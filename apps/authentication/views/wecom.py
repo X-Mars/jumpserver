@@ -233,11 +233,26 @@ class WeComQRLoginCallbackView(AuthMixin, WeComQRMixin, View):
             return response
 
         user = get_object_or_none(User, wecom_id=wecom_userid)
+        user_detail = wecom.get_user_detail(wecom_userid)
+        a = user_detail['mobile']
         if user is None:
-            title = _('WeCom is not bound')
-            msg = _('Please login with a password and then bind the WeCom')
-            response = self.get_failed_response(login_url, title=title, msg=msg)
-            return response
+            user = User.objects.create(username=user_detail['userid'], email=user_detail['email'], name=user_detail['name'], avatar=user_detail['avatar'], wechat=wecom_userid, phone=user_detail['mobile'], wecom_id=wecom_userid)
+            user.save()
+            print(user)
+        else:
+            user.username = user_detail['userid']
+            user.email = user_detail['email']
+            user.name = user_detail['name']
+            user.avatar = user_detail['avatar']
+            user.wechat = wecom_userid
+            user.phone = user_detail['mobile']
+            user.wecom_id = wecom_userid
+            user.save()
+            # TODO: 用户没有当前企业微信应用的权限，会不会报错？需要验证。
+            # title = _('WeCom is not bound')
+            # msg = _('Please login with a password and then bind the WeCom')
+            # response = self.get_failed_response(login_url, title=title, msg=msg)
+            # return response
 
         try:
             self.check_oauth2_auth(user, settings.AUTH_BACKEND_WECOM)

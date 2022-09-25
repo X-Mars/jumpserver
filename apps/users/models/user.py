@@ -679,8 +679,11 @@ class User(AuthMixin, TokenMixin, RoleMixin, MFAMixin, AbstractUser):
         blank=True, verbose_name=_('Role')
     )
     is_service_account = models.BooleanField(default=False, verbose_name=_("Is service account"))
-    avatar = models.ImageField(
-        upload_to="avatar", null=True, verbose_name=_('Avatar')
+    # avatar = models.ImageField(
+    #     upload_to="avatar", null=True, verbose_name=_('Avatar')
+    # )
+    avatar = models.URLField(
+        blank=True, verbose_name=_('Avatar'), null=True, max_length=255
     )
     wechat = models.CharField(
         max_length=128, blank=True, verbose_name=_('Wechat')
@@ -840,7 +843,7 @@ class User(AuthMixin, TokenMixin, RoleMixin, MFAMixin, AbstractUser):
         admin_default = settings.STATIC_URL + "img/avatar/admin.png"
         user_default = settings.STATIC_URL + "img/avatar/user.png"
         if self.avatar:
-            return self.avatar.url
+            return self.avatar
         if self.is_superuser:
             return admin_default
         else:
