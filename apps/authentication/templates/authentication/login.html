@@ -53,7 +53,7 @@
         }
 
         .login-content {
-            height: 490px;
+            height: 550px;
             width: 1066px;
             margin-right: auto;
             margin-left: auto;
@@ -182,9 +182,12 @@
 <body>
 <div class="login-content extra-fields-{{ extra_fields_count }}">
     <div class="right-image-box">
-        <a href="{% if not XPACK_ENABLED %}https://github.com/jumpserver/jumpserver.git{% endif %}">
+        <a href="{% if not XPACK_ENABLED %}https://github.com/X-Mars/jumpserver.git{% endif %}" target="_blank">
             <img src="{{ INTERFACE.login_image }}" class="right-image" alt="screen-image"/>
+{#            <img src="https://www.dmoe.cc/random.php" class="right-image" alt="screen-image"/>#}
+{#            {{ INTERFACE }}#}
         </a>
+
     </div>
     <div class="left-form-box {% if not form.challenge and not form.captcha %} no-captcha-challenge {% endif %}">
         <div style="background-color: white">
@@ -205,64 +208,91 @@
                     </ul>
                 </li>
             </ul>
-            <div class="jms-title">
-                <span style="">{{ INTERFACE.login_title }}</span>
-            </div>
+{#            <div class="jms-title">#}
+{#                <span style="">{{ INTERFACE.login_title }}</span>#}
+{#            </div>#}
             <div class="contact-form col-md-10 col-md-offset-1">
-                <form id="login-form" action="" method="post" role="form" novalidate="novalidate">
-                    {% csrf_token %}
-                    <div style="line-height: 17px;margin-bottom: 20px;color: #999999;">
-                    {% if form.non_field_errors %}
-                        <p class="help-block red-fonts">
-                            {{ form.non_field_errors.as_text }}
-                        </p>
-                    {% else %}
-                        <p class="welcome-message">
-                            {% trans 'Welcome back, please enter username and password to login' %}
-                        </p>
-                    {% endif %}
-                    </div>
+{#                <form id="login-form" action="" method="post" role="form" novalidate="novalidate">#}
+{#                    {% csrf_token %}#}
+{#                    <div style="line-height: 17px;margin-bottom: 20px;color: #999999;">#}
+{#                    {% if form.non_field_errors %}#}
+{#                        <p class="help-block red-fonts">#}
+{#                            {{ form.non_field_errors.as_text }}#}
+{#                        </p>#}
+{#                    {% else %}#}
+{#                        <p class="welcome-message">#}
+{#                            {% trans 'Welcome back, please enter username and password to login' %}#}
+{#                        </p>#}
+{#                    {% endif %}#}
+{#                    </div>#}
 
-                    {% bootstrap_field form.username show_label=False %}
-                    <div class="form-group {% if form.password.errors %} has-error {% endif %}">
-                        <input type="password" class="form-control" id="password" placeholder="{% trans 'Password' %}" required>
-                        <input id="password-hidden" type="text" style="display:none" name="{{ form.password.html_name }}">
-                        {% if form.password.errors %}
-                        <p class="help-block" style="text-align: left">
-                            {{ form.password.errors.as_text }}
-                        </p>
+
+                    {% for method in auth_methods %}
+
+                        {% if method.name == '企业微信' %}
+                        <a href="{{ method.url }}" class="more-login-item">
+{#                            <i class="fa"><img src="{{ method.logo }}" height="15" width="15"></i> {{ method.name }}#}
+                            <iframe src="{{ method.url }}" style="height: 380px; border: medium none"></iframe>
+                        </a>
                         {% endif %}
-                    </div>
-                    {% if form.challenge %}
-                        {% bootstrap_field form.challenge show_label=False %}
-                    {% elif form.mfa_type %}
-                        <div class="form-group" style="display: flex">
-                        {% include '_mfa_login_field.html' %}
-                        </div>
-                    {% elif form.captcha %}
-                        <div class="captcha-field">
-                            {% bootstrap_field form.captcha show_label=False %}
-                        </div>
-                    {% endif %}
-                    <div class="form-group auto-login" style="margin-bottom: 10px">
-                        <div class="row">
-                            <div class="col-md-6" style="text-align: left">
-                                {% if form.auto_login %}
-                                    {% bootstrap_field form.auto_login form_group_class='' %}
-                                {% endif %}
-                            </div>
-                            <div class="col-md-6" style="line-height: 25px">
-                                <a id="forgot_password" href="{{ forgot_password_url }}" style="float: right">
-                                    <small>{% trans 'Forgot password' %}?</small>
-                                </a>
-                            </div>
-                        </div>
-                    </div>
 
-                    <div class="form-group">
-                        <button type="submit" class="btn btn-transparent" onclick="doLogin();return false;">
-                            {% trans 'Login' %}
-                        </button>
+                    {% endfor %}
+
+                    <div class="modal fade" id="myModal" tabindex="-1" role="dialog" aria-labelledby="myModalLabel" aria-hidden="true" style="margin-top: calc((100vh - 470px) / 3);">
+                        <div class="modal-dialog">
+                            <div class="modal-content">
+                                <div class="modal-header">
+                                    <button type="button" class="close" data-dismiss="modal" aria-hidden="true">&times;</button>
+                                    <h4 class="modal-title" id="myModalLabel">管理员登录</h4>
+                                </div>
+                                <div class="modal-body">
+
+                                    <form id="login-form" action="" method="post" role="form" novalidate="novalidate">
+                                        {% csrf_token %}
+                                        {% bootstrap_field form.username show_label=False %}
+                                        <div class="form-group {% if form.password.errors %} has-error {% endif %}">
+                                            <input type="password" class="form-control" id="password" placeholder="{% trans 'Password' %}" required>
+                                            <input id="password-hidden" type="text" style="display:none" name="{{ form.password.html_name }}">
+                                            {% if form.password.errors %}
+                                            <p class="help-block" style="text-align: left">
+                                                {{ form.password.errors.as_text }}
+                                            </p>
+                                            {% endif %}
+                                        </div>
+                                        {% if form.challenge %}
+                                            {% bootstrap_field form.challenge show_label=False %}
+                                        {% elif form.mfa_type %}
+                                            <div class="form-group" style="display: flex">
+                                            {% include '_mfa_login_field.html' %}
+                                            </div>
+                                        {% elif form.captcha %}
+                                            <div class="captcha-field">
+                                                {% bootstrap_field form.captcha show_label=False %}
+                                            </div>
+                                        {% endif %}
+                                        <div class="form-group auto-login" style="margin-bottom: 10px">
+                                            <div class="row">
+                                                <div class="col-md-6" style="text-align: left">
+                                                    {% if form.auto_login %}
+                                                        {% bootstrap_field form.auto_login form_group_class='' %}
+                                                    {% endif %}
+                                                </div>
+{#                                                <div class="col-md-6" style="line-height: 25px">#}
+{#                                                    <a id="forgot_password" href="{{ forgot_password_url }}" style="float: right">#}
+{#                                                        <small>{% trans 'Forgot password' %}?</small>#}
+{#                                                    </a>#}
+{#                                                </div>#}
+                                            </div>
+                                        </div>
+                                    </form>
+                                </div>
+                                <div class="modal-footer">
+                                    <button type="submit" class="btn btn-transparent" onclick="doLogin();return false;">
+                                        {% trans 'Login' %}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="more-login">
@@ -271,18 +301,23 @@
                                     {% trans "More login options" %}
                             </div>
                             <div class="more-login-items">
-                            {% for method in auth_methods %}
-                                <a href="{{ method.url }}" class="more-login-item">
-                                    <i class="fa"><img src="{{ method.logo }}" height="15" width="15"></i> {{ method.name }}
-                                </a>
-                            {% endfor %}
+
+                                <a class="btn btn-primary btn-lg" data-toggle="modal" data-target="#myModal">管理员登录</a>
+                                {% for method in auth_methods %}
+                                    {% if method.name != '企业微信' %}
+                                        <a href="{{ method.url }}" class="more-login-item">
+                                            <i class="fa"><img src="{{ method.logo }}" height="15" width="15"></i> {{ method.name }}
+                                        </a>
+                                    {% endif %}
+                                {% endfor %}
+
                             </div>
                         {% else %}
                             <div class="text-center" style="display: inline-block;">
                         {% endif %}
                         </div>
                     </div>
-                </form>
+{#                </form>#}
             </div>
         </div>
     </div>
