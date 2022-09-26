@@ -296,13 +296,13 @@
                     </div>
 
                     <div class="more-login">
+                        <a class="btn btn-primary btn-lg" data-toggle="modal" data-target="#myModal">管理员登录</a>
                         {% if auth_methods %}
                             <div class="more-methods-title {{ current_lang.code }}">
                                     {% trans "More login options" %}
                             </div>
                             <div class="more-login-items">
 
-                                <a class="btn btn-primary btn-lg" data-toggle="modal" data-target="#myModal">管理员登录</a>
                                 {% for method in auth_methods %}
                                     {% if method.name != '企业微信' %}
                                         <a href="{{ method.url }}" class="more-login-item">
