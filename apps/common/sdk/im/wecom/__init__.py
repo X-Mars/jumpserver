@@ -182,5 +182,5 @@ class WeCom(RequestMixin):
             'userid': id,
         }
 
-        data = self._requests.get(URL.GET_USER_DETAIL, params)
+        data = self._requests.get(URL.GET_USER_DETAIL, params, check_errcode_is_0=False)
         return data
