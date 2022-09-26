@@ -233,21 +233,20 @@ class WeComQRLoginCallbackView(AuthMixin, WeComQRMixin, View):
             return response
 
         user = get_object_or_none(User, wecom_id=wecom_userid)
-        user_detail = wecom.get_user_detail(wecom_userid)
-        a = user_detail['mobile']
+        # user_detail = wecom.get_user_detail(wecom_userid)
         if user is None:
-            user = User.objects.create(username=user_detail['userid'], email=user_detail['email'], name=user_detail['name'], avatar=user_detail['avatar'], wechat=wecom_userid, phone=user_detail['mobile'], wecom_id=wecom_userid)
+            user = User.objects.create(username=wecom_userid, name=wecom_userid, wechat=wecom_userid, wecom_id=wecom_userid)
             user.save()
             print(user)
-        else:
-            user.username = user_detail['userid']
-            user.email = user_detail['email']
-            user.name = user_detail['name']
-            user.avatar = user_detail['avatar']
-            user.wechat = wecom_userid
-            user.phone = user_detail['mobile']
-            user.wecom_id = wecom_userid
-            user.save()
+        # else:
+        #     user.username = user_detail['userid']
+        #     user.email = user_detail['email']
+        #     user.name = user_detail['name']
+        #     user.avatar = user_detail['avatar']
+        #     user.wechat = wecom_userid
+        #     user.phone = user_detail['mobile']
+        #     user.wecom_id = wecom_userid
+        #     user.save()
             # TODO: 用户没有当前企业微信应用的权限，会不会报错？需要验证。
             # title = _('WeCom is not bound')
             # msg = _('Please login with a password and then bind the WeCom')
