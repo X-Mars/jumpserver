@@ -234,6 +234,12 @@ class WeComQRLoginCallbackView(AuthMixin, WeComQRMixin, View):
 
         user = get_object_or_none(User, wecom_id=wecom_userid)
         # user_detail = wecom.get_user_detail(wecom_userid)
+
+        if user is None:
+            user= User.objects.get(wechat=wecom_userid)
+            if user is not None:
+                user.wecom_id = wecom_userid
+                user.save()
         if user is None:
             user = User.objects.create(username=wecom_userid, name=wecom_userid, wechat=wecom_userid, wecom_id=wecom_userid)
             user.save()
