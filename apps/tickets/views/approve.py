@@ -2,11 +2,14 @@
 #
 
 from __future__ import unicode_literals
-from django.core.cache import cache
-from django.shortcuts import redirect, reverse
-from django.views.generic.base import TemplateView
-from django.utils.translation import ugettext as _
 
+from django.core.cache import cache
+from django.http import HttpResponse
+from django.shortcuts import redirect, reverse
+from django.utils.translation import gettext as _
+from django.views.generic.base import TemplateView
+
+from common.utils import get_logger, FlashMessageUtil
 from orgs.utils import tmp_to_root_org
 from tickets.const import TicketType
 from tickets.errors import AlreadyClosed
@@ -14,7 +17,6 @@ from tickets.models import (
     Ticket, ApplyAssetTicket,
     ApplyLoginTicket, ApplyLoginAssetTicket, ApplyCommandTicket
 )
-from common.utils import get_logger, FlashMessageUtil
 
 logger = get_logger(__name__)
 
@@ -78,6 +80,9 @@ class TicketDirectApproveView(TemplateView):
         return super().get_context_data(**kwargs)
 
     def get(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            return HttpResponse(status=401)
+
         token = kwargs.get('token')
         ticket_info = cache.get(token)
         if not ticket_info:

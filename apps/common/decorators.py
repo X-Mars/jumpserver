@@ -6,6 +6,7 @@ import inspect
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 from django.db import transaction
 
@@ -66,10 +67,16 @@ class EventLoopThread(threading.Thread):
 _loop_thread = EventLoopThread()
 _loop_thread.setDaemon(True)
 _loop_thread.start()
-executor = ThreadPoolExecutor(max_workers=10,
-                              thread_name_prefix='debouncer')
+executor = ThreadPoolExecutor(
+    max_workers=10,
+    thread_name_prefix='debouncer'
+)
 _loop_debouncer_func_task_cache = {}
 _loop_debouncer_func_args_cache = {}
+
+
+def get_loop():
+    return _loop_thread.get_loop()
 
 
 def cancel_or_remove_debouncer_task(cache_key):
@@ -217,3 +224,24 @@ def do_test():
     end = time.time()
     using = end - s
     print("end : %s, using: %s" % (end, using))
+
+
+def cached_method(ttl=20):
+    _cache = {}
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            key = (func, args, tuple(sorted(kwargs.items())))
+            # 检查缓存是否存在且未过期
+            if key in _cache and time.time() - _cache[key]['timestamp'] < ttl:
+                return _cache[key]['result']
+
+            # 缓存过期或不存在，执行方法并缓存结果
+            result = func(*args, **kwargs)
+            _cache[key] = {'result': result, 'timestamp': time.time()}
+            return result
+
+        return wrapper
+
+    return decorator

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from common.serializers.fields import LabeledChoiceField
@@ -59,6 +59,7 @@ class TicketApplySerializer(TicketSerializer):
     org_id = serializers.CharField(
         required=True, max_length=36, allow_blank=True, label=_("Organization")
     )
+    applicant = serializers.CharField(required=False, allow_blank=True)
 
     def get_applicant(self, applicant_id):
         current_user = self.context['request'].user

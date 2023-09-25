@@ -65,10 +65,14 @@ special_pid_mapper = {
     'acls.commandgroup': 'perms',
     'acls.loginacl': 'perms',
     'acls.loginassetacl': 'perms',
+    'acls.connectmethodacl': 'perms',
     'xpack.account': 'cloud_import',
     'xpack.syncinstancedetail': 'cloud_import',
     'xpack.syncinstancetask': 'cloud_import',
     'xpack.syncinstancetaskexecution': 'cloud_import',
+    'xpack.strategy': 'cloud_import',
+    'xpack.strategyaction': 'cloud_import',
+    'xpack.strategyrule': 'cloud_import',
     'terminal.applet': 'remote_application',
     'terminal.applethost': 'remote_application',
     'accounts.accountbackupautomation': "backup_account_node",
@@ -108,6 +112,7 @@ special_pid_mapper = {
     "settings.view_setting": "view_setting",
     "rbac.view_console": "view_console",
     "rbac.view_audit": "view_audit",
+    'audits.usersession': 'view_audit',
     "rbac.view_workbench": "view_workbench",
     "rbac.view_webterminal": "view_workbench",
     "rbac.view_filemanager": "view_workbench",
@@ -390,7 +395,7 @@ class PermissionTreeUtil:
             'chkDisabled': self.check_disabled,
             'checked': checked,
             'meta': {
-                'type':  tp,
+                'type': tp,
             },
             **data
         }

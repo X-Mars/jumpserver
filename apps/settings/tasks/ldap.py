@@ -2,8 +2,7 @@
 #
 from celery import shared_task
 from django.conf import settings
-from django.db import transaction
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 from common.utils import get_logger
 from ops.celery.decorator import after_app_ready_start
@@ -22,8 +21,7 @@ def sync_ldap_user():
     LDAPSyncUtil().perform_sync()
 
 
-@shared_task(verbose_name=_('Import ldap user'))
-@transaction.atomic
+@shared_task(verbose_name=_('Periodic import ldap user'))
 def import_ldap_user():
     logger.info("Start import ldap user task")
     util_server = LDAPServerUtil()
@@ -44,7 +42,7 @@ def import_ldap_user():
         logger.info('Imported {} users successfully'.format(len(users)))
 
 
-@shared_task(verbose_name=_('Periodic import ldap user'))
+@shared_task(verbose_name=_('Registration periodic import ldap user task'))
 @after_app_ready_start
 def import_ldap_user_periodic():
     if not settings.AUTH_LDAP:

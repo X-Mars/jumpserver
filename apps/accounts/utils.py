@@ -1,10 +1,10 @@
-from django.utils.translation import ugettext_lazy as _
+import copy
+
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
-from accounts.const import (
-    SecretType, DEFAULT_PASSWORD_RULES
-)
-from common.utils import gen_key_pair, random_string
+from accounts.const import SecretType, DEFAULT_PASSWORD_RULES
+from common.utils import ssh_key_gen, random_string
 from common.utils import validate_ssh_private_key, parse_ssh_private_key_str
 
 
@@ -16,13 +16,23 @@ class SecretGenerator:
 
     @staticmethod
     def generate_ssh_key():
-        private_key, public_key = gen_key_pair()
+        private_key, public_key = ssh_key_gen()
         return private_key
 
     def generate_password(self):
-        length = int(self.password_rules.get('length', 0))
-        length = length if length else DEFAULT_PASSWORD_RULES['length']
-        return random_string(length, special_char=True)
+        password_rules = self.password_rules
+        if not password_rules or not isinstance(password_rules, dict):
+            password_rules = {}
+        rules = copy.deepcopy(DEFAULT_PASSWORD_RULES)
+        rules.update(password_rules)
+        rules = {
+            'length': rules['length'],
+            'lower': rules['lowercase'],
+            'upper': rules['uppercase'],
+            'digit': rules['digit'],
+            'special_char': rules['symbol']
+        }
+        return random_string(**rules)
 
     def get_secret(self):
         if self.secret_type == SecretType.SSH_KEY:
@@ -41,6 +51,8 @@ def validate_password_for_ansible(password):
     # Ansible 推送的时候不支持
     if '{{' in password:
         raise serializers.ValidationError(_('Password can not contains `{{` '))
+    if '{%' in password:
+        raise serializers.ValidationError(_('Password can not contains `{%` '))
     # Ansible Windows 推送的时候不支持
     if "'" in password:
         raise serializers.ValidationError(_("Password can not contains `'` "))

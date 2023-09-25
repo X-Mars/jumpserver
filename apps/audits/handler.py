@@ -3,7 +3,7 @@ from datetime import datetime
 
 from django.core.cache import cache
 from django.db import transaction
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 from common.local import encrypted_field_set
 from common.utils import get_request_ip, get_logger
@@ -72,7 +72,12 @@ class OperatorLogHandler(metaclass=Singleton):
         if instance_id is None:
             return log_id, before, after
 
-        log_id, cache_instance = self.get_instance_dict_from_cache(instance_id)
+        try:
+            log_id, cache_instance = self.get_instance_dict_from_cache(instance_id)
+        except Exception as err:
+            logger.error('Get instance diff from cache error: %s' % err)
+            return log_id, before, after
+
         if not cache_instance:
             return log_id, before, after
 
@@ -103,8 +108,6 @@ class OperatorLogHandler(metaclass=Singleton):
             return ''
         if isinstance(value[0], str):
             return ','.join(value)
-        if isinstance(value[0], dict) and value[0].get('value') and isinstance(value[0]['value'], str):
-            return ','.join([str(i['value']) for i in value])
         return json.dumps(value)
 
     def __data_processing(self, dict_item, loop=True):

@@ -76,6 +76,16 @@ class JMSInventory:
             var['ansible_ssh_private_key_file'] = account.private_key_path
         return var
 
+    @staticmethod
+    def make_custom_become_ansible_vars(account, platform):
+        var = {
+            'custom_become': True, 'custom_become_method': platform.su_method,
+            'custom_become_user': account.su_from.username,
+            'custom_become_password': account.su_from.secret,
+            'custom_become_private_key_path': account.su_from.private_key_path
+        }
+        return var
+
     def make_account_vars(self, host, asset, account, automation, protocol, platform, gateway):
         from accounts.const import AutomationTypes
         if not account:
@@ -89,6 +99,7 @@ class JMSInventory:
         su_from = account.su_from
         if platform.su_enabled and su_from:
             host.update(self.make_account_ansible_vars(su_from))
+            host.update(self.make_custom_become_ansible_vars(account, platform))
             become_method = 'sudo' if platform.su_method != 'su' else 'su'
             host['ansible_become'] = True
             host['ansible_become_method'] = 'sudo'
@@ -116,7 +127,9 @@ class JMSInventory:
                 }
                 host['jms_asset']['port'] = port
             else:
-                host.update(self.make_proxy_command(gateway))
+                ansible_ssh_common_args = self.make_proxy_command(gateway)
+                host['jms_asset'].update(ansible_ssh_common_args)
+                host.update(ansible_ssh_common_args)
 
     @staticmethod
     def get_primary_protocol(ansible_config, protocols):
@@ -139,7 +152,7 @@ class JMSInventory:
                 ansible_config['ansible_winrm_server_cert_validation'] = 'ignore'
             else:
                 ansible_config['ansible_winrm_scheme'] = 'http'
-                ansible_config['ansible_winrm_transport'] = 'plaintext'
+                ansible_config['ansible_winrm_transport'] = 'ntlm'
         return ansible_config
 
     def asset_to_host(self, asset, account, automation, protocols, platform):
@@ -150,13 +163,16 @@ class JMSInventory:
 
         protocol = self.get_primary_protocol(ansible_config, protocols)
 
+        tp, category = asset.type, asset.category
+        name = asset.name.replace(' ', '_').replace('[', '_').replace(']', '_')
+        secret_info = {k: v for k, v in asset.secret_info.items() if v}
         host = {
-            'name': '{}'.format(asset.name.replace(' ', '_')),
+            'name': name,
             'jms_asset': {
                 'id': str(asset.id), 'name': asset.name, 'address': asset.address,
-                'type': asset.type, 'category': asset.category,
+                'type': tp, 'category': category,
                 'protocol': protocol.name, 'port': protocol.port,
-                'spec_info': asset.spec_info, 'secret_info': asset.secret_info,
+                'spec_info': asset.spec_info, 'secret_info': secret_info,
                 'protocols': [{'name': p.name, 'port': p.port} for p in protocols],
             },
             'jms_account': {
@@ -166,7 +182,7 @@ class JMSInventory:
             } if account else None
         }
 
-        if host['jms_account'] and asset.platform.type == 'oracle':
+        if host['jms_account'] and tp == 'oracle':
             host['jms_account']['mode'] = 'sysdba' if account.privileged else None
 
         ansible_config = self.fill_ansible_config(ansible_config, protocol)
@@ -269,8 +285,13 @@ class JMSInventory:
         for host in hosts:
             name = host.pop('name')
             data['all']['hosts'][name] = host
-        if self.exclude_localhost and data['all']['hosts'].__contains__('localhost'):
-            data['all']['hosts'].update({'localhost': {'ansible_host': '255.255.255.255'}})
+        if not self.exclude_localhost:
+            data['all']['hosts'].update({
+                'localhost': {
+                    'ansible_host': '127.0.0.1',
+                    'ansible_connection': 'local'
+                }
+            })
         return data
 
     def write_to_file(self, path):

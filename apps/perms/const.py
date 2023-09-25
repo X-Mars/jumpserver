@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 from common.db.fields import BitChoices
 from common.utils.integer import bit
@@ -9,12 +9,12 @@ __all__ = ["ActionChoices"]
 
 
 class ActionChoices(BitChoices):
-    connect = bit(1), _("Connect")
-    upload = bit(2), _("Upload")
-    download = bit(3), _("Download")
-    copy = bit(4), _("Copy")
-    paste = bit(5), _("Paste")
-    delete = bit(6), _("Delete")
+    connect = bit(1), _("Connect") + " ({})".format(_("All protocols"))
+    upload = bit(2), _("Upload") + " (RDP, SFTP)"
+    download = bit(3), _("Download") + " (RDP, SFTP)"
+    copy = bit(4), _("Copy") + " (RDP, VNC)"
+    paste = bit(5), _("Paste") + " (RDP, VNC)"
+    delete = bit(6), _("Delete") + " (SFTP)"
 
     @classmethod
     def is_tree(cls):

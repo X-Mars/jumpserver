@@ -1,4 +1,4 @@
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from common.serializers.fields import EncryptedField
@@ -52,7 +52,7 @@ class OAuth2SettingSerializer(serializers.Serializer):
         required=False, allow_blank=True, max_length=1024, label=_('Provider end session endpoint')
     )
     AUTH_OAUTH2_LOGOUT_COMPLETELY = serializers.BooleanField(required=False, label=_('Logout completely'))
-    AUTH_OAUTH2_USER_ATTR_MAP = serializers.DictField(
+    AUTH_OAUTH2_USER_ATTR_MAP = serializers.JSONField(
         required=True, label=_('User attr map')
     )
     AUTH_OAUTH2_ALWAYS_UPDATE_USER = serializers.BooleanField(

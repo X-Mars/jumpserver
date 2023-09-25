@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 #
+from urllib.parse import urlparse
+
+from django.db.models import TextChoices
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
-from urllib.parse import urlparse
-from django.utils.translation import ugettext_lazy as _
-from django.db.models import TextChoices
-from common.serializers.fields import LabeledChoiceField
+
 from common.serializers import MethodSerializer
+from common.serializers.fields import LabeledChoiceField
 from common.serializers.fields import ReadableHiddenField, EncryptedField
-from ..models import ReplayStorage, CommandStorage
 from .. import const
+from ..models import ReplayStorage, CommandStorage
 
 
 # Replay storage serializers
@@ -131,6 +133,8 @@ replay_storage_type_serializer_classes_mapping = {
 # Command storage serializers
 # ---------------------------
 def command_storage_es_host_format_validator(host):
+    if '#' in host:
+        raise serializers.ValidationError(_('The address cannot contain the special character `#`'))
     h = urlparse(host)
     default_error_msg = _('The address format is incorrect')
     if h.scheme not in ['http', 'https']:

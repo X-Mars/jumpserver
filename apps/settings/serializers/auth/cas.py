@@ -1,4 +1,4 @@
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 __all__ = [
@@ -25,5 +25,5 @@ class CASSettingSerializer(serializers.Serializer):
     CAS_APPLY_ATTRIBUTES_TO_USER = serializers.BooleanField(
         required=False, label=_('Enable attributes map')
     )
-    CAS_RENAME_ATTRIBUTES = serializers.DictField(required=False, label=_('Rename attr'))
+    CAS_RENAME_ATTRIBUTES = serializers.JSONField(required=False, label=_('Rename attr'))
     CAS_CREATE_USER = serializers.BooleanField(required=False, label=_('Create user if not'))

@@ -1,10 +1,10 @@
-from django.utils.translation import ugettext_lazy as _
 from django.db import models
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
-from common.serializers.fields import EncryptedField
-from common.validators import PhoneValidator
 from common.sdk.sms import BACKENDS
+from common.serializers.fields import EncryptedField, PhoneField
+from common.validators import PhoneValidator
 
 __all__ = [
     'SMSSettingSerializer', 'AlibabaSMSSettingSerializer', 'TencentSMSSettingSerializer',
@@ -27,9 +27,8 @@ class SignTmplPairSerializer(serializers.Serializer):
 class BaseSMSSettingSerializer(serializers.Serializer):
     PREFIX_TITLE = _('SMS')
 
-    SMS_TEST_PHONE = serializers.CharField(
-        max_length=256, required=False, validators=[PhoneValidator(), ],
-        allow_blank=True, label=_('Test phone')
+    SMS_TEST_PHONE = PhoneField(
+        validators=[PhoneValidator()], required=False, allow_blank=True, allow_null=True, label=_('Test phone')
     )
 
     def to_representation(self, instance):
@@ -96,7 +95,7 @@ class CustomSMSSettingSerializer(BaseSMSSettingSerializer):
         post = 'post', 'Post'
 
     CUSTOM_SMS_URL = serializers.URLField(required=True, label=_("URL"))
-    CUSTOM_SMS_API_PARAMS = serializers.DictField(
+    CUSTOM_SMS_API_PARAMS = serializers.JSONField(
         label=_('Parameters'), default={'phone_number': '{phone_number}', 'code': '{code}'}
     )
     CUSTOM_SMS_REQUEST_METHOD = serializers.ChoiceField(

@@ -2,16 +2,16 @@
 
 from __future__ import unicode_literals
 
-from common.utils import FlashMessageUtil, get_object_or_none, random_string
-from common.utils.verify_code import SendAndVerifyCodeUtil
 from django.conf import settings
 from django.core.cache import cache
 from django.shortcuts import redirect, reverse
 from django.urls import reverse_lazy
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 from django.views.generic import FormView, RedirectView
-from users.notifications import ResetPasswordSuccessMsg
 
+from common.utils import FlashMessageUtil, get_object_or_none, random_string
+from common.utils.verify_code import SendAndVerifyCodeUtil
+from users.notifications import ResetPasswordSuccessMsg
 from ... import forms
 from ...models import User
 from ...utils import check_password_rules, get_password_check_rules
@@ -114,6 +114,11 @@ class UserForgotPasswordView(FormView):
         target = form.cleaned_data[form_type]
         code = form.cleaned_data['code']
 
+        query_key = form_type
+        if form_type == 'sms':
+            query_key = 'phone'
+            target = target.lstrip('+')
+
         try:
             sender_util = SendAndVerifyCodeUtil(target, backend=form_type)
             sender_util.verify(code)
@@ -121,7 +126,6 @@ class UserForgotPasswordView(FormView):
             form.add_error('code', str(e))
             return super().form_invalid(form)
 
-        query_key = 'phone' if form_type == 'sms' else form_type
         user = get_object_or_none(User, **{'username': username, query_key: target})
         if not user:
             form.add_error('code', _('No user matched'))

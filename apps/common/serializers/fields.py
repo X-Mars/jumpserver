@@ -212,10 +212,30 @@ class BitChoicesField(TreeChoicesField):
 
 
 class PhoneField(serializers.CharField):
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            code = data.get('code')
+            phone = data.get('phone', '')
+            if code and phone:
+                data = '{}{}'.format(code, phone)
+            else:
+                data = phone
+        try:
+            phone = phonenumbers.parse(data, 'CN')
+            data = '{}{}'.format(phone.country_code, phone.national_number)
+        except phonenumbers.NumberParseException:
+            data = '+86{}'.format(data)
+
+        return super().to_internal_value(data)
+
     def to_representation(self, value):
         if value:
-            phone = phonenumbers.parse(value, 'CN')
-            value = {'code': '+%s' % phone.country_code, 'phone': phone.national_number}
+            try:
+                phone = phonenumbers.parse(value, 'CN')
+                value = {'code': '+%s' % phone.country_code, 'phone': phone.national_number}
+            except phonenumbers.NumberParseException:
+                value = {'code': '+86', 'phone': value}
         return value
 
 

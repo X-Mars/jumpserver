@@ -2,10 +2,10 @@
 #
 import time
 
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
+from rest_framework import status
 from rest_framework.generics import RetrieveAPIView, CreateAPIView
 from rest_framework.response import Response
-from rest_framework import status
 
 from common.permissions import IsValidUser, UserConfirmation
 from ..const import ConfirmType
@@ -13,7 +13,7 @@ from ..serializers import ConfirmSerializer
 
 
 class ConfirmBindORUNBindOAuth(RetrieveAPIView):
-    permission_classes = (UserConfirmation.require(ConfirmType.ReLogin),)
+    permission_classes = (IsValidUser, UserConfirmation.require(ConfirmType.ReLogin),)
 
     def retrieve(self, request, *args, **kwargs):
         return Response('ok')

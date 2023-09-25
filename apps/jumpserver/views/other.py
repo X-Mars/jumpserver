@@ -2,13 +2,13 @@
 #
 import re
 
-from django.http import HttpResponseRedirect, JsonResponse, Http404
 from django.conf import settings
-from django.views.generic import View, TemplateView
-from django.shortcuts import redirect
-from django.utils.translation import ugettext_lazy as _
-from django.views.decorators.csrf import csrf_exempt
 from django.http import HttpResponse
+from django.http import HttpResponseRedirect, JsonResponse, Http404
+from django.shortcuts import redirect
+from django.utils.translation import gettext_lazy as _
+from django.views.decorators.csrf import csrf_exempt
+from django.views.generic import View, TemplateView
 from rest_framework.views import APIView
 
 from common.views.http import HttpResponseTemporaryRedirect
@@ -88,3 +88,9 @@ class KokoView(View):
 
 class ResourceDownload(TemplateView):
     template_name = 'resource_download.html'
+
+
+def csrf_failure(request, reason=""):
+    from django.shortcuts import reverse
+    login_url = reverse('authentication:login') + '?csrf_failure=1&admin=1'
+    return redirect(login_url)

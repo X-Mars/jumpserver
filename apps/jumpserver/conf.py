@@ -21,7 +21,7 @@ from urllib.parse import urljoin, urlparse
 
 import yaml
 from django.urls import reverse_lazy
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from gmssl.sm4 import CryptSM4, SM4_ENCRYPT, SM4_DECRYPT
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -186,8 +186,9 @@ class Config(dict):
         'BOOTSTRAP_TOKEN': '',
         'DEBUG': False,
         'DEBUG_DEV': False,
+        'DEBUG_ANSIBLE': False,
         'LOG_LEVEL': 'DEBUG',
-        'LOG_DIR': os.path.join(PROJECT_DIR, 'logs'),
+        'LOG_DIR': os.path.join(PROJECT_DIR, 'data', 'logs'),
         'DB_ENGINE': 'mysql',
         'DB_NAME': 'jumpserver',
         'DB_HOST': '127.0.0.1',
@@ -219,9 +220,14 @@ class Config(dict):
         'ANNOUNCEMENT_ENABLED': True,
         'ANNOUNCEMENT': {},
 
+        # Security
+        'X_FRAME_OPTIONS': 'DENY',
+
+        # 未使用的配置
         'CAPTCHA_TEST_MODE': None,
-        'TOKEN_EXPIRATION': 3600 * 24,
         'DISPLAY_PER_PAGE': 25,
+
+        'TOKEN_EXPIRATION': 3600 * 24,
         'DEFAULT_EXPIRED_YEARS': 70,
         'SESSION_COOKIE_DOMAIN': None,
         'CSRF_COOKIE_DOMAIN': None,
@@ -229,8 +235,12 @@ class Config(dict):
         'SESSION_COOKIE_AGE': 3600 * 24,
         'SESSION_EXPIRE_AT_BROWSER_CLOSE': False,
         'LOGIN_URL': reverse_lazy('authentication:login'),
-        'CONNECTION_TOKEN_EXPIRATION': 5 * 60,  # 默认
-        'CONNECTION_TOKEN_EXPIRATION_MAX': 60 * 60 * 24 * 30,  # 最大
+
+        'CONNECTION_TOKEN_ONETIME_EXPIRATION': 5 * 60,  # 默认(new)
+        'CONNECTION_TOKEN_EXPIRATION': 5 * 60,  # 默认(old)
+
+        'CONNECTION_TOKEN_REUSABLE_EXPIRATION': 60 * 60 * 24 * 30,  # 最大(new)
+        'CONNECTION_TOKEN_EXPIRATION_MAX': 60 * 60 * 24 * 30,  # 最大(old)
         'CONNECTION_TOKEN_REUSABLE': False,
 
         # Custom Config
@@ -240,6 +250,19 @@ class Config(dict):
         # Custom Config
         'MFA_CUSTOM': False,
         'MFA_CUSTOM_FILE_MD5': '',
+
+        # 临时密码
+        'AUTH_TEMP_TOKEN': False,
+
+        # Vault
+        'VAULT_ENABLED': False,
+        'VAULT_HCP_HOST': '',
+        'VAULT_HCP_TOKEN': '',
+        'VAULT_HCP_MOUNT_POINT': 'jumpserver',
+
+        # Cache login password
+        'CACHE_LOGIN_PASSWORD_ENABLED': False,
+        'CACHE_LOGIN_PASSWORD_TTL': 60 * 60 * 24,
 
         # Auth LDAP settings
         'AUTH_LDAP': False,
@@ -310,9 +333,9 @@ class Config(dict):
         'CAS_ROOT_PROXIED_AS': 'https://example.com',
         'CAS_LOGOUT_COMPLETELY': True,
         'CAS_VERSION': 3,
-        'CAS_USERNAME_ATTRIBUTE': 'uid',
+        'CAS_USERNAME_ATTRIBUTE': 'cas:user',
         'CAS_APPLY_ATTRIBUTES_TO_USER': False,
-        'CAS_RENAME_ATTRIBUTES': {'uid': 'username'},
+        'CAS_RENAME_ATTRIBUTES': {'cas:user': 'username'},
         'CAS_CREATE_USER': True,
 
         'AUTH_SSO': False,
@@ -359,8 +382,9 @@ class Config(dict):
         'AUTH_OAUTH2_USER_ATTR_MAP': {
             'name': 'name', 'username': 'username', 'email': 'email'
         },
-
-        'AUTH_TEMP_TOKEN': False,
+        'AUTH_PASSKEY': False,
+        'FIDO_SERVER_ID': '',
+        'FIDO_SERVER_NAME': 'JumpServer',
 
         # 企业微信
         'AUTH_WECOM': False,
@@ -435,11 +459,7 @@ class Config(dict):
         'TERMINAL_ASSET_LIST_PAGE_SIZE': 'auto',
         'TERMINAL_SESSION_KEEP_DURATION': 200,
         'TERMINAL_HOST_KEY': '',
-        'TERMINAL_TELNET_REGEX': '',
         'TERMINAL_COMMAND_STORAGE': {},
-        # Luna 页面
-        # 默认图形化分辨率
-        'TERMINAL_GRAPHICAL_RESOLUTION': 'Auto',
         # 未来废弃(目前迁移会用)
         'TERMINAL_RDP_ADDR': '',
         # 保留(Luna还在用)
@@ -452,9 +472,13 @@ class Config(dict):
         'SECURITY_MFA_AUTH': 0,  # 0 不开启 1 全局开启 2 管理员开启
         'SECURITY_MFA_AUTH_ENABLED_FOR_THIRD_PARTY': True,
         'SECURITY_COMMAND_EXECUTION': True,
+        'SECURITY_COMMAND_BLACKLIST': [
+            'reboot', 'shutdown', 'poweroff', 'halt', 'dd', 'half', 'top'
+        ],
         'SECURITY_SERVICE_ACCOUNT_REGISTRATION': True,
         'SECURITY_VIEW_AUTH_NEED_MFA': True,
         'SECURITY_MAX_IDLE_TIME': 30,
+        'SECURITY_MAX_SESSION_TIME': 24,
         'SECURITY_PASSWORD_EXPIRATION_TIME': 9999,
         'SECURITY_PASSWORD_MIN_LENGTH': 6,
         'SECURITY_ADMIN_USER_PASSWORD_MIN_LENGTH': 6,
@@ -471,6 +495,7 @@ class Config(dict):
         'SECURITY_LUNA_REMEMBER_AUTH': True,
         'SECURITY_WATERMARK_ENABLED': True,
         'SECURITY_MFA_VERIFY_TTL': 3600,
+        'SECURITY_UNCOMMON_USERS_TTL': 30,
         'VERIFY_CODE_TTL': 60,
         'SECURITY_SESSION_SHARE': True,
         'SECURITY_CHECK_DIFFERENT_CITY_LOGIN': True,
@@ -492,18 +517,20 @@ class Config(dict):
         'HTTP_BIND_HOST': '0.0.0.0',
         'HTTP_LISTEN_PORT': 8080,
         'WS_LISTEN_PORT': 8070,
+
         'SYSLOG_ADDR': '',  # '192.168.0.1:514'
         'SYSLOG_FACILITY': 'user',
         'SYSLOG_SOCKTYPE': 2,
+
         'PERM_EXPIRED_CHECK_PERIODIC': 60 * 60,
         'FLOWER_URL': "127.0.0.1:5555",
         'LANGUAGE_CODE': 'zh',
         'TIME_ZONE': 'Asia/Shanghai',
         'FORCE_SCRIPT_NAME': '',
         'SESSION_COOKIE_SECURE': False,
+        'DOMAINS': '',
         'CSRF_COOKIE_SECURE': False,
         'REFERER_CHECK_ENABLED': False,
-        'CSRF_TRUSTED_ORIGINS': '',
         'SESSION_ENGINE': 'cache',
         'SESSION_SAVE_EVERY_REQUEST': True,
         'SESSION_EXPIRE_AT_BROWSER_CLOSE_FORCE': False,
@@ -535,6 +562,7 @@ class Config(dict):
         'TICKET_AUTHORIZE_DEFAULT_TIME': 7,
         'TICKET_AUTHORIZE_DEFAULT_TIME_UNIT': 'day',
         'PERIOD_TASK_ENABLED': True,
+        'TERMINAL_TELNET_REGEX': '',
 
         # 导航栏 帮助
         'HELP_DOCUMENT_URL': 'https://docs.jumpserver.org/zh/v3/',
@@ -545,6 +573,19 @@ class Config(dict):
 
         # Applet 等软件的下载地址
         'APPLET_DOWNLOAD_HOST': '',
+
+        # FTP 文件上传下载备份阈值，单位(M)，当值小于等于0时，不备份
+        'FTP_FILE_MAX_STORE': 100,
+
+        # API 请求次数限制
+        'MAX_LIMIT_PER_PAGE': 100,
+
+        'LIMIT_SUPER_PRIV': False,
+    }
+
+    old_config_map = {
+        'CONNECTION_TOKEN_ONETIME_EXPIRATION': 'CONNECTION_TOKEN_EXPIRATION',
+        'CONNECTION_TOKEN_REUSABLE_EXPIRATION': 'CONNECTION_TOKEN_EXPIRATION_MAX',
     }
 
     def __init__(self, *args):
@@ -687,13 +728,19 @@ class Config(dict):
             value = self.convert_type(item, value)
         return value
 
-    def get(self, item):
+    def get(self, item, default=None):
         # 再从配置文件中获取
         value = self.get_from_config(item)
         if value is None:
             value = self.get_from_env(item)
+
+        # 因为要递归，所以优先从上次返回的递归中获取
+        if default is None:
+            default = self.defaults.get(item)
+        if value is None and item in self.old_config_map:
+            return self.get(self.old_config_map[item], default)
         if value is None:
-            value = self.defaults.get(item)
+            value = default
         if self.secret_encryptor:
             value = self.secret_encryptor.decrypt_if_need(value, item)
         return value

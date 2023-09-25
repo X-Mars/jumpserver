@@ -44,15 +44,27 @@ def set_default_by_type(tp, data, field_info):
 
 def create_serializer_class(serializer_name, fields_info):
     serializer_fields = {}
-    fields_name = ['name', 'label', 'default', 'type', 'help_text']
+    fields_name = ['name', 'label', 'default', 'required', 'type', 'help_text']
 
     for i, field_info in enumerate(fields_info):
         data = {k: field_info.get(k) for k in fields_name}
         field_type = data.pop('type', 'str')
+
+        # 用户定义 default 和 required 可能会冲突, 所以要处理一下
+        default = data.get('default', None)
+        if default is None:
+            data.pop('default', None)
+            data['required'] = True
+        elif default == '':
+            data['required'] = False
+            data['allow_blank'] = True
+        else:
+            data['required'] = False
         data = set_default_by_type(field_type, data, field_info)
         data = set_default_if_need(data, i)
+        if field_type in ['int', 'bool', 'list'] and "allow_blank" in data.keys():
+            data.pop('allow_blank')
         field_name = data.pop('name')
         field_class = type_field_map.get(field_type, serializers.CharField)
         serializer_fields[field_name] = field_class(**data)
-
     return type(serializer_name, (serializers.Serializer,), serializer_fields)

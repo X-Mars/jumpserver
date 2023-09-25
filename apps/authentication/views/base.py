@@ -1,26 +1,24 @@
 from functools import lru_cache
 
-from rest_framework.request import Request
-from django.utils.translation import ugettext_lazy as _
-from django.utils.module_loading import import_string
 from django.conf import settings
 from django.db.utils import IntegrityError
+from django.utils.module_loading import import_string
+from django.utils.translation import gettext_lazy as _
 from django.views import View
+from rest_framework.request import Request
 
 from authentication import errors
 from authentication.mixins import AuthMixin
-from users.models import User
-from common.utils.django import reverse, get_object_or_none
 from common.utils import get_logger
-
+from common.utils.django import reverse, get_object_or_none
+from users.models import User
+from users.signal_handlers import check_only_allow_exist_user_auth
 from .mixins import FlashMessageMixin
-
 
 logger = get_logger(__file__)
 
 
 class BaseLoginCallbackView(AuthMixin, FlashMessageMixin, View):
-
     client_type_path = ''
     client_auth_params = {}
     user_type = ''
@@ -52,6 +50,11 @@ class BaseLoginCallbackView(AuthMixin, FlashMessageMixin, View):
             user, create = User.objects.get_or_create(
                 username=user_attr['username'], defaults=user_attr
             )
+
+            if not check_only_allow_exist_user_auth(create):
+                user.delete()
+                return user, (self.msg_client_err, self.request.error_message)
+
             setattr(user, f'{self.user_type}_id', user_id)
             if create:
                 setattr(user, 'source', self.user_type)

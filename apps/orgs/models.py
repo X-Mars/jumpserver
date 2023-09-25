@@ -1,5 +1,6 @@
 from django.db import models
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
+from rest_framework.serializers import ValidationError
 
 from common.db.models import JMSBaseModel
 from common.tree import TreeNode
@@ -9,10 +10,22 @@ logger = get_logger(__name__)
 
 
 class OrgRoleMixin:
+    ROOT_ID = '00000000-0000-0000-0000-000000000000'
+    ROOT_NAME = _('GLOBAL')
+    DEFAULT_ID = '00000000-0000-0000-0000-000000000002'
+    DEFAULT_NAME = _('DEFAULT')
+    SYSTEM_ID = '00000000-0000-0000-0000-000000000004'
+    SYSTEM_NAME = _('SYSTEM')
+    INTERNAL_IDS = [ROOT_ID, DEFAULT_ID, SYSTEM_ID]
     members: models.Manager
+    id: str
 
     def get_members(self):
-        return self.members.all().distinct()
+        from users.models import User
+        if self.id == self.ROOT_ID:
+            return User.objects.all().exclude(is_service_account=True)
+        else:
+            return self.members.all().distinct()
 
     def add_member(self, user, role=None):
         from rbac.builtin import BuiltinRole
@@ -72,12 +85,6 @@ class Organization(OrgRoleMixin, JMSBaseModel):
         'users.User', related_name='orgs', through='rbac.RoleBinding', through_fields=('org', 'user')
     )
 
-    ROOT_ID = '00000000-0000-0000-0000-000000000000'
-    ROOT_NAME = _('GLOBAL')
-    DEFAULT_ID = '00000000-0000-0000-0000-000000000002'
-    DEFAULT_NAME = _('DEFAULT')
-    SYSTEM_ID = '00000000-0000-0000-0000-000000000004'
-    SYSTEM_NAME = _('SYSTEM')
     orgs_mapping = None
 
     class Meta:
@@ -166,6 +173,10 @@ class Organization(OrgRoleMixin, JMSBaseModel):
     def is_default(self):
         return str(self.id) == self.DEFAULT_ID
 
+    @property
+    def internal(self):
+        return str(self.id) in self.INTERNAL_IDS
+
     def change_to(self):
         from .utils import set_current_org
         set_current_org(self)
@@ -218,5 +229,7 @@ class Organization(OrgRoleMixin, JMSBaseModel):
             TicketFlow.objects.filter(org_id=self.id).delete()
 
     def delete(self, *args, **kwargs):
+        if str(self.id) in self.INTERNAL_IDS:
+            raise ValidationError(_('Can not delete virtual org'))
         self.delete_related_models()
         return super().delete(*args, **kwargs)

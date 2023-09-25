@@ -2,12 +2,13 @@
 #
 import os
 import tarfile
+
 from django.core.files.storage import default_storage
 from django.db.models import F
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404, reverse
 from django.utils.encoding import escape_uri_path
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext_noop, gettext as _
 from django_filters import rest_framework as filters
 from rest_framework import generics
 from rest_framework import viewsets, views
@@ -15,31 +16,34 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.drf.filters import BaseFilterSet
-from common.const.http import GET
-from common.drf.filters import DatetimeRangeFilter
-from common.drf.renders import PassthroughRenderer
+from audits.const import ActionChoices
 from common.api import AsyncApiMixin
-from common.utils import data_to_json, is_uuid
+from common.const.http import GET
+from common.drf.filters import BaseFilterSet
+from common.drf.filters import DatetimeRangeFilterBackend
+from common.drf.renders import PassthroughRenderer
+from common.storage.replay import ReplayStorageHandler
+from common.utils import data_to_json, is_uuid, i18n_fmt
 from common.utils import get_logger, get_object_or_none
-from rbac.permissions import RBACPermission
+from common.views.mixins import RecordViewLogMixin
 from orgs.mixins.api import OrgBulkModelViewSet
 from orgs.utils import tmp_to_root_org, tmp_to_org
+from rbac.permissions import RBACPermission
 from terminal import serializers
+from terminal.const import TerminalType
 from terminal.models import Session
-from terminal.utils import (
-    find_session_replay_local, download_session_replay,
-    is_session_approver, get_session_replay_url
-)
 from terminal.permissions import IsSessionAssignee
+from terminal.utils import is_session_approver
 from users.models import User
 
 __all__ = [
     'SessionViewSet', 'SessionReplayViewSet',
-    'SessionJoinValidateAPI', 'MySessionAPIView',
+    'SessionJoinValidateAPI', 'MySessionAPIView'
 ]
 
 logger = get_logger(__name__)
+
+REPLAY_OP = gettext_noop('User %s %s session %s replay')
 
 
 class MySessionAPIView(generics.ListAPIView):
@@ -70,7 +74,7 @@ class SessionFilterSet(BaseFilterSet):
             return queryset.filter(terminal__name=value)
 
 
-class SessionViewSet(OrgBulkModelViewSet):
+class SessionViewSet(RecordViewLogMixin, OrgBulkModelViewSet):
     model = Session
     serializer_classes = {
         'default': serializers.SessionSerializer,
@@ -84,9 +88,9 @@ class SessionViewSet(OrgBulkModelViewSet):
     date_range_filter_fields = [
         ('date_start', ('date_from', 'date_to'))
     ]
-    extra_filter_backends = [DatetimeRangeFilter]
+    extra_filter_backends = [DatetimeRangeFilterBackend]
     rbac_perms = {
-        'download': ['terminal.download_sessionreplay']
+        'download': ['terminal.download_sessionreplay'],
     }
     permission_classes = [RBACPermission | IsSessionAssignee]
 
@@ -112,26 +116,56 @@ class SessionViewSet(OrgBulkModelViewSet):
         os.chdir(current_dir)
         return file
 
+    def get_storage(self):
+        return ReplayStorageHandler(self.get_object())
+
     @action(methods=[GET], detail=True, renderer_classes=(PassthroughRenderer,), url_path='replay/download',
             url_name='replay-download')
     def download(self, request, *args, **kwargs):
-        session = self.get_object()
-        local_path, url = get_session_replay_url(session)
+        storage = self.get_storage()
+        local_path, url = storage.get_file_path_url()
         if local_path is None:
-            return Response({"error": url}, status=404)
-        file = self.prepare_offline_file(session, local_path)
+            # url => error message
+            return Response({'error': url}, status=404)
 
+        file = self.prepare_offline_file(storage.obj, local_path)
         response = FileResponse(file)
         response['Content-Type'] = 'application/octet-stream'
         # 这里要注意哦，网上查到的方法都是response['Content-Disposition']='attachment;filename="filename.py"',
         # 但是如果文件名是英文名没问题，如果文件名包含中文，下载下来的文件名会被改为url中的path。
-        filename = escape_uri_path('{}.tar'.format(session.id))
+        filename = escape_uri_path('{}.tar'.format(storage.obj.id))
         disposition = "attachment; filename*=UTF-8''{}".format(filename)
         response["Content-Disposition"] = disposition
+
+        detail = i18n_fmt(
+            REPLAY_OP, self.request.user, _('Download'), str(storage.obj)
+        )
+        self.record_logs(
+            [storage.obj.asset_id], ActionChoices.download, detail,
+            model=Session, resource_display=str(storage.obj)
+        )
         return response
 
+    @action(methods=[GET], detail=False, permission_classes=[IsAuthenticated], url_path='online-info', )
+    def online_info(self, request, *args, **kwargs):
+        asset = self.request.query_params.get('asset_id')
+        account = self.request.query_params.get('account')
+        if asset is None or account is None:
+            return Response({'count': None})
+
+        queryset = Session.objects.filter(is_finished=False) \
+            .filter(asset_id=asset) \
+            .filter(protocol='rdp')  # 当前只统计 rdp 协议的会话
+        if '(' in account and ')' in account:
+            queryset = queryset.filter(account=account)
+        else:
+            queryset = queryset.filter(account__endswith='({})'.format(account))
+        count = queryset.count()
+        return Response({'count': count})
+
     def get_queryset(self):
-        queryset = super().get_queryset().prefetch_related('terminal') \
+        queryset = super().get_queryset() \
+            .prefetch_related('terminal') \
             .annotate(terminal_display=F('terminal__name'))
         return queryset
 
@@ -148,7 +182,7 @@ class SessionViewSet(OrgBulkModelViewSet):
         return super().perform_create(serializer)
 
 
-class SessionReplayViewSet(AsyncApiMixin, viewsets.ViewSet):
+class SessionReplayViewSet(AsyncApiMixin, RecordViewLogMixin, viewsets.ViewSet):
     serializer_class = serializers.ReplaySerializer
     download_cache_key = "SESSION_REPLAY_DOWNLOAD_{}"
     session = None
@@ -180,14 +214,20 @@ class SessionReplayViewSet(AsyncApiMixin, viewsets.ViewSet):
 
     @staticmethod
     def get_replay_data(session, url):
-        tp = 'json'
-        if session.protocol in ('rdp', 'vnc'):
-            # 需要考虑录像播放和离线播放器的约定，暂时不处理
-            tp = 'guacamole'
+        all_guacamole_types = (
+            TerminalType.lion, TerminalType.guacamole,
+            TerminalType.razor, TerminalType.xrdp
+        )
+
         if url.endswith('.cast.gz'):
             tp = 'asciicast'
-        if url.endswith('.replay.mp4'):
+        elif url.endswith('.replay.mp4'):
             tp = 'mp4'
+        elif (getattr(session.terminal, 'type', None) in all_guacamole_types) or \
+                (session.protocol in ('rdp', 'vnc')):
+            tp = 'guacamole'
+        else:
+            tp = 'json'
 
         download_url = reverse('api-terminal:session-replay-download', kwargs={'pk': session.id})
         data = {
@@ -205,15 +245,26 @@ class SessionReplayViewSet(AsyncApiMixin, viewsets.ViewSet):
             return False
         return True
 
+    def async_callback(self, *args, **kwargs):
+        session_id = kwargs.get('pk')
+        session = get_object_or_404(Session, id=session_id)
+        detail = i18n_fmt(
+            REPLAY_OP, self.request.user, _('View'), str(session)
+        )
+        self.record_logs(
+            [session.asset_id], ActionChoices.download, detail,
+            model=Session, resource_display=str(session)
+        )
+
     def retrieve(self, request, *args, **kwargs):
         session_id = kwargs.get('pk')
         session = get_object_or_404(Session, id=session_id)
-        local_path, url = find_session_replay_local(session)
 
-        if not local_path:
-            local_path, url = download_session_replay(session)
-            if not local_path:
-                return Response({"error": url}, status=404)
+        storage = ReplayStorageHandler(session)
+        local_path, url = storage.get_file_path_url()
+        if local_path is None:
+            # url => error message
+            return Response({"error": url}, status=404)
         data = self.get_replay_data(session, url)
         return Response(data)
 

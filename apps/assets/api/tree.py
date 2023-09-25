@@ -1,10 +1,12 @@
 # ~*~ coding: utf-8 ~*~
 
 from django.db.models import Q
+from django.utils.translation import gettext_lazy as _
 from rest_framework.generics import get_object_or_404
 from rest_framework.response import Response
 
 from assets.locks import NodeAddChildrenLock
+from common.exceptions import JMSException
 from common.tree import TreeNodeSerializer
 from common.utils import get_logger
 from orgs.mixins import generics
@@ -33,15 +35,19 @@ class NodeChildrenApi(generics.ListCreateAPIView):
     is_initial = False
 
     def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
         self.instance = self.get_object()
-        return super().initial(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         with NodeAddChildrenLock(self.instance):
             data = serializer.validated_data
             _id = data.get("id")
             value = data.get("value")
-            if not value:
+            if value:
+                children = self.instance.get_children()
+                if children.filter(value=value).exists():
+                    raise JMSException(_('The same level node name cannot be the same'))
+            else:
                 value = self.instance.get_next_child_preset_name()
             node = self.instance.create_child(value=value, _id=_id)
             # 避免查询 full value
@@ -121,10 +127,13 @@ class NodeChildrenAsTreeApi(SerializeToTreeNodeMixin, NodeChildrenApi):
         if not self.instance or not include_assets:
             return Asset.objects.none()
         if query_all:
-            assets = self.instance.get_all_assets_for_tree()
+            assets = self.instance.get_all_assets()
         else:
-            assets = self.instance.get_assets_for_tree()
-        return assets
+            assets = self.instance.get_assets()
+        return assets.only(
+            "id", "name", "address", "platform_id",
+            "org_id", "is_active", 'comment'
+        ).prefetch_related('platform')
 
     def filter_queryset_for_assets(self, assets):
         search = self.request.query_params.get('search')

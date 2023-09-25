@@ -9,7 +9,7 @@ import yaml
 from django.conf import settings
 from django.utils import timezone
 from django.utils.translation import gettext as _
-from sshtunnel import SSHTunnelForwarder, BaseSSHTunnelForwarderError
+from sshtunnel import SSHTunnelForwarder
 
 from assets.automations.methods import platform_automation_methods
 from common.utils import get_logger, lazyproperty, is_openssh_format_key, ssh_pubkey_gen
@@ -175,7 +175,7 @@ class BasePlaybookManager:
         method = self.method_id_meta_mapper.get(method_id)
         if not method:
             logger.error("Method not found: {}".format(method_id))
-            return method
+            return
         method_playbook_dir_path = method['dir']
         sub_playbook_path = os.path.join(sub_playbook_dir, 'project', 'main.yml')
         shutil.copytree(method_playbook_dir_path, os.path.dirname(sub_playbook_path))
@@ -196,6 +196,11 @@ class BasePlaybookManager:
             print(msg)
         runners = []
         for platform, assets in assets_group_by_platform.items():
+            if not assets:
+                continue
+            if not platform.automation or not platform.automation.ansible_enabled:
+                print(_("  - Platform {} ansible disabled").format(platform.name))
+                continue
             assets_bulked = [assets[i:i + self.bulk_size] for i in range(0, len(assets), self.bulk_size)]
 
             for i, _assets in enumerate(assets_bulked, start=1):
@@ -204,6 +209,8 @@ class BasePlaybookManager:
                 inventory_path = os.path.join(self.runtime_dir, sub_dir, 'hosts.json')
                 self.generate_inventory(_assets, inventory_path)
                 playbook_path = self.generate_playbook(_assets, platform, playbook_dir)
+                if not playbook_path:
+                    continue
 
                 runer = PlaybookRunner(
                     inventory_path,
@@ -262,22 +269,21 @@ class BasePlaybookManager:
         info = self.file_to_json(runner.inventory)
         servers, not_valid = [], []
         for k, host in info['all']['hosts'].items():
-            jms_asset, jms_gateway = host['jms_asset'], host.get('gateway')
+            jms_asset, jms_gateway = host.get('jms_asset'), host.get('gateway')
             if not jms_gateway:
                 continue
-
-            server = SSHTunnelForwarder(
-                (jms_gateway['address'], jms_gateway['port']),
-                ssh_username=jms_gateway['username'],
-                ssh_password=jms_gateway['secret'],
-                ssh_pkey=jms_gateway['private_key_path'],
-                remote_bind_address=(jms_asset['address'], jms_asset['port'])
-            )
             try:
+                server = SSHTunnelForwarder(
+                    (jms_gateway['address'], jms_gateway['port']),
+                    ssh_username=jms_gateway['username'],
+                    ssh_password=jms_gateway['secret'],
+                    ssh_pkey=jms_gateway['private_key_path'],
+                    remote_bind_address=(jms_asset['address'], jms_asset['port'])
+                )
                 server.start()
-            except BaseSSHTunnelForwarderError:
+            except Exception as e:
                 err_msg = 'Gateway is not active: %s' % jms_asset.get('name', '')
-                print('\033[31m %s \033[0m\n' % err_msg)
+                print(f'\033[31m {err_msg} 原因: {e} \033[0m\n')
                 not_valid.append(k)
             else:
                 host['ansible_host'] = jms_asset['address'] = '127.0.0.1'
@@ -310,6 +316,7 @@ class BasePlaybookManager:
         shutil.rmtree(self.runtime_dir)
 
     def run(self, *args, **kwargs):
+        print(">>> 任务准备阶段\n")
         runners = self.get_runners()
         if len(runners) > 1:
             print("### 分次执行任务, 总共 {}\n".format(len(runners)))

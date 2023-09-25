@@ -1,5 +1,5 @@
 # ~*~ coding: utf-8 ~*~
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 from django.views.generic.detail import SingleObjectMixin
 from rest_framework.serializers import ValidationError
 from rest_framework.views import APIView, Response
@@ -25,6 +25,9 @@ class DomainViewSet(OrgBulkModelViewSet):
         if self.request.query_params.get('gateway'):
             return serializers.DomainWithGatewaySerializer
         return serializers.DomainSerializer
+
+    def get_queryset(self):
+        return super().get_queryset().prefetch_related('assets')
 
 
 class GatewayViewSet(HostViewSet):

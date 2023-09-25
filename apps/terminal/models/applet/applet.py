@@ -1,6 +1,7 @@
 import os.path
 import random
 import shutil
+from collections import defaultdict
 
 import yaml
 from django.conf import settings
@@ -10,6 +11,7 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 from rest_framework.serializers import ValidationError
 
+from assets.models import Platform
 from common.db.models import JMSBaseModel
 from common.utils import lazyproperty, get_logger
 from common.utils.yml import yaml_load_with_i18n
@@ -24,15 +26,21 @@ class Applet(JMSBaseModel):
         general = 'general', _('General')
         web = 'web', _('Web')
 
+    class Edition(models.TextChoices):
+        community = 'community', _('Community edition')
+        enterprise = 'enterprise', _('Enterprise')
+
     name = models.SlugField(max_length=128, verbose_name=_('Name'), unique=True)
     display_name = models.CharField(max_length=128, verbose_name=_('Display name'))
     version = models.CharField(max_length=16, verbose_name=_('Version'))
     author = models.CharField(max_length=128, verbose_name=_('Author'))
+    edition = models.CharField(max_length=128, choices=Edition.choices, default=Edition.community,
+                               verbose_name=_('Edition'))
     type = models.CharField(max_length=16, verbose_name=_('Type'), default='general', choices=Type.choices)
     is_active = models.BooleanField(default=True, verbose_name=_('Is active'))
     builtin = models.BooleanField(default=False, verbose_name=_('Builtin'))
     protocols = models.JSONField(default=list, verbose_name=_('Protocol'))
-    can_concurrent = models.BooleanField(default=True, verbose_name=_('Can concurrent'))
+    can_concurrent = models.BooleanField(default=False, verbose_name=_('Can concurrent'))
     tags = models.JSONField(default=list, verbose_name=_('Tags'))
     comment = models.TextField(default='', blank=True, verbose_name=_('Comment'))
     hosts = models.ManyToManyField(
@@ -84,22 +92,21 @@ class Applet(JMSBaseModel):
             if not os.path.exists(path):
                 raise ValidationError({'error': _('Applet pkg not valid, Missing file {}').format(name)})
 
-        with open(os.path.join(d, 'manifest.yml')) as f:
+        with open(os.path.join(d, 'manifest.yml'), encoding='utf8') as f:
             manifest = yaml_load_with_i18n(f)
 
         if not manifest.get('name', ''):
             raise ValidationError({'error': 'Missing name in manifest.yml'})
         return manifest
 
-    @classmethod
-    def load_platform_if_need(cls, d):
+    def load_platform_if_need(self, d):
         from assets.serializers import PlatformSerializer
         from assets.const import CustomTypes
 
         if not os.path.exists(os.path.join(d, 'platform.yml')):
             return
         try:
-            with open(os.path.join(d, 'platform.yml')) as f:
+            with open(os.path.join(d, 'platform.yml'), encoding='utf8') as f:
                 data = yaml_load_with_i18n(f)
         except Exception as e:
             raise ValidationError({'error': _('Load platform.yml failed: {}').format(e)})
@@ -115,10 +122,14 @@ class Applet(JMSBaseModel):
         if not data.get('automation'):
             data['automation'] = CustomTypes._get_automation_constrains()['*']
 
-        s = PlatformSerializer(data=data)
+        created_by = 'Applet:{}'.format(self.name)
+        instance = self.get_related_platform()
+        s = PlatformSerializer(data=data, instance=instance)
         s.add_type_choices(tp, tp)
         s.is_valid(raise_exception=True)
-        s.save()
+        p = s.save()
+        p.created_by = created_by
+        p.save(update_fields=['created_by'])
 
     @classmethod
     def install_from_dir(cls, path, builtin=True):
@@ -128,10 +139,9 @@ class Applet(JMSBaseModel):
         name = manifest['name']
         instance = cls.objects.filter(name=name).first()
         serializer = AppletSerializer(instance=instance, data=manifest)
-        serializer.is_valid()
-        serializer.save(builtin=builtin)
-
-        cls.load_platform_if_need(path)
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save(builtin=builtin)
+        instance.load_platform_if_need(path)
 
         pkg_path = default_storage.path('applets/{}'.format(name))
         if os.path.exists(pkg_path):
@@ -139,23 +149,50 @@ class Applet(JMSBaseModel):
         shutil.copytree(path, pkg_path)
         return instance, serializer
 
-    def select_host(self, user):
-        hosts = [
-            host for host in self.hosts.filter(is_active=True)
-            if host.load != 'offline'
-        ]
+    host_prefer_key_tpl = 'applet_host_prefer_{}'
+
+    @classmethod
+    def clear_host_prefer(cls):
+        cache.delete_pattern(cls.host_prefer_key_tpl.format('*'))
+
+    def _select_by_load(self, hosts):
+        using_keys = cache.keys(self.host_prefer_key_tpl.format('*'))
+        using_host_ids = cache.get_many(using_keys)
+        counts = defaultdict(int)
+        for host_id in using_host_ids.values():
+            counts[host_id] += 1
+
+        hosts = list(sorted(hosts, key=lambda h: counts[h.id]))
+        return hosts[0]
+
+    def select_host(self, user, asset):
+        hosts = self.hosts.filter(is_active=True)
+        hosts = [host for host in hosts if host.load != 'offline']
         if not hosts:
             return None
 
-        prefer_key = 'applet_host_prefer_{}'.format(user.id)
+        spec_label = asset.labels.filter(name__in=['AppletHost', '发布机']).first()
+        if spec_label:
+            matched = [host for host in hosts if host.name == spec_label.value]
+            if matched:
+                return matched[0]
+
+        hosts = [h for h in hosts if h.auto_create_accounts]
+        prefer_key = self.host_prefer_key_tpl.format(user.id)
         prefer_host_id = cache.get(prefer_key, None)
         pref_host = [host for host in hosts if host.id == prefer_host_id]
+
         if pref_host:
             host = pref_host[0]
         else:
-            host = random.choice(hosts)
-            cache.set(prefer_key, host.id, timeout=None)
+            host = self._select_by_load(hosts)
+            cache.set(prefer_key, str(host.id), timeout=None)
         return host
+
+    def get_related_platform(self):
+        created_by = 'Applet:{}'.format(self.name)
+        platform = Platform.objects.filter(created_by=created_by).first()
+        return platform
 
     @staticmethod
     def random_select_prefer_account(user, host, accounts):
@@ -175,42 +212,85 @@ class Applet(JMSBaseModel):
             cache.set(prefer_host_account_key, account.id, timeout=None)
         return account
 
-    def select_host_account(self, user):
+    accounts_using_key_tmpl = 'applet_host_accounts_{}_{}_{}'
+
+    def select_a_public_account(self, user, host, valid_accounts):
+        using_keys = cache.keys(self.accounts_using_key_tmpl.format(host.id, '*', '*')) or []
+        accounts_username_used = list(cache.get_many(using_keys).values())
+        logger.debug('Applet host account using: {}: {}'.format(host.name, accounts_username_used))
+        accounts = valid_accounts.exclude(username__in=accounts_username_used)
+        public_accounts = accounts.filter(username__startswith='jms_')
+        if not public_accounts:
+            public_accounts = accounts.exclude(username__in=['Administrator', 'root'])
+        account = self.random_select_prefer_account(user, host, public_accounts)
+        return account
+
+    def try_to_use_private_account(self, user, host, valid_accounts):
+        host_can_concurrent = str(host.deploy_options.get('RDS_fSingleSessionPerUser', 0)) == '0'
+        app_can_concurrent = self.can_concurrent or self.type == 'web'
+        all_can_concurrent = host_can_concurrent and app_can_concurrent
+
+        private_account = valid_accounts.filter(username='js_{}'.format(user.username)).first()
+        if not private_account:
+            logger.debug('Private account not found ...')
+            return None
+        # 优先使用 private account，支持并发或者不支持并发时，如果私有没有被占用，则使用私有
+        account = None
+        # 如果都支持，不管私有是否被占用，都使用私有
+        if all_can_concurrent:
+            logger.debug('All can concurrent, use private account')
+            account = private_account
+        # 如果主机都不支持并发，则查询一下私有账号有没有任何应用使用，如果没有被使用，则使用私有
+        elif not host_can_concurrent:
+            private_using_key = self.accounts_using_key_tmpl.format(host.id, private_account.username, '*')
+            private_is_using = len(cache.keys(private_using_key))
+            logger.debug("Private account is using: {}".format(private_is_using))
+            if not private_is_using:
+                account = private_account
+        # 如果主机支持，但是应用不支持并发，则查询一下私有账号有没有被这个应用使用, 如果没有被使用，则使用私有
+        elif host_can_concurrent and not app_can_concurrent:
+            private_app_using_key = self.accounts_using_key_tmpl.format(host.id, private_account.username, self.name)
+            private_is_using_by_this_app = cache.get(private_app_using_key, False)
+            logger.debug("Private account is using {} by {}".format(private_is_using_by_this_app, self.name))
+            if not private_is_using_by_this_app:
+                account = private_account
+        return account
+
+    def select_host_account(self, user, asset):
         # 选择激活的发布机
-        host = self.select_host(user)
+        host = self.select_host(user, asset)
         if not host:
             return None
-        can_concurrent = self.can_concurrent and self.type == 'general'
+        logger.info('Select applet host: {}'.format(host.name))
 
-        accounts = host.accounts.all().filter(is_active=True, privileged=False)
-        private_account = accounts.filter(username='js_{}'.format(user.username)).first()
-        accounts_using_key_tmpl = 'applet_host_accounts_{}_{}'
+        valid_accounts = host.accounts.all().filter(is_active=True, privileged=False)
+        account = self.try_to_use_private_account(user, host, valid_accounts)
+        if not account:
+            logger.debug('No private account, try to use public account')
+            account = self.select_a_public_account(user, host, valid_accounts)
 
-        if private_account and can_concurrent:
-            account = private_account
-        else:
-            using_keys = cache.keys(accounts_using_key_tmpl.format(host.id, '*')) or []
-            accounts_username_used = list(cache.get_many(using_keys).values())
-            logger.debug('Applet host account using: {}: {}'.format(host.name, accounts_username_used))
+        if not account:
+            logger.debug('No available account for applet host: {}'.format(host.name))
+            return None
 
-            # 优先使用 private account
-            if private_account and private_account.username not in accounts_username_used:
-                account = private_account
-            else:
-                accounts = accounts.exclude(username__in=accounts_username_used).filter(username__startswith='jms_')
-                account = self.random_select_prefer_account(user, host, accounts)
-                if not account:
-                    return
         ttl = 60 * 60 * 24
-        lock_key = accounts_using_key_tmpl.format(host.id, account.username)
+        lock_key = self.accounts_using_key_tmpl.format(host.id, account.username, self.name)
         cache.set(lock_key, account.username, ttl)
 
-        return {
+        res = {
             'host': host,
             'account': account,
             'lock_key': lock_key,
             'ttl': ttl
         }
+        logger.debug('Select host and account: {}'.format(res))
+        return res
+
+    def delete(self, using=None, keep_parents=False):
+        platform = self.get_related_platform()
+        if platform and platform.assets.count() == 0:
+            platform.delete()
+        return super().delete(using, keep_parents)
 
 
 class AppletPublication(JMSBaseModel):

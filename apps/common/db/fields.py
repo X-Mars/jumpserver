@@ -10,13 +10,13 @@ from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.db import models
-from django.db.models import Q, Manager
-from django.utils.encoding import force_text
-from django.utils.translation import ugettext_lazy as _
+from django.db.models import Q, Manager, QuerySet
+from django.utils.translation import gettext_lazy as _
 from rest_framework.utils.encoders import JSONEncoder
 
 from common.local import add_encrypted_field_set
-from common.utils import signer, crypto, contains_ip
+from common.utils import contains_ip
+from .utils import Encryptor
 from .validators import PortRangeValidator
 
 __all__ = [
@@ -139,20 +139,11 @@ class EncryptMixin:
     EncryptMixin要放在最前面
     """
 
-    def decrypt_from_signer(self, value):
-        return signer.unsign(value) or ""
-
     def from_db_value(self, value, expression, connection, context=None):
         if value is None:
             return value
 
-        value = force_text(value)
-        plain_value = crypto.decrypt(value)
-
-        # 如果没有解开，使用原来的signer解密
-        if not plain_value:
-            plain_value = self.decrypt_from_signer(value)
-
+        plain_value = Encryptor(value).decrypt()
         # 可能和Json mix，所以要先解密，再json
         sp = super()
         if hasattr(sp, "from_db_value"):
@@ -167,9 +158,9 @@ class EncryptMixin:
         sp = super()
         if hasattr(sp, "get_prep_value"):
             value = sp.get_prep_value(value)
-        value = force_text(value)
+
         # 替换新的加密方式
-        return crypto.encrypt(value)
+        return Encryptor(value).encrypt()
 
 
 class EncryptTextField(EncryptMixin, models.TextField):
@@ -295,7 +286,13 @@ class RelatedManager:
         self.instance.__dict__[self.field.name] = value
 
     @classmethod
-    def get_filter_q(cls, value, to_model):
+    def get_to_filter_q(cls, value, to_model):
+        """
+        这个是 instance 去查找 to_model 的 queryset 的 Q
+        :param value:
+        :param to_model:
+        :return:
+        """
         if not value or not isinstance(value, dict):
             return Q()
 
@@ -314,7 +311,7 @@ class RelatedManager:
             queryset = to_model.get_queryset()
         else:
             queryset = to_model.objects.all()
-        q = cls.get_filter_q(value, to_model)
+        q = cls.get_to_filter_q(value, to_model)
         return queryset.filter(q).distinct()
 
     @staticmethod
@@ -322,13 +319,13 @@ class RelatedManager:
         q = Q()
         if isinstance(val, str):
             val = [val]
+        if ['*'] in val:
+            return Q()
         for ip in val:
             if not ip:
                 continue
             try:
-                if ip == '*':
-                    return Q()
-                elif '/' in ip:
+                if '/' in ip:
                     network = ipaddress.ip_network(ip)
                     ips = network.hosts()
                     q |= Q(**{"{}__in".format(name): ips})
@@ -372,9 +369,16 @@ class RelatedManager:
 
             if match == 'ip_in':
                 q = cls.get_ip_in_q(name, val)
-            elif match in ("exact", "contains", "startswith", "endswith", "regex", "gte", "lte", "gt", "lt"):
+            elif match in ("contains", "startswith", "endswith", "gte", "lte", "gt", "lt"):
                 lookup = "{}__{}".format(name, match)
                 q = Q(**{lookup: val})
+            elif match == 'regex':
+                try:
+                    re.compile(val)
+                    lookup = "{}__{}".format(name, match)
+                    q = Q(**{lookup: val})
+                except re.error:
+                    q = Q(pk__isnull=True)
             elif match == "not":
                 q = ~Q(**{name: val})
             elif match in ['m2m', 'in']:
@@ -392,7 +396,8 @@ class RelatedManager:
         return self.filter_queryset_by_model(value, to_model)
 
     def get_attr_q(self):
-        q = self._get_filter_attrs_q(self.value, apps.get_model(self.field.to))
+        to_model = apps.get_model(self.field.to)
+        q = self._get_filter_attrs_q(self.value, to_model)
         return q
 
     def all(self):
@@ -441,13 +446,11 @@ class JSONManyToManyDescriptor:
         # 自定义的情况：比如 nodes, category
         res = True
         to_model = apps.get_model(self.field.to)
-        src_model = self.field.model
-        field_name = self.field.name
-        custom_attr_filter = getattr(src_model, "get_filter_{}_attr_q".format(field_name), None)
+        custom_attr_filter = getattr(to_model, "get_json_filter_attr_q", None)
 
         custom_q = Q()
         for rule in attr_rules:
-            value = getattr(obj, rule['name'], '')
+            value = getattr(obj, rule['name'], None) or ''
             rule_value = rule.get('value', '')
             rule_match = rule.get('match', 'exact')
 
@@ -458,17 +461,22 @@ class JSONManyToManyDescriptor:
                     continue
 
             if rule_match == 'in':
-                res &= value in rule_value
+                res &= value in rule_value or '*' in rule_value
             elif rule_match == 'exact':
-                res &= value == rule_value
+                res &= value == rule_value or rule_value == '*'
             elif rule_match == 'contains':
-                res &= rule_value in value
+                res &= (rule_value in value)
             elif rule_match == 'startswith':
                 res &= str(value).startswith(str(rule_value))
             elif rule_match == 'endswith':
                 res &= str(value).endswith(str(rule_value))
             elif rule_match == 'regex':
-                res &= re.match(rule_value, value)
+                try:
+                    matched = bool(re.search(r'{}'.format(rule_value), value))
+                except Exception as e:
+                    logging.error('Error regex match: %s', e)
+                    matched = False
+                res &= matched
             elif rule_match == 'not':
                 res &= value != rule_value
             elif rule['match'] == 'gte':
@@ -482,13 +490,19 @@ class JSONManyToManyDescriptor:
             elif rule['match'] == 'ip_in':
                 if isinstance(rule_value, str):
                     rule_value = [rule_value]
-                res &= contains_ip(value, rule_value)
+                res &= '*' in rule_value or contains_ip(value, rule_value)
             elif rule['match'] == 'm2m':
                 if isinstance(value, Manager):
                     value = value.values_list('id', flat=True)
+                elif isinstance(value, QuerySet):
+                    value = value.values_list('id', flat=True)
+                elif isinstance(value, models.Model):
+                    value = [value.id]
+                if isinstance(rule_value, (str, int)):
+                    rule_value = [rule_value]
                 value = set(map(str, value))
                 rule_value = set(map(str, rule_value))
-                res &= rule_value.issubset(value)
+                res &= bool(value & rule_value)
             else:
                 logging.error("unknown match: {}".format(rule['match']))
                 res &= False
@@ -500,14 +514,23 @@ class JSONManyToManyDescriptor:
         return res
 
     def get_filter_q(self, instance):
+        """
+        这个是某个 instance 获取 关联 资源的 filter q
+        :param instance:
+        :return:
+        """
         model_cls = self.field.model
         field_name = self.field.column
         q = Q(**{f'{field_name}__type': 'all'}) | \
-            Q(**{f'{field_name}__type': 'ids', f'{field_name}__ids__contains': [str(instance.id)]})
+            Q(**{
+                f'{field_name}__type': 'ids',
+                f'{field_name}__ids__contains': [str(instance.id)]
+            })
         queryset_id_attrs = model_cls.objects \
             .filter(**{'{}__type'.format(field_name): 'attrs'}) \
             .values_list('id', '{}__attrs'.format(field_name))
-        ids = [str(_id) for _id, attr_rules in queryset_id_attrs if self.is_match(instance, attr_rules)]
+        ids = [str(_id) for _id, attr_rules in queryset_id_attrs
+               if self.is_match(instance, attr_rules)]
         if ids:
             q |= Q(id__in=ids)
         return q
@@ -543,9 +566,13 @@ class JSONManyToManyField(models.JSONField):
         if val["type"] == "ids":
             if not isinstance(val["ids"], list):
                 raise ValueError(_("Invalid ids for ids, should be a list"))
+            if not val["ids"]:
+                raise ValueError(_("This field is required."))
         elif val["type"] == "attrs":
             if not isinstance(val["attrs"], list):
                 raise ValueError(_("Invalid attrs, should be a list of dict"))
+            if not val["attrs"]:
+                raise ValueError(_("This field is required."))
             for attr in val["attrs"]:
                 if not isinstance(attr, dict):
                     raise ValueError(_("Invalid attrs, should be a list of dict"))

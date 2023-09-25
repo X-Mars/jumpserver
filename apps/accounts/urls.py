@@ -9,6 +9,7 @@ app_name = 'accounts'
 router = BulkRouter()
 
 router.register(r'accounts', api.AccountViewSet, 'account')
+router.register(r'virtual-accounts', api.VirtualAccountViewSet, 'virtual-account')
 router.register(r'gathered-accounts', api.GatheredAccountViewSet, 'gathered-account')
 router.register(r'account-secrets', api.AccountSecretsViewSet, 'account-secret')
 router.register(r'account-templates', api.AccountTemplateViewSet, 'account-template')
@@ -39,7 +40,7 @@ urlpatterns = [
 
     path('push-account/<uuid:pk>/asset/remove/', api.PushAccountRemoveAssetApi.as_view(),
          name='push-account-remove-asset'),
-    path('push-accountt/<uuid:pk>/asset/add/', api.PushAccountAddAssetApi.as_view(), name='push-account-add-asset'),
+    path('push-account/<uuid:pk>/asset/add/', api.PushAccountAddAssetApi.as_view(), name='push-account-add-asset'),
     path('push-account/<uuid:pk>/nodes/', api.PushAccountNodeAddRemoveApi.as_view(),
          name='push-account-add-or-remove-node'),
     path('push-account/<uuid:pk>/assets/', api.PushAccountAssetsListApi.as_view(), name='push-account-assets'),

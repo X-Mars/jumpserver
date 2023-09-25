@@ -10,6 +10,7 @@ from .cloud import CloudTypes
 from .custom import CustomTypes
 from .database import DatabaseTypes
 from .device import DeviceTypes
+from .gpt import GPTTypes
 from .host import HostTypes
 from .web import WebTypes
 
@@ -18,7 +19,7 @@ class AllTypes(ChoicesMixin):
     choices: list
     includes = [
         HostTypes, DeviceTypes, DatabaseTypes,
-        CloudTypes, WebTypes, CustomTypes
+        CloudTypes, WebTypes, CustomTypes, GPTTypes
     ]
     _category_constrains = {}
 
@@ -147,6 +148,7 @@ class AllTypes(ChoicesMixin):
             (Category.DATABASE, DatabaseTypes),
             (Category.CLOUD, CloudTypes),
             (Category.WEB, WebTypes),
+            (Category.GPT, GPTTypes),
             (Category.CUSTOM, CustomTypes),
         )
 
@@ -193,7 +195,6 @@ class AllTypes(ChoicesMixin):
         }
         return node
 
-
     @classmethod
     def asset_to_node(cls, asset, pid):
         node = {
@@ -223,7 +224,7 @@ class AllTypes(ChoicesMixin):
         return dict(id='ROOT', name=_('All types'), title=_('All types'), open=True, isParent=True)
 
     @classmethod
-    def get_tree_nodes(cls, resource_platforms, include_asset=False):
+    def get_tree_nodes(cls, resource_platforms, include_asset=False, get_root=True):
         from ..models import Platform
         platform_count = defaultdict(int)
         for platform_id in resource_platforms:
@@ -238,10 +239,10 @@ class AllTypes(ChoicesMixin):
             category_type_mapper[p.category] += platform_count[p.id]
             tp_platforms[p.category + '_' + p.type].append(p)
 
-        nodes = [cls.get_root_nodes()]
+        nodes = [cls.get_root_nodes()] if get_root else []
         for category, type_cls in cls.category_types():
             # Category 格式化
-            meta = {'type': 'category', 'category': category.value}
+            meta = {'type': 'category', 'category': category.value, '_type': category.value}
             category_node = cls.choice_to_node(category, 'ROOT', meta=meta)
             category_count = category_type_mapper.get(category, 0)
             category_node['name'] += f'({category_count})'
@@ -351,7 +352,7 @@ class AllTypes(ChoicesMixin):
 
                 for d in platform_datas:
                     name = d['name']
-                    # print("\t    - Platform: {}".format(name))
+                    print("\t    - Platform: {}".format(name))
                     _automation = d.pop('automation', {})
                     _protocols = d.pop('_protocols', [])
                     _protocols_setting = d.pop('protocols_setting', {})
@@ -364,7 +365,7 @@ class AllTypes(ChoicesMixin):
                         setting = _protocols_setting.get(p['name'], {})
                         p['required'] = setting.pop('required', False)
                         p['default'] = setting.pop('default', False)
-                        p['setting'] = {**p.get('setting', {}), **setting}
+                        p['setting'] = {**p.get('setting', {}).get('default', ''), **setting}
 
                     platform_data = {
                         **default_platform_data, **d,

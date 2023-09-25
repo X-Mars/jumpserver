@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 #
-import phonenumbers
 
 from functools import partial
 
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from common.serializers import CommonBulkSerializerMixin
@@ -57,14 +56,15 @@ class RolesSerializerMixin(serializers.Serializer):
         if request.user.is_anonymous:
             return fields
 
-        action = view.action or "list"
-        if action in ("partial_bulk_update", "bulk_update", "partial_update", "update"):
-            action = "create"
-
         model_cls_field_mapper = {
             SystemRoleBinding: ["system_roles"],
             OrgRoleBinding: ["org_roles"],
         }
+
+        update_actions = ("partial_bulk_update", "bulk_update", "partial_update", "update")
+        action = view.action or "list"
+        if action in update_actions:
+            action = "create"
 
         for model_cls, fields_names in model_cls_field_mapper.items():
             perms = RBACPermission.parse_action_model_perms(action, model_cls)
@@ -132,7 +132,7 @@ class UserSerializer(RolesSerializerMixin, CommonBulkSerializerMixin, serializer
             "last_login", "date_updated"  # 日期字段
         ]
         fields_bool = [
-            "is_superuser",
+            "is_superuser", "is_org_admin",
             "is_service_account", "is_valid",
             "is_expired", "is_active",  # 布尔字段
             "is_otp_secret_key_bound", "can_public_key_auth",
@@ -157,7 +157,7 @@ class UserSerializer(RolesSerializerMixin, CommonBulkSerializerMixin, serializer
             "is_first_login", "wecom_id", "dingtalk_id",
             "feishu_id",
         ]
-        disallow_self_update_fields = ["is_active"]
+        disallow_self_update_fields = ["is_active", "system_roles", "org_roles"]
         extra_kwargs = {
             "password": {
                 "write_only": True,
@@ -170,6 +170,7 @@ class UserSerializer(RolesSerializerMixin, CommonBulkSerializerMixin, serializer
             "is_active": {"label": _("Is active")},
             "is_valid": {"label": _("Is valid")},
             "is_service_account": {"label": _("Is service account")},
+            "is_org_admin": {"label": _("Is org admin")},
             "is_expired": {"label": _("Is expired")},
             "avatar_url": {"label": _("Avatar url")},
             "created_by": {"read_only": True, "allow_blank": True},

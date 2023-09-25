@@ -1,14 +1,14 @@
-from django.core.cache import cache
-from django.conf import settings
-from django.core.mail import send_mail
 from celery import shared_task
-
-from common.sdk.sms.exceptions import CodeError, CodeExpired, CodeSendTooFrequently
-from common.sdk.sms.endpoint import SMS
-from common.exceptions import JMSException
-from common.utils.random import random_string
-from common.utils import get_logger
+from django.conf import settings
+from django.core.cache import cache
 from django.utils.translation import gettext_lazy as _
+
+from common.exceptions import JMSException
+from common.sdk.sms.endpoint import SMS
+from common.sdk.sms.exceptions import CodeError, CodeExpired, CodeSendTooFrequently
+from common.tasks import send_mail_async
+from common.utils import get_logger
+from common.utils.random import random_string
 
 logger = get_logger(__file__)
 
@@ -26,6 +26,7 @@ class SendAndVerifyCodeUtil(object):
         self.target = target
         self.backend = backend
         self.key = key or self.KEY_TMPL.format(target)
+        self.verify_key = self.key + '_verify'
         self.timeout = settings.VERIFY_CODE_TTL if timeout is None else timeout
         self.other_args = kwargs
 
@@ -47,6 +48,11 @@ class SendAndVerifyCodeUtil(object):
             raise
 
     def verify(self, code):
+        times = cache.get(self.verify_key, 0)
+        if times >= 3:
+            self.__clear()
+            raise CodeExpired
+        cache.set(self.verify_key, times + 1, timeout=self.timeout)
         right = cache.get(self.key)
         if not right:
             raise CodeExpired
@@ -59,6 +65,7 @@ class SendAndVerifyCodeUtil(object):
 
     def __clear(self):
         cache.delete(self.key)
+        cache.delete(self.verify_key)
 
     def __ttl(self):
         return cache.ttl(self.key)
@@ -78,8 +85,7 @@ class SendAndVerifyCodeUtil(object):
     def __send_with_email(self):
         subject = self.other_args.get('subject')
         message = self.other_args.get('message')
-        from_email = settings.EMAIL_FROM or settings.EMAIL_HOST_USER
-        send_mail(subject, message, from_email, [self.target], html_message=message)
+        send_mail_async(subject, message, [self.target], html_message=message)
 
     def __send(self, code):
         """
@@ -91,4 +97,4 @@ class SendAndVerifyCodeUtil(object):
             self.__send_with_email()
 
         cache.set(self.key, self.code, self.timeout)
-        logger.info(f'Send verify code to {self.target}: {code}')
+        logger.debug(f'Send verify code to {self.target}')

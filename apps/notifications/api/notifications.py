@@ -1,12 +1,12 @@
 from rest_framework.mixins import ListModelMixin, UpdateModelMixin, RetrieveModelMixin
-from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from common.api import JMSGenericViewSet
 from common.permissions import IsValidUser
-from notifications.notifications import system_msgs
-from notifications.models import SystemMsgSubscription, UserMsgSubscription
 from notifications.backends import BACKEND
+from notifications.models import SystemMsgSubscription, UserMsgSubscription
+from notifications.notifications import system_msgs
 from notifications.serializers import (
     SystemMsgSubscriptionSerializer, SystemMsgSubscriptionByCategorySerializer,
     UserMsgSubscriptionSerializer,
@@ -32,9 +32,9 @@ class BackendListView(APIView):
         return Response(data=data)
 
 
-class SystemMsgSubscriptionViewSet(ListModelMixin,
-                                   UpdateModelMixin,
-                                   JMSGenericViewSet):
+class SystemMsgSubscriptionViewSet(
+    ListModelMixin, UpdateModelMixin, JMSGenericViewSet
+):
     lookup_field = 'message_type'
     queryset = SystemMsgSubscription.objects.all()
     serializer_classes = {
@@ -96,6 +96,8 @@ def get_all_test_messages(request):
     import textwrap
     from ..notifications import Message
     from django.shortcuts import HttpResponse
+    if not request.user.is_superuser:
+        return HttpResponse('没有权限', status=401)
 
     msgs_cls = Message.get_all_sub_messages()
     html_data = '<h3>HTML 格式 </h3>'

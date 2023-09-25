@@ -10,8 +10,7 @@ from django.core.cache import cache
 from django.db import models, transaction
 from django.db.models import Q, Manager
 from django.db.transaction import atomic
-from django.utils.translation import ugettext
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _, gettext
 
 from common.db.models import output_as_string
 from common.utils import get_logger
@@ -163,7 +162,7 @@ class FamilyMixin:
         return key
 
     def get_next_child_preset_name(self):
-        name = ugettext("New node")
+        name = gettext("New node")
         values = [
             child.value[child.value.rfind(' '):]
             for child in self.get_children()
@@ -403,12 +402,7 @@ class NodeAssetsMixin(NodeAllAssetsMappingMixin):
         return Asset.objects.filter(q).distinct()
 
     def get_assets_amount(self):
-        q = Q(node__key__startswith=f'{self.key}:') | Q(node__key=self.key)
-        return self.assets.through.objects.filter(q).count()
-
-    def get_assets_account_by_children(self):
-        children = self.get_all_children().values_list()
-        return self.assets.through.objects.filter(node_id__in=children).count()
+        return self.get_all_assets().count()
 
     @classmethod
     def get_node_all_assets_by_key_v2(cls, key):
@@ -428,18 +422,6 @@ class NodeAssetsMixin(NodeAllAssetsMappingMixin):
         from .asset import Asset
         assets = Asset.objects.filter(nodes=self)
         return assets.distinct()
-
-    def get_assets_for_tree(self):
-        return self.get_assets().only(
-            "id", "name", "address", "platform_id",
-            "org_id", "is_active"
-        ).prefetch_related('platform')
-
-    def get_all_assets_for_tree(self):
-        return self.get_all_assets().only(
-            "id", "name", "address", "platform_id",
-            "org_id", "is_active"
-        ).prefetch_related('platform')
 
     def get_valid_assets(self):
         return self.get_assets().valid()

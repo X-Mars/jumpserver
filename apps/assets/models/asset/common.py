@@ -8,7 +8,7 @@ from collections import defaultdict
 from django.db import models
 from django.db.models import Q
 from django.forms import model_to_dict
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 from assets import const
 from common.db.fields import EncryptMixin
@@ -206,15 +206,14 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
     @lazyproperty
     def auto_config(self):
         platform = self.platform
-        automation = self.platform.automation
         auto_config = {
             'su_enabled': platform.su_enabled,
             'domain_enabled': platform.domain_enabled,
             'ansible_enabled': False
         }
+        automation = getattr(self.platform, 'automation', None)
         if not automation:
             return auto_config
-
         auto_config.update(model_to_dict(automation))
         return auto_config
 
@@ -222,8 +221,11 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
         return self.address
 
     def get_target_ssh_port(self):
-        protocol = self.protocols.all().filter(name='ssh').first()
-        return protocol.port if protocol else 22
+        return self.get_protocol_port('ssh')
+
+    def get_protocol_port(self, protocol):
+        protocol = self.protocols.all().filter(name=protocol).first()
+        return protocol.port if protocol else 0
 
     @property
     def is_valid(self):

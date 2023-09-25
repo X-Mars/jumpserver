@@ -2,7 +2,7 @@ from typing import List
 
 from rest_framework.request import Request
 
-from assets.models import Node, PlatformProtocol
+from assets.models import Node, Protocol
 from assets.utils import get_node_from_request, is_query_node_all_assets
 from common.utils import lazyproperty, timeit
 
@@ -70,22 +70,18 @@ class SerializeToTreeNodeMixin:
 
     @timeit
     def serialize_assets(self, assets, node_key=None, pid=None):
-        sftp_enabled_platform = PlatformProtocol.objects \
-            .filter(name='ssh', setting__sftp_enabled=True) \
-            .values_list('platform', flat=True) \
-            .distinct()
         if node_key is None:
             get_pid = lambda asset: getattr(asset, 'parent_key', '')
         else:
             get_pid = lambda asset: node_key
-
+        sftp_asset_ids = Protocol.objects.filter(name='sftp') \
+            .values_list('asset_id', flat=True)
+        sftp_asset_ids = list(sftp_asset_ids)
         data = [
             {
                 'id': str(asset.id),
                 'name': asset.name,
-                'title':
-                    f'{asset.address}\n{asset.comment}'
-                    if asset.comment else asset.address,
+                'title': f'{asset.address}\n{asset.comment}',
                 'pId': pid or get_pid(asset),
                 'isParent': False,
                 'open': False,
@@ -96,7 +92,7 @@ class SerializeToTreeNodeMixin:
                     'data': {
                         'platform_type': asset.platform.type,
                         'org_name': asset.org_name,
-                        'sftp': asset.platform_id in sftp_enabled_platform,
+                        'sftp': asset.id in sftp_asset_ids,
                         'name': asset.name,
                         'address': asset.address
                     },

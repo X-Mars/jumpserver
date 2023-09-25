@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 from django.db.models import Count
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 from common.serializers.mixin import ObjectRelatedField
 from orgs.mixins.serializers import BulkOrgResourceModelSerializer
@@ -24,9 +24,7 @@ class UserGroupSerializer(BulkOrgResourceModelSerializer):
         fields_small = fields_mini + [
             'comment', 'date_created', 'created_by'
         ]
-        fields = fields_mini + fields_small + [
-            'users', 'users_amount',
-        ]
+        fields = fields_mini + fields_small + ['users']
         extra_kwargs = {
             'created_by': {'label': _('Created by'), 'read_only': True},
             'users_amount': {'label': _('Users amount')},

@@ -2,32 +2,34 @@
 #
 
 from __future__ import unicode_literals
-import os
-import datetime
-from typing import Callable
 
-from django.db import IntegrityError
-from django.templatetags.static import static
+import datetime
+import os
+from typing import Callable
+from urllib.parse import urlparse
+
+from django.conf import settings
+from django.contrib.auth import BACKEND_SESSION_KEY
 from django.contrib.auth import login as auth_login, logout as auth_logout
-from django.http import HttpResponse, HttpRequest
+from django.db import IntegrityError
+from django.http import HttpRequest
 from django.shortcuts import reverse, redirect
+from django.templatetags.static import static
+from django.urls import reverse_lazy
 from django.utils.decorators import method_decorator
-from django.utils.translation import ugettext as _, get_language
+from django.utils.translation import gettext as _, get_language
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.debug import sensitive_post_parameters
 from django.views.generic.base import TemplateView, RedirectView
 from django.views.generic.edit import FormView
-from django.conf import settings
-from django.urls import reverse_lazy
-from django.contrib.auth import BACKEND_SESSION_KEY
 
 from common.utils import FlashMessageUtil, static_or_direct
 from users.utils import (
     redirect_user_first_login_or_index
 )
-from ..const import RSA_PRIVATE_KEY, RSA_PUBLIC_KEY
 from .. import mixins, errors
+from ..const import RSA_PRIVATE_KEY, RSA_PUBLIC_KEY
 from ..forms import get_user_login_form_cls
 
 __all__ = [
@@ -39,6 +41,7 @@ __all__ = [
 class UserLoginContextMixin:
     get_user_mfa_context: Callable
     request: HttpRequest
+    error_origin: str
 
     def get_support_auth_methods(self):
         auth_methods = [
@@ -87,6 +90,12 @@ class UserLoginContextMixin:
                 'enabled': settings.AUTH_FEISHU,
                 'url': reverse('authentication:feishu-qr-login'),
                 'logo': static('img/login_feishu_logo.png')
+            },
+            {
+                'name': _("Passkey"),
+                'enabled': settings.AUTH_PASSKEY,
+                'url': reverse('api-auth:passkey-login'),
+                'logo': static('img/login_passkey.png')
             }
         ]
         return [method for method in auth_methods if method['enabled']]
@@ -133,8 +142,27 @@ class UserLoginContextMixin:
             count += 1
         return count
 
+    def set_csrf_error_if_need(self, context):
+        if not self.request.GET.get('csrf_failure'):
+            return context
+
+        http_origin = self.request.META.get('HTTP_ORIGIN')
+        http_referer = self.request.META.get('HTTP_REFERER')
+        http_origin = http_origin or http_referer
+
+        if not http_origin:
+            return context
+
+        try:
+            origin = urlparse(http_origin)
+            context['error_origin'] = str(origin.netloc)
+        except ValueError:
+            pass
+        return context
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
+        self.set_csrf_error_if_need(context)
         context.update({
             'demo_mode': os.environ.get("DEMO_MODE"),
             'auth_methods': self.get_support_auth_methods(),
@@ -203,7 +231,9 @@ class UserLoginView(mixins.AuthMixin, UserLoginContextMixin, FormView):
 
     def form_valid(self, form):
         if not self.request.session.test_cookie_worked():
-            return HttpResponse(_("Please enable cookies and try again."))
+            form.add_error(None, _("Login timeout, please try again."))
+            return self.form_invalid(form)
+
         # https://docs.djangoproject.com/en/3.1/topics/http/sessions/#setting-test-cookies
         self.request.session.delete_test_cookie()
 

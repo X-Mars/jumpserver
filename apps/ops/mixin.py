@@ -3,7 +3,7 @@
 import abc
 
 from django.db import models
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from .celery.utils import (
@@ -48,7 +48,8 @@ class PeriodTaskModelMixin(models.Model):
 
     def set_period_schedule(self):
         name, task, args, kwargs = self.get_register_task()
-        if not self.is_periodic:
+        is_active = self.is_active if hasattr(self, 'is_active') else True
+        if not self.is_periodic or not is_active:
             disable_celery_periodic_task(name)
             return
 

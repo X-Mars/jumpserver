@@ -1,4 +1,4 @@
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from common.serializers.fields import EncryptedField
@@ -33,7 +33,7 @@ class CommonSettingSerializer(serializers.Serializer):
     AUTH_OPENID_IGNORE_SSL_VERIFICATION = serializers.BooleanField(
         required=False, label=_('Ignore ssl verification')
     )
-    AUTH_OPENID_USER_ATTR_MAP = serializers.DictField(
+    AUTH_OPENID_USER_ATTR_MAP = serializers.JSONField(
         required=True, label=_('User attr map'),
         help_text=_('User attr map present how to map OpenID user attr to '
                     'jumpserver, username,name,email is jumpserver attr')

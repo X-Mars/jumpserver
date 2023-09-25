@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 #
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
-from orgs.mixins.serializers import BulkOrgResourceModelSerializer
+
 from audits.backends.db import OperateLogStore
-from common.serializers.fields import LabeledChoiceField
+from common.serializers.fields import LabeledChoiceField, ObjectRelatedField
 from common.utils import reverse, i18n_trans
 from common.utils.timezone import as_current_tz
 from ops.serializers.job import JobExecutionSerializer
+from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 from terminal.models import Session
+from users.models import User
 from . import models
 from .const import (
     ActionChoices, OperateChoices,
@@ -37,8 +39,8 @@ class FTPLogSerializer(serializers.ModelSerializer):
         fields_mini = ["id"]
         fields_small = fields_mini + [
             "user", "remote_addr", "asset", "account",
-            "org_id", "operate", "filename", "is_success",
-            "date_start",
+            "org_id", "operate", "filename", "date_start",
+            "is_success", "has_file",
         ]
         fields = fields_small
 
@@ -158,3 +160,31 @@ class ActivityUnionLogSerializer(serializers.Serializer):
                 api_to_ui=True, is_audit=True
             )
         return detail_url
+
+
+class FileSerializer(serializers.Serializer):
+    file = serializers.FileField(allow_empty_file=True)
+
+
+class UserSessionSerializer(serializers.ModelSerializer):
+    type = LabeledChoiceField(choices=LoginTypeChoices.choices, label=_("Type"))
+    user = ObjectRelatedField(required=False, queryset=User.objects, label=_('User'))
+    is_current_user_session = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.UserSession
+        fields_mini = ['id']
+        fields_small = fields_mini + [
+            'type', 'ip', 'city', 'user_agent', 'user', 'is_current_user_session',
+            'backend', 'backend_display', 'date_created', 'date_expired'
+        ]
+        fields = fields_small
+        extra_kwargs = {
+            "backend_display": {"label": _("Authentication backend")},
+        }
+
+    def get_is_current_user_session(self, obj):
+        request = self.context.get('request')
+        if not request:
+            return False
+        return request.session.session_key == obj.key

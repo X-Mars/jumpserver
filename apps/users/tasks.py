@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 #
+from datetime import timedelta
 
 from celery import shared_task
+from django.conf import settings
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from common.const.crontab import CRONTAB_AT_AM_TEN, CRONTAB_AT_PM_TWO
 from common.utils import get_logger
-from ops.celery.decorator import after_app_ready_start
-from ops.celery.utils import (
-    create_or_update_celery_periodic_tasks
-)
+from common.utils.timezone import utc_now
+from ops.celery.decorator import after_app_ready_start, register_as_period_task
+from ops.celery.utils import create_or_update_celery_periodic_tasks
+from orgs.utils import tmp_to_root_org
 from users.notifications import PasswordExpirationReminderMsg
 from users.notifications import UserExpirationReminderMsg
 from .models import User
@@ -75,3 +77,13 @@ def check_user_expired_periodic():
         }
     }
     create_or_update_celery_periodic_tasks(tasks)
+
+
+@shared_task(verbose_name=_('Check unused users'))
+@register_as_period_task(crontab=CRONTAB_AT_PM_TWO)
+@tmp_to_root_org()
+def check_unused_users():
+    uncommon_users_ttl = settings.SECURITY_UNCOMMON_USERS_TTL
+    seconds_to_subtract = uncommon_users_ttl * 24 * 60 * 60
+    t = utc_now() - timedelta(seconds=seconds_to_subtract)
+    User.objects.filter(last_login__lte=t).update(is_active=False)

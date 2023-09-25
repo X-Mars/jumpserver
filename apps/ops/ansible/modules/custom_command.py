@@ -64,7 +64,7 @@ name:
 from ansible.module_utils.basic import AnsibleModule
 
 from ops.ansible.modules_utils.custom_common import (
-    SSHClient, ssh_common_argument_spec
+    SSHClient, common_argument_spec
 )
 
 
@@ -85,14 +85,11 @@ def get_commands(module):
 
 
 def main():
-    argument_spec = ssh_common_argument_spec()
+    argument_spec = common_argument_spec()
     argument_spec.update(
         name=dict(required=True, aliases=['user']),
         password=dict(aliases=['pass'], no_log=True),
         commands=dict(type='list', required=False),
-        first_conn_delay_time=dict(
-            type='float', required=False, default=0.5
-        ),
     )
     module = AnsibleModule(argument_spec=argument_spec)
 
@@ -102,10 +99,10 @@ def main():
         module.fail_json(
             msg='No command found, please go to the platform details to add'
         )
-    err = ssh_client.execute(commands)
-    if err:
+    output, err_msg = ssh_client.execute(commands)
+    if err_msg:
         module.fail_json(
-            msg='There was a problem executing the command: %s' % err
+            msg='There was a problem executing the command: %s' % err_msg
         )
 
     user = module.params['name']

@@ -15,7 +15,7 @@ from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.shortcuts import reverse, redirect, get_object_or_404
 from django.utils.http import urlencode
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 from rest_framework.request import Request
 
 from acls.models import LoginACL
@@ -132,11 +132,11 @@ class CommonMixin:
             return user
 
         user_id = self.request.session.get('user_id')
-        auth_password = self.request.session.get('auth_password')
+        auth_ok = self.request.session.get('auth_password')
         auth_expired_at = self.request.session.get('auth_password_expired_at')
         auth_expired = auth_expired_at < time.time() if auth_expired_at else False
 
-        if not user_id or not auth_password or auth_expired:
+        if not user_id or not auth_ok or auth_expired:
             raise errors.SessionEmptyError()
 
         user = get_object_or_404(User, pk=user_id)
@@ -340,19 +340,23 @@ class AuthACLMixin:
 
     def _check_login_acl(self, user, ip):
         # ACL 限制用户登录
-        acl = LoginACL.match(user, ip)
+        acl = LoginACL.get_match_rule_acls(user, ip)
         if not acl:
             return
 
-        acl: LoginACL
-        if acl.is_action(acl.ActionChoices.accept):
+        if acl.is_action(LoginACL.ActionChoices.accept):
             return
 
-        if acl.is_action(acl.ActionChoices.reject):
+        if acl.is_action(LoginACL.ActionChoices.reject):
             raise errors.LoginACLIPAndTimePeriodNotAllowed(user.username, request=self.request)
 
         if acl.is_action(acl.ActionChoices.review):
             self.request.session['auth_confirm_required'] = '1'
+            self.request.session['auth_acl_id'] = str(acl.id)
+            return
+
+        if acl.is_action(acl.ActionChoices.notice):
+            self.request.session['auth_notice_required'] = '1'
             self.request.session['auth_acl_id'] = str(acl.id)
             return
 
@@ -370,18 +374,19 @@ class AuthACLMixin:
         logger.debug('Login confirm acl id: {}'.format(acl_id))
         if not acl_id:
             return
-        acl = LoginACL.filter_acl(user).filter(id=acl_id).first()
+
+        acl = LoginACL.get_user_acls(user).filter(id=acl_id).first()
         if not acl:
             return
         if not acl.is_action(acl.ActionChoices.review):
             return
-        self.get_ticket_or_create(acl)
+        self.get_ticket_or_create(acl, user)
         self.check_user_login_confirm()
 
-    def get_ticket_or_create(self, acl):
+    def get_ticket_or_create(self, acl, user):
         ticket = self.get_ticket()
         if not ticket or ticket.is_state(ticket.State.closed):
-            ticket = acl.create_confirm_ticket(self.request)
+            ticket = acl.create_confirm_ticket(self.request, user)
             self.request.session['auth_ticket_id'] = str(ticket.id)
         return ticket
 
@@ -460,6 +465,7 @@ class AuthMixin(CommonMixin, AuthPreCheckMixin, AuthACLMixin, MFAMixin, AuthPost
         self._check_password_require_reset_or_not(user)
         self._check_passwd_is_too_simple(user, password)
         self._check_passwd_need_update(user)
+        user.cache_login_password_if_need(password)
 
         # 校验login-mfa, 如果登录页面上显示 mfa 的话
         self._check_login_page_mfa_if_need(user)
@@ -478,6 +484,7 @@ class AuthMixin(CommonMixin, AuthPreCheckMixin, AuthACLMixin, MFAMixin, AuthPost
         request.session['auto_login'] = auto_login
         if not auth_backend:
             auth_backend = getattr(user, 'backend', settings.AUTH_BACKEND_MODEL)
+
         request.session['auth_backend'] = auth_backend
 
     def check_oauth2_auth(self, user: User, auth_backend):
@@ -510,7 +517,8 @@ class AuthMixin(CommonMixin, AuthPreCheckMixin, AuthACLMixin, MFAMixin, AuthPost
 
     def clear_auth_mark(self):
         keys = [
-            'auth_password', 'user_id', 'auth_confirm_required', 'auth_ticket_id', 'auth_acl_id'
+            'auth_password', 'user_id', 'auth_confirm_required',
+            'auth_notice_required', 'auth_ticket_id', 'auth_acl_id'
         ]
         for k in keys:
             self.request.session.pop(k, '')

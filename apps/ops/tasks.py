@@ -2,7 +2,7 @@
 
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from django_celery_beat.models import PeriodicTask
 
 from common.utils import get_logger, get_object_or_none
@@ -35,7 +35,12 @@ def job_task_activity_callback(self, job_id, *args, **kwargs):
     activity_callback=job_task_activity_callback
 )
 def run_ops_job(job_id):
-    job = get_object_or_none(Job, id=job_id)
+    with tmp_to_root_org():
+        job = get_object_or_none(Job, id=job_id)
+    if not job:
+        logger.error("Did not get the execution: {}".format(job_id))
+        return
+
     with tmp_to_org(job.org):
         execution = job.create_execution()
         execution.creator = job.creator
@@ -64,7 +69,13 @@ def job_execution_task_activity_callback(self, execution_id, *args, **kwargs):
     activity_callback=job_execution_task_activity_callback
 )
 def run_ops_job_execution(execution_id, **kwargs):
-    execution = get_object_or_none(JobExecution, id=execution_id)
+    with tmp_to_root_org():
+        execution = get_object_or_none(JobExecution, id=execution_id)
+
+    if not execution:
+        logger.error("Did not get the execution: {}".format(execution_id))
+        return
+
     try:
         with tmp_to_org(execution.org):
             execution.start()

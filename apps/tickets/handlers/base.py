@@ -1,6 +1,6 @@
 import html2text
 from django.template.loader import render_to_string
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 
 from common.utils import get_logger
 from tickets.const import TicketState, TicketType
@@ -98,7 +98,7 @@ class BaseHandler:
         context = self._diff_prev_approve_context(state)
         context.update({'approve_info': approve_info})
         body = self.safe_html_script(
-            render_to_string('tickets/ticket_approve_diff.html', context)
+            render_to_string('tickets/user_login_reminder.html', context)
         )
         data = {
             'body': body,

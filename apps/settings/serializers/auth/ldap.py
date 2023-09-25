@@ -1,4 +1,4 @@
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from common.serializers.fields import EncryptedField
@@ -54,7 +54,7 @@ class LDAPSettingSerializer(serializers.Serializer):
         max_length=1024, required=True, label=_('User search filter'),
         help_text=_('Choice may be (cn|uid|sAMAccountName)=%(user)s)')
     )
-    AUTH_LDAP_USER_ATTR_MAP = serializers.DictField(
+    AUTH_LDAP_USER_ATTR_MAP = serializers.JSONField(
         required=True, label=_('User attr map'),
         help_text=_('User attr map present how to map LDAP user attr to '
                     'jumpserver, username,name,email is jumpserver attr')

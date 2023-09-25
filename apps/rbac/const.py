@@ -1,5 +1,5 @@
 from django.db import models
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 
 class Scope(models.TextChoices):
@@ -22,7 +22,8 @@ exclude_permissions = (
     ('common', 'setting', '*', '*'),
 
     ('authentication', 'privatetoken', '*', '*'),
-    ('authentication', 'connectiontoken', 'delete', 'connectiontoken'),
+    ('authentication', 'connectiontoken', 'delete,change', 'connectiontoken'),
+    ('authentication', 'connectiontoken', 'view', 'connectiontokensecret'),
     ('authentication', 'ssotoken', '*', '*'),
     ('authentication', 'superconnectiontoken', 'change,delete', 'superconnectiontoken'),
     ('authentication', 'temptoken', 'delete', 'temptoken'),
@@ -91,7 +92,8 @@ exclude_permissions = (
     ('audits', 'activitylog', 'add,delete,change', 'activitylog'),
     ('audits', 'passwordchangelog', 'add,change,delete', 'passwordchangelog'),
     ('audits', 'userloginlog', 'add,change,delete,change', 'userloginlog'),
-    ('audits', 'ftplog', 'change,delete', 'ftplog'),
+    ('audits', 'usersession', 'add,delete,change', 'usersession'),
+    ('audits', 'ftplog', 'delete', 'ftplog'),
     ('tickets', 'ticketassignee', '*', 'ticketassignee'),
     ('tickets', 'ticketflow', 'add,delete', 'ticketflow'),
     ('tickets', 'comment', '*', '*'),
@@ -143,11 +145,16 @@ only_system_permissions = (
     ('terminal', 'task', '*', '*'),
     ('terminal', 'endpoint', '*', '*'),
     ('terminal', 'endpointrule', '*', '*'),
-    ('authentication', '*', '*', '*'),
+    ('authentication', 'accesskey', '*', '*'),
+    ('authentication', 'superconnectiontoken', '*', '*'),
+    ('authentication', 'temptoken', '*', '*'),
+    ('authentication', 'passkey', '*', '*'),
     ('tickets', '*', '*', '*'),
     ('orgs', 'organization', 'view', 'rootorg'),
     ('terminal', 'applet', '*', '*'),
     ('terminal', 'applethost', '*', '*'),
+    ('acls', 'loginacl', '*', '*'),
+    ('acls', 'connectmethodacl', '*', '*')
 )
 
 only_org_permissions = (

@@ -1,5 +1,5 @@
 from django.db import models
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 
 class StrategyChoice(models.TextChoices):
@@ -45,10 +45,26 @@ class RunasPolicies(models.TextChoices):
     skip = 'skip', _('Skip')
 
 
-class Modules(models.TextChoices):
+class JobModules(models.TextChoices):
     shell = 'shell', _('Shell')
     winshell = 'win_shell', _('Powershell')
     python = 'python', _('Python')
+    mysql = 'mysql', _('MySQL')
+    postgresql = 'postgresql', _('PostgreSQL')
+    sqlserver = 'sqlserver', _('SQLServer')
+    raw = 'raw', _('Raw')
+
+
+class AdHocModules(models.TextChoices):
+    shell = 'shell', _('Shell')
+    winshell = 'win_shell', _('Powershell')
+    python = 'python', _('Python')
+    mysql = 'mysql', _('MySQL')
+    mariadb = 'mariadb', _('MariaDB')
+    postgresql = 'postgresql', _('PostgreSQL')
+    sqlserver = 'sqlserver', _('SQLServer')
+    oracle = 'oracle', _('Oracle')
+    raw = 'raw', _('Raw')
 
 
 class JobStatus(models.TextChoices):
