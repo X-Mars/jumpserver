@@ -10,22 +10,47 @@ __all__ = ['CommandFilterACLViewSet', 'CommandGroupViewSet']
 
 class CommandGroupViewSet(OrgBulkModelViewSet):
     model = models.CommandGroup
-    filterset_fields = ('name',)
-    search_fields = filterset_fields
+    chat_ai_create_reuse = {
+        'lookup_operation_id': 'acls_command_groups_list',
+        'fields': [
+            {
+                'body_field': 'type',
+                'query_parameter': 'type',
+                'unwrap': 'value',
+                'default': models.CommandGroup.TypeChoices.command,
+            },
+            {
+                'body_field': 'content',
+                'query_parameter': 'content',
+            },
+            {
+                'body_field': 'ignore_case',
+                'query_parameter': 'ignore_case',
+                'default': True,
+            },
+        ],
+    }
+    filterset_fields = (
+        'name', 'type', 'content', 'ignore_case', 'command_filters'
+    )
+    search_fields = ('name',)
     serializer_class = serializers.CommandGroupSerializer
 
 
 class CommandACLFilter(ACLUserAssetFilterMixin):
     class Meta:
         model = models.CommandFilterACL
-        fields = ['name', ]
+        fields = ['id', 'name', 'users', 'assets', 'action']
 
 
 class CommandFilterACLViewSet(OrgBulkModelViewSet):
     model = models.CommandFilterACL
     filterset_class = CommandACLFilter
     search_fields = ['name']
-    serializer_class = serializers.CommandFilterACLSerializer
+    serializer_classes = {
+        'default': serializers.CommandFilterACLSerializer,
+        'list': serializers.CommandFilterACLListSerializer,
+    }
     rbac_perms = {
         'command_review': 'tickets.add_superticket'
     }

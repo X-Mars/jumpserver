@@ -1,8 +1,8 @@
-from accounts.const import AutomationTypes
-from assets.automations.ping_gateway.manager import PingGatewayManager
-from common.utils import get_logger
+from django.utils.translation import gettext_lazy as _
 
-logger = get_logger(__name__)
+from accounts.const import AutomationTypes
+from assets.automations.base.manager import print_automation_log
+from assets.automations.ping_gateway.manager import PingGatewayManager
 
 
 class VerifyGatewayAccountManager(PingGatewayManager):
@@ -13,7 +13,9 @@ class VerifyGatewayAccountManager(PingGatewayManager):
 
     @staticmethod
     def before_runner_start():
-        logger.info(">>> 开始执行测试网关账号可连接性任务")
+        print_automation_log(
+            _("Checking gateway account connectivity"), 'progress'
+        )
 
     def get_accounts(self, gateway):
         account_ids = self.execution.snapshot['accounts']

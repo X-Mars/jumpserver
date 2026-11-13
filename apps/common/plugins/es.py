@@ -2,6 +2,7 @@
 #
 import datetime
 import inspect
+
 import sys
 
 if sys.version_info.major == 3 and sys.version_info.minor >= 10:
@@ -14,9 +15,16 @@ from uuid import UUID
 
 from django.utils.translation import gettext_lazy as _
 from django.db.models import QuerySet as DJQuerySet
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
-from elasticsearch.exceptions import RequestError, NotFoundError
+from django.db.models import Q
+from elasticsearch7 import Elasticsearch
+from elasticsearch7.helpers import bulk
+from elasticsearch7.exceptions import RequestError, SSLError
+from elasticsearch7.exceptions import NotFoundError as NotFoundError7
+from elasticsearch7.exceptions import UnsupportedProductError as UnsupportedProductError7
+
+from elasticsearch8.exceptions import NotFoundError as NotFoundError8
+from elasticsearch8.exceptions import BadRequestError
+from elasticsearch8.exceptions import UnsupportedProductError as UnsupportedProductError8
 
 from common.utils.common import lazyproperty
 from common.utils import get_logger
@@ -25,10 +33,20 @@ from common.exceptions import JMSException
 
 logger = get_logger(__file__)
 
+UNSUPPORTED_PRODUCT_ERRORS = (
+    UnsupportedProductError7,
+    UnsupportedProductError8,
+)
+
 
 class InvalidElasticsearch(JMSException):
     default_code = 'invalid_elasticsearch'
     default_detail = _('Invalid elasticsearch config')
+
+
+class InvalidElasticsearchProduct(JMSException):
+    default_code = 'invalid_elasticsearch_product'
+    default_detail = _('The server is not Elasticsearch or this product is not supported')
 
 
 class NotSupportElasticsearch8(JMSException):
@@ -36,9 +54,100 @@ class NotSupportElasticsearch8(JMSException):
     default_detail = _('Not Support Elasticsearch8')
 
 
-class ES(object):
-    def __init__(self, config, properties, keyword_fields, exact_fields=None, match_fields=None):
+class InvalidElasticsearchSSL(JMSException):
+    default_code = 'invalid_elasticsearch_SSL'
+    default_detail = _(
+        'Connection failed: Self-signed certificate used. Please check server certificate configuration')
 
+
+class ESClient(object):
+
+    def __new__(cls, *args, **kwargs):
+        version = get_es_client_version(**kwargs)
+        if version == 6:
+            return ESClientV6(*args, **kwargs)
+        elif version == 7:
+            return ESClientV7(*args, **kwargs)
+        elif version in (8, 9):
+            return ESClientV8(*args, **kwargs)
+        raise ValueError('Unsupported ES_VERSION %r' % version)
+
+
+class ESClientBase(object):
+    @classmethod
+    def get_properties(cls, data, index):
+        return data[index]['mappings']['properties']
+
+    @classmethod
+    def get_mapping(cls, properties):
+        return {'mappings': {'properties': properties}}
+
+
+class ESClientV7(ESClientBase):
+    def __init__(self, *args, **kwargs):
+        from elasticsearch7 import Elasticsearch
+        self.es = Elasticsearch(*args, **kwargs)
+
+    @classmethod
+    def get_sort(cls, field, direction):
+        return f'{field}:{direction}'
+
+    @classmethod
+    def get_sorts(cls, sorts: list):
+        return ','.join(sorts)
+
+
+class ESClientV6(ESClientV7):
+
+    @classmethod
+    def get_properties(cls, data, index):
+        return data[index]['mappings']['data']['properties']
+
+    @classmethod
+    def get_mapping(cls, properties):
+        return {'mappings': {'data': {'properties': properties}}}
+
+
+class ESClientV8(ESClientBase):
+    def __init__(self, *args, **kwargs):
+        from elasticsearch8 import Elasticsearch
+        self.es = Elasticsearch(*args, **kwargs)
+
+    @classmethod
+    def get_sort(cls, field, direction):
+        return {field: {'order': direction}}
+
+    @classmethod
+    def get_sorts(cls, sorts: list):
+        return sorts
+
+
+def raise_invalid_elasticsearch(exc):
+    logger.warning('Elasticsearch validation failed: %s', exc)
+    if isinstance(exc, UNSUPPORTED_PRODUCT_ERRORS):
+        raise InvalidElasticsearchProduct
+    raise InvalidElasticsearch
+
+
+def get_es_client_version(**kwargs):
+    try:
+        es = Elasticsearch(**kwargs)
+        info = es.info()
+        version = int(info['version']['number'].split('.')[0])
+        return version
+    except SSLError:
+        raise InvalidElasticsearchSSL
+    except Exception as e:
+        raise_invalid_elasticsearch(e)
+
+
+class ES(object):
+
+    def __init__(
+            self, config, properties, keyword_fields,
+            exact_fields=None, fuzzy_fields=None, match_fields=None, **kwargs
+    ):
+        self.version = 7
         self.config = config
         hosts = self.config.get('HOSTS')
         kwargs = self.config.get('OTHER', {})
@@ -46,14 +155,18 @@ class ES(object):
         ignore_verify_certs = kwargs.pop('IGNORE_VERIFY_CERTS', False)
         if ignore_verify_certs:
             kwargs['verify_certs'] = None
-        self.es = Elasticsearch(hosts=hosts, max_retries=0, **kwargs)
+        try:
+            self.client = ESClient(hosts=hosts, max_retries=0, **kwargs)
+        except Exception as e:
+            raise_invalid_elasticsearch(e)
+        self.es = self.client.es
         self.index_prefix = self.config.get('INDEX') or 'jumpserver'
         self.is_index_by_date = bool(self.config.get('INDEX_BY_DATE', False))
 
         self.index = None
         self.query_index = None
         self.properties = properties
-        self.exact_fields, self.match_fields, self.keyword_fields = set(), set(), set()
+        self.exact_fields, self.match_fields, self.keyword_fields, self.fuzzy_fields = set(), set(), set(), set()
 
         if isinstance(keyword_fields, Iterable):
             self.keyword_fields.update(keyword_fields)
@@ -61,6 +174,8 @@ class ES(object):
             self.exact_fields.update(exact_fields)
         if isinstance(match_fields, Iterable):
             self.match_fields.update(match_fields)
+        if isinstance(fuzzy_fields, Iterable):
+            self.fuzzy_fields.update(fuzzy_fields)
 
         self.init_index()
         self.doc_type = self.config.get("DOC_TYPE") or '_doc'
@@ -83,26 +198,14 @@ class ES(object):
         if not self.ping(timeout=2):
             return False
 
-        info = self.es.info()
-        version = info['version']['number'].split('.')[0]
-
-        if version == '8':
-            raise NotSupportElasticsearch8
-
         try:
             # 获取索引信息，如果没有定义，直接返回
             data = self.es.indices.get_mapping(index=self.index)
-        except NotFoundError:
+        except (NotFoundError8, NotFoundError7):
             return False
 
         try:
-            if version == '6':
-                # 检测索引是不是新的类型 es6
-                properties = data[self.index]['mappings']['data']['properties']
-            else:
-                # 检测索引是不是新的类型 es7 default index type: _doc
-                properties = data[self.index]['mappings']['properties']
-
+            properties = self.client.get_properties(data=data, index=self.index)
             for keyword in self.keyword_fields:
                 if not properties[keyword]['type'] == 'keyword':
                     break
@@ -118,12 +221,7 @@ class ES(object):
 
     def _ensure_index_exists(self):
         try:
-            info = self.es.info()
-            version = info['version']['number'].split('.')[0]
-            if version == '6':
-                mappings = {'mappings': {'data': {'properties': self.properties}}}
-            else:
-                mappings = {'mappings': {'properties': self.properties}}
+            mappings = self.client.get_mapping(self.properties)
 
             if self.is_index_by_date:
                 mappings['aliases'] = {
@@ -132,7 +230,7 @@ class ES(object):
 
             try:
                 self.es.indices.create(index=self.index, body=mappings)
-            except RequestError as e:
+            except (RequestError, BadRequestError) as e:
                 if e.error == 'resource_already_exists_exception':
                     logger.warning(e)
                 else:
@@ -175,11 +273,17 @@ class ES(object):
 
     def _filter(self, query: dict, from_=None, size=None, sort=None):
         body = self.get_query_body(**query)
+        search_params = {
+            'index': self.query_index,
+            'body': body,
+            'from_': from_,
+            'size': size
+        }
+        if sort is not None:
+            search_params['sort'] = sort
+        logger.info('search_params: {}'.format(search_params))
+        data = self.es.search(**search_params)
 
-        data = self.es.search(
-            index=self.query_index, doc_type=self.doc_type, body=body,
-            from_=from_, size=size, sort=sort
-        )
         source_data = []
         for item in data['hits']['hits']:
             if item:
@@ -191,7 +295,7 @@ class ES(object):
     def count(self, **query):
         try:
             body = self.get_query_body(**query)
-            data = self.es.count(index=self.query_index, doc_type=self.doc_type, body=body)
+            data = self.es.count(index=self.query_index, body=body)
             count = data["count"]
         except Exception as e:
             logger.error('ES count error: {}'.format(e))
@@ -227,6 +331,33 @@ class ES(object):
             datetime_range['lte'] = datetime__lte
         return 'datetime', datetime_range
 
+    @staticmethod
+    def handle_exact_fields(exact):
+        _filter = []
+        for k, v in exact.items():
+            query = 'term'
+            if isinstance(v, list):
+                query = 'terms'
+            _filter.append({
+                query: {k: v}
+            })
+        return _filter
+
+    @staticmethod
+    def handle_fuzzy_fields(exact):
+        _filter = []
+        for k, v in exact.items():
+            _filter.append({'wildcard': {k: f'*{v}*'}})
+        return _filter
+
+    @staticmethod
+    def is_keyword(props: dict, field: str) -> bool:
+        return props.get(field, {}).get("type", "keyword") == "keyword"
+
+    @staticmethod
+    def is_long(props: dict, field: str) -> bool:
+        return props.get(field, {}).get("type") == "long"
+
     def get_query_body(self, **kwargs):
         new_kwargs = {}
         for k, v in kwargs.items():
@@ -234,25 +365,57 @@ class ES(object):
                 v = str(v)
             if k == 'pk':
                 k = 'id'
+            if k.endswith('__in'):
+                k = k.replace('__in', '')
             new_kwargs[k] = v
         kwargs = new_kwargs
 
         index_in_field = 'id__in'
+        keyword_fields = self.keyword_fields
         exact_fields = self.exact_fields
         match_fields = self.match_fields
+        fuzzy_fields = self.fuzzy_fields
 
         match = {}
+        search = []
         exact = {}
+        fuzzy = {}
         index = {}
 
         if index_in_field in kwargs:
             index['values'] = kwargs[index_in_field]
 
+        mapping = self.es.indices.get_mapping(index=self.index)
+        props = (
+            mapping
+            .get(self.index, {})
+            .get('mappings', {})
+            .get('properties', {})
+        )
+
+        common_keyword_able = exact_fields | keyword_fields
+
         for k, v in kwargs.items():
-            if k in exact_fields:
+            if k in ("org_id", "session") and self.is_keyword(props, k):
                 exact[k] = v
+
+            elif self.is_long(props, k):
+                exact[k] = v
+
+            elif k in common_keyword_able:
+                exact[f"{k}.keyword"] = v
+
+            elif k in fuzzy_fields:
+                fuzzy[f"{k}.keyword"] = v
+
             elif k in match_fields:
                 match[k] = v
+
+        args = kwargs.get('search', [])
+        for item in args:
+            for k, v in item.items():
+                if k in match_fields:
+                    search.append(item)
 
         # 处理时间
         time_field_name, time_range = self.handler_time_field(kwargs)
@@ -282,15 +445,15 @@ class ES(object):
         body = {
             'query': {
                 'bool': {
-                    'must': [
+                    'must': [],
+                    'should': should + [
                         {'match': {k: v}} for k, v in match.items()
-                    ],
-                    'should': should,
-                    'filter': [
-                                  {
-                                      'term': {k: v}
-                                  } for k, v in exact.items()
-                              ] + [
+                    ] + [
+                                  {'match': item} for item in search
+                              ],
+                    'filter': self.handle_exact_fields(exact) +
+                              self.handle_fuzzy_fields(fuzzy) +
+                              [
                                   {
                                       'range': {
                                           time_field_name: time_range
@@ -308,6 +471,7 @@ class ES(object):
 
 
 class QuerySet(DJQuerySet):
+    custom = True
     default_days_ago = 7
     max_result_window = 10000
 
@@ -324,6 +488,17 @@ class QuerySet(DJQuerySet):
         _method_calls = {k: list(v) for k, v in groupby(self._method_calls, lambda x: x[0])}
         return _method_calls
 
+    def _grouped_search_args(self, query):
+        conditions = {}
+        for q in query:
+            for c in q.children:
+                if isinstance(c, Q):
+                    child = self._grouped_search_args(c)
+                    [conditions.setdefault(k, []).extend(v) for k, v in child.items()]
+                else:
+                    conditions.setdefault(c[0], []).append(c[1])
+        return conditions
+
     @lazyproperty
     def _filter_kwargs(self):
         _method_calls = self._grouped_method_calls
@@ -331,9 +506,14 @@ class QuerySet(DJQuerySet):
         if not filter_calls:
             return {}
         names, multi_args, multi_kwargs = zip(*filter_calls)
-        kwargs = reduce(lambda x, y: {**x, **y}, multi_kwargs, {})
 
-        striped_kwargs = {}
+        # input 输入
+        multi_args = tuple(reduce(lambda x, y: x + y, (sub for sub in multi_args if sub), ()))
+        args = self._grouped_search_args(multi_args)
+        striped_args = [{k.replace('__icontains', ''): v} for k, values in args.items() for v in values]
+
+        kwargs = reduce(lambda x, y: {**x, **y}, multi_kwargs, {})
+        striped_kwargs = {'search': striped_args}
         for k, v in kwargs.items():
             k = k.replace('__exact', '')
             k = k.replace('__startswith', '')
@@ -344,6 +524,7 @@ class QuerySet(DJQuerySet):
     @lazyproperty
     def _sort(self):
         order_by = self._grouped_method_calls.get('order_by')
+        _sorts = [self._storage.client.get_sort('_score', 'desc')]
         if order_by:
             for call in reversed(order_by):
                 fields = call[1]
@@ -355,8 +536,11 @@ class QuerySet(DJQuerySet):
                     else:
                         direction = 'asc'
                     field = field.lstrip('-+')
-                    sort = f'{field}:{direction}'
-                    return sort
+                    sort = self._storage.client.get_sort(field, direction)
+                    _sorts.append(sort)
+                    break
+        sorts = self._storage.client.get_sorts(_sorts)
+        return sorts
 
     def __execute(self):
         _filter_kwargs = self._filter_kwargs

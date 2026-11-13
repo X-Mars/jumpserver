@@ -1,9 +1,9 @@
+from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from acls.models.base import BaseACL
 from common.serializers.fields import JSONManyToManyField, LabeledChoiceField
-from jumpserver.utils import has_valid_xpack_license
 from orgs.models import Organization
 from ..const import ActionChoices
 
@@ -62,16 +62,24 @@ class ActionAclSerializer(serializers.Serializer):
         self.set_action_choices()
 
     class Meta:
-        action_choices_exclude = [ActionChoices.warning]
+        action_choices_exclude = [ActionChoices.warning, ActionChoices.notify_and_warn]
 
     def set_action_choices(self):
         field_action = self.fields.get("action")
         if not field_action:
             return
-        if not has_valid_xpack_license():
+        if not settings.XPACK_LICENSE_IS_VALID:
             field_action._choices.pop(ActionChoices.review, None)
+        if not (
+            settings.XPACK_LICENSE_IS_VALID and
+            settings.FACE_RECOGNITION_ENABLED
+        ):
+            field_action._choices.pop(ActionChoices.face_verify, None)
+            field_action._choices.pop(ActionChoices.face_online, None)
         for choice in self.Meta.action_choices_exclude:
             field_action._choices.pop(choice, None)
+        if not settings.XPACK_LICENSE_IS_VALID or not settings.CHANGE_SECRET_AFTER_SESSION_END:
+            field_action._choices.pop(ActionChoices.change_secret, None)
 
 
 class BaseACLSerializer(ActionAclSerializer, serializers.Serializer):
@@ -81,7 +89,7 @@ class BaseACLSerializer(ActionAclSerializer, serializers.Serializer):
         fields_small = fields_mini + [
             "is_active", "priority", "action",
             "date_created", "date_updated",
-            "comment", "created_by", "org_id",
+            "comment", "created_by"
         ]
         fields_m2m = ["reviewers", ]
         fields = fields_small + fields_m2m
@@ -91,11 +99,29 @@ class BaseACLSerializer(ActionAclSerializer, serializers.Serializer):
             'reviewers': {'label': _('Recipients')},
         }
 
+class BaseUserACLSerializer(BaseACLSerializer):
+    users = JSONManyToManyField(label=_('User'))
+
+    class Meta(BaseACLSerializer.Meta):
+        fields = BaseACLSerializer.Meta.fields + ['users']
+
+
+class BaseUserAssetAccountACLSerializer(BaseUserACLSerializer):
+    assets = JSONManyToManyField(label=_('Asset'))
+    accounts = serializers.ListField(
+        child=serializers.CharField(),
+        label=_('Account'),
+        help_text=_("Account usernames, or @ALL to match all accounts."),
+    )
+
+    class Meta(BaseUserACLSerializer.Meta):
+        fields = BaseUserACLSerializer.Meta.fields + ['assets', 'accounts', 'org_id']
+
     def validate_reviewers(self, reviewers):
         action = self.initial_data.get('action')
         if not action and self.instance:
             action = self.instance.action
-        if action != ActionChoices.review:
+        if action != ActionChoices.review or (not reviewers and (self.initial_data.get('workflow') or getattr(self.instance, 'workflow_id', None))):
             return reviewers
         org_id = self.fields["org_id"].default()
         org = Organization.get_instance(org_id)
@@ -110,18 +136,3 @@ class BaseACLSerializer(ActionAclSerializer, serializers.Serializer):
             )
             raise serializers.ValidationError(error)
         return valid_reviewers
-
-
-class BaseUserACLSerializer(BaseACLSerializer):
-    users = JSONManyToManyField(label=_('User'))
-
-    class Meta(BaseACLSerializer.Meta):
-        fields = BaseACLSerializer.Meta.fields + ['users']
-
-
-class BaseUserAssetAccountACLSerializer(BaseUserACLSerializer):
-    assets = JSONManyToManyField(label=_('Asset'))
-    accounts = serializers.ListField(label=_('Account'))
-
-    class Meta(BaseUserACLSerializer.Meta):
-        fields = BaseUserACLSerializer.Meta.fields + ['assets', 'accounts']

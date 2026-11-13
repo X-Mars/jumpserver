@@ -6,9 +6,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from assets.const import Connectivity
-from common.utils import (
-    get_logger
-)
+from common.utils import get_logger
 
 logger = get_logger(__file__)
 
@@ -24,6 +22,27 @@ class AbsConnectivity(models.Model):
         self.connectivity = val
         self.date_verified = timezone.now()
         self.save(update_fields=['connectivity', 'date_verified'])
+
+    @staticmethod
+    def get_err_connectivity(msg=None):
+        msg = (msg or '').strip().lower()
+
+        error_map = {
+            'rdp connection failed': Connectivity.RDP_ERR,
+            'expected openssh key': Connectivity.OPENSSH_KEY_ERR,
+            'invalid/incorrect password': Connectivity.PASSWORD_ERR,
+            'failed to create temporary': Connectivity.CREATE_TEMPORARY_ERR,
+            'ntlm: the specified credentials were rejected by the server': Connectivity.NTLM_ERR,
+            'permission denied': Connectivity.AUTH_ERR,
+            'authentication failed': Connectivity.AUTH_ERR,
+            'authentication failure': Connectivity.AUTH_ERR,
+        }
+
+        for key, value in error_map.items():
+            if key in msg:
+                return value
+
+        return Connectivity.ERR
 
     @property
     def is_connective(self):

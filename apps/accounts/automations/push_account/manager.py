@@ -1,149 +1,82 @@
-from copy import deepcopy
+from django.utils.translation import gettext_lazy as _
 
-from accounts.const import AutomationTypes, SecretType, Connectivity
-from assets.const import HostTypes
+from accounts.const import (
+    AutomationTypes,
+)
 from common.utils import get_logger
-from ..base.manager import AccountBasePlaybookManager
-from ..change_secret.manager import ChangeSecretManager
+from ..base.manager import BaseChangeSecretPushManager
+from ...models import PushSecretRecord
 
 logger = get_logger(__name__)
 
 
-class PushAccountManager(ChangeSecretManager, AccountBasePlaybookManager):
-    ansible_account_prefer = ''
+class PushAccountManager(BaseChangeSecretPushManager):
+
+    @staticmethod
+    def require_update_version(account, record):
+        account.skip_history_when_saving = True
+        return False
 
     @classmethod
     def method_type(cls):
         return AutomationTypes.push_account
 
-    def host_callback(self, host, asset=None, account=None, automation=None, path_dir=None, **kwargs):
-        host = super(ChangeSecretManager, self).host_callback(
-            host, asset=asset, account=account, automation=automation,
-            path_dir=path_dir, **kwargs
+    def get_secret(self, account):
+        secret = account.secret
+        if not secret and not account.follows_template:
+            secret = super().get_secret(account)
+        return secret
+
+    def gen_account_inventory(self, account, asset, h, path_dir):
+        secret = self.get_secret(account)
+        secret_type = account.secret_type
+        if not secret:
+            raise ValueError(_('Secret cannot be empty'))
+        record = self.get_or_create_record(asset, account, h['name'])
+        new_secret, private_key_path = self.handle_ssh_secret(secret_type, secret, path_dir)
+        h = self.gen_inventory(h, account, new_secret, private_key_path, asset, path_dir)
+        return h, record
+
+    def get_or_create_record(self, asset, account, name):
+        asset_account_id = f'{asset.id}-{account.id}'
+
+        if asset_account_id in self.record_map:
+            record_id = self.record_map[asset_account_id]
+            record = PushSecretRecord.objects.filter(id=record_id).first()
+            if not record:
+                raise ValueError(_(
+                    'Push secret record not found: %(record_id)s'
+                ) % {'record_id': record_id})
+        else:
+            record = self.create_record(asset, account)
+
+        self.name_record_mapper[name] = record
+        return record
+
+    def create_record(self, asset, account):
+        record = PushSecretRecord.objects.create(
+            asset=asset, account=account, execution=self.execution,
+            comment=f'{account.username}@{asset.address}'
         )
-        if host.get('error'):
-            return host
+        return record
 
-        accounts = self.get_accounts(account)
-        inventory_hosts = []
-        if asset.type == HostTypes.WINDOWS and self.secret_type == SecretType.SSH_KEY:
-            msg = f'Windows {asset} does not support ssh key push'
-            print(msg)
-            return inventory_hosts
+    def print_summary(self):
+        records = {
+            str(record.id): record
+            for record in self.name_record_mapper.values()
+        }.values()
+        success, failed, unverified = self.get_record_result_counts(records)
+        # Inventory preparation can reject an account before a push record is
+        # created. Include those failures in the final summary while avoiding
+        # double-counting record failures already tracked by fail_accounts.
+        failed = max(failed, self.summary.get('fail_accounts', 0))
+        self.print_result_summary(
+            success,
+            failed,
+            unverified,
+            total=success + failed + unverified,
+            include_unverified=True,
+        )
 
-        host['ssh_params'] = {}
-        for account in accounts:
-            h = deepcopy(host)
-            secret_type = account.secret_type
-            h['name'] += '(' + account.username + ')'
-            if self.secret_type is None:
-                new_secret = account.secret
-            else:
-                new_secret = self.get_secret(secret_type)
-
-            self.name_recorder_mapper[h['name']] = {
-                'account': account, 'new_secret': new_secret,
-            }
-
-            private_key_path = None
-            if secret_type == SecretType.SSH_KEY:
-                private_key_path = self.generate_private_key_path(new_secret, path_dir)
-                new_secret = self.generate_public_key(new_secret)
-
-            h['ssh_params'].update(self.get_ssh_params(account, new_secret, secret_type))
-            h['account'] = {
-                'name': account.name,
-                'username': account.username,
-                'secret_type': secret_type,
-                'secret': new_secret,
-                'private_key_path': private_key_path
-            }
-            if asset.platform.type == 'oracle':
-                h['account']['mode'] = 'sysdba' if account.privileged else None
-            inventory_hosts.append(h)
-        return inventory_hosts
-
-    def on_host_success(self, host, result):
-        account_info = self.name_recorder_mapper.get(host)
-        if not account_info:
-            return
-
-        account = account_info['account']
-        new_secret = account_info['new_secret']
-        if not account:
-            return
-        account.secret = new_secret
-        account.save(update_fields=['secret'])
-        account.set_connectivity(Connectivity.OK)
-
-    def on_host_error(self, host, error, result):
-        pass
-
-    def on_runner_failed(self, runner, e):
-        logger.error("Pust account error: {}".format(e))
-
-    def run(self, *args, **kwargs):
-        if self.secret_type and not self.check_secret():
-            return
-        super(ChangeSecretManager, self).run(*args, **kwargs)
-
-    # @classmethod
-    # def trigger_by_asset_create(cls, asset):
-    #     automations = PushAccountAutomation.objects.filter(
-    #         triggers__contains=TriggerChoice.on_asset_create
-    #     )
-    #     account_automation_map = {auto.username: auto for auto in automations}
-    #
-    #     util = AssetPermissionUtil()
-    #     permissions = util.get_permissions_for_assets([asset], with_node=True)
-    #     account_permission_map = defaultdict(list)
-    #     for permission in permissions:
-    #         for account in permission.accounts:
-    #             account_permission_map[account].append(permission)
-    #
-    #     username_automation_map = {}
-    #     for username, automation in account_automation_map.items():
-    #         if username != '@USER':
-    #             username_automation_map[username] = automation
-    #             continue
-    #
-    #         asset_permissions = account_permission_map.get(username)
-    #         if not asset_permissions:
-    #             continue
-    #         asset_permissions = util.get_permissions([p.id for p in asset_permissions])
-    #         usernames = asset_permissions.values_list('users__username', flat=True).distinct()
-    #         for _username in usernames:
-    #             username_automation_map[_username] = automation
-    #
-    #     asset_usernames_exists = asset.accounts.values_list('username', flat=True)
-    #     accounts_to_create = []
-    #     accounts_to_push = []
-    #     for username, automation in username_automation_map.items():
-    #         if username in asset_usernames_exists:
-    #             continue
-    #
-    #         if automation.secret_strategy != SecretStrategy.custom:
-    #             secret_generator = SecretGenerator(
-    #                 automation.secret_strategy, automation.secret_type,
-    #                 automation.password_rules
-    #             )
-    #             secret = secret_generator.get_secret()
-    #         else:
-    #             secret = automation.secret
-    #
-    #         account = Account(
-    #             username=username, secret=secret,
-    #             asset=asset, secret_type=automation.secret_type,
-    #             comment='Create by account creation {}'.format(automation.name),
-    #         )
-    #         accounts_to_create.append(account)
-    #         if automation.action == 'create_and_push':
-    #             accounts_to_push.append(account)
-    #         else:
-    #             accounts_to_create.append(account)
-    #
-    #         logger.debug(f'Create account {account} for asset {asset}')
-
-    # @classmethod
-    # def trigger_by_permission_accounts_change(cls):
-    #     pass
+    def get_report_template(self):
+        return "accounts/push_account_report.html"

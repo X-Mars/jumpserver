@@ -137,6 +137,7 @@ class Organization(OrgRoleMixin, JMSBaseModel):
     def expire_orgs_mapping(cls):
         cls.orgs_mapping = None
 
+    @property
     def org_id(self):
         return self.id
 
@@ -167,14 +168,17 @@ class Organization(OrgRoleMixin, JMSBaseModel):
         name = settings.GLOBAL_ORG_DISPLAY_NAME or cls.ROOT_NAME
         return cls(id=cls.ROOT_ID, name=name, builtin=True)
 
-    def is_root(self):
+    def is_root(self) -> bool:
         return self.id == self.ROOT_ID
 
-    def is_default(self):
+    def is_default(self) -> bool:
         return str(self.id) == self.DEFAULT_ID
 
+    def is_system(self) -> bool:
+        return str(self.id) == self.SYSTEM_ID
+
     @property
-    def internal(self):
+    def internal(self) -> bool:
         return str(self.id) in self.INTERNAL_IDS
 
     def change_to(self):

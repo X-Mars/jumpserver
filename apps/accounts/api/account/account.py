@@ -1,18 +1,34 @@
+from copy import copy
+
+from django.db import transaction
 from django.shortcuts import get_object_or_404
+from django.utils.translation import gettext_lazy as _
+from rest_framework import serializers as drf_serializers
 from rest_framework.decorators import action
 from rest_framework.generics import ListAPIView, CreateAPIView
 from rest_framework.response import Response
-from rest_framework.status import HTTP_200_OK
+from rest_framework.status import HTTP_200_OK, HTTP_400_BAD_REQUEST
 
 from accounts import serializers
-from accounts.filters import AccountFilterSet
-from accounts.models import Account
+from accounts.const import ChangeSecretRecordStatusChoice, Source
+from accounts.exceptions import TemplateFollowingConflict
+from accounts.filters import AccountFilterSet, NodeFilterBackend
 from accounts.mixins import AccountRecordViewLogMixin
+from accounts.models import Account, ChangeSecretRecord, AccountTemplate
+from accounts.tasks import push_accounts_to_assets_task
+from accounts.tree import get_account_tree_metrics
+from assets.const.gpt import create_or_update_chatx_resources
 from assets.models import Asset, Node
+from authentication.permissions import UserConfirmation, ConfirmType
 from common.api.mixin import ExtraFilterFieldsMixin
-from common.permissions import UserConfirmation, ConfirmType, IsValidUser
+from common.drf.filters import AttrRulesFilterBackend
+from common.permissions import IsValidUser
+from common.utils import lazyproperty, get_logger
 from orgs.mixins.api import OrgBulkModelViewSet
+from orgs.utils import tmp_to_root_org
 from rbac.permissions import RBACPermission
+
+logger = get_logger(__file__)
 
 __all__ = [
     'AccountViewSet', 'AccountSecretsViewSet',
@@ -22,7 +38,18 @@ __all__ = [
 
 class AccountViewSet(OrgBulkModelViewSet):
     model = Account
+    chat_ai_operation_guidance = {
+        'create': (
+            'Create a password account on an existing asset using its ID and '
+            'the requested username. Set privileged true for root. Use only '
+            'asset, username, name, secret_type, privileged, is_active and '
+            'comment fields. Do not put the password in the request body '
+            'or ask for it in chat. The trusted approval form asks the user for '
+            'the password and sends it separately after confirmation.'
+        ),
+    }
     search_fields = ('username', 'name', 'asset__name', 'asset__address', 'comment')
+    extra_filter_backends = [AttrRulesFilterBackend, NodeFilterBackend]
     filterset_class = AccountFilterSet
     serializer_classes = {
         'default': serializers.AccountSerializer,
@@ -32,8 +59,85 @@ class AccountViewSet(OrgBulkModelViewSet):
         'partial_update': ['accounts.change_account'],
         'su_from_accounts': 'accounts.view_account',
         'clear_secret': 'accounts.change_account',
+        'move_to_assets': 'accounts.delete_account',
+        'copy_to_assets': 'accounts.add_account',
+        'chat': 'accounts.view_account',
+        'tree_metrics': 'accounts.view_account',
     }
     export_as_zip = True
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        asset_id = self.request.query_params.get('asset') or self.request.query_params.get('asset_id')
+        if not asset_id:
+            return queryset
+
+        asset = get_object_or_404(Asset, pk=asset_id)
+        queryset = asset.all_accounts.all()
+        return queryset
+
+    @action(methods=['post'], detail=False, url_path='tree-metrics',
+            serializer_class=serializers.AccountTreeMetricsQuerySerializer)
+    def tree_metrics(self, request):
+        serializer = serializers.AccountTreeMetricsQuerySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        results = get_account_tree_metrics(
+            data['resources'], accounts=self.get_queryset(),
+            include_descendants=data['include_descendants'],
+        )
+        return Response({'results': results})
+
+    def perform_bulk_create(self, serializer):
+        result = super().perform_create(serializer)
+
+        template_items = [
+            d for d in serializer.data
+            if d.get("source", {}).get('value') == Source.TEMPLATE and d.get("source_id")
+        ]
+        if len(template_items) < 2:
+            return result
+
+        source_template_accounts = {
+            f"{item['asset']['id']}+{item['source_id']}": item["id"]
+            for item in template_items
+        }
+        template_ids = {item["source_id"] for item in template_items}
+
+        templates = (
+            AccountTemplate.objects
+            .filter(id__in=template_ids, su_from_id__isnull=False)
+            .only("id", "su_from_id")
+        )
+        su_from_map = {str(tpl.id): str(tpl.su_from_id) for tpl in templates}
+        if not su_from_map:
+            return result
+
+        account_su_from_id_map: dict[str] = {}
+
+        for d in template_items:
+            source_tpl_id = d["source_id"]
+            su_from_tpl_id = su_from_map.get(source_tpl_id)
+            if not su_from_tpl_id:
+                continue
+
+            su_from_account_id = source_template_accounts.get(
+                f"{d['asset']['id']}+{su_from_tpl_id}"
+            )
+            if su_from_account_id:
+                account_su_from_id_map[d["id"]] = su_from_account_id
+
+        if not account_su_from_id_map:
+            return result
+
+        accounts = Account.objects.filter(id__in=account_su_from_id_map.keys())
+        for account in accounts:
+            su_from_account_id = account_su_from_id_map.get(str(account.id))
+            if su_from_account_id:
+                account.su_from_id = su_from_account_id
+                account.save(update_fields=['su_from_id'])
+
+        return result
 
     @action(methods=['get'], detail=False, url_path='su-from-accounts')
     def su_from_accounts(self, request, *args, **kwargs):
@@ -45,11 +149,11 @@ class AccountViewSet(OrgBulkModelViewSet):
             accounts = account.get_su_from_accounts()
         elif asset_id:
             asset = get_object_or_404(Asset, pk=asset_id)
-            accounts = asset.accounts.all()
+            accounts = asset.all_accounts
         else:
             accounts = Account.objects.none()
-        accounts = self.filter_queryset(accounts)
-        serializer = serializers.AccountSerializer(accounts, many=True)
+        accounts = self.filter_queryset(accounts).select_related('asset__platform', 'asset__ds')
+        serializer = serializers.SuFromAccountSerializer(accounts, many=True)
         return Response(data=serializer.data)
 
     @action(
@@ -57,19 +161,26 @@ class AccountViewSet(OrgBulkModelViewSet):
         permission_classes=[IsValidUser]
     )
     def username_suggestions(self, request, *args, **kwargs):
-        asset_ids = request.data.get('assets')
-        node_ids = request.data.get('nodes')
-        username = request.data.get('username')
+        raw_asset_ids = request.data.get('assets', [])
+        node_ids = request.data.get('nodes', [])
+        username = request.data.get('username', '')
 
-        assets = Asset.objects.all()
-        if asset_ids:
-            assets = assets.filter(id__in=asset_ids)
+        asset_ids = set(raw_asset_ids)
+
         if node_ids:
             nodes = Node.objects.filter(id__in=node_ids)
-            node_asset_ids = Node.get_nodes_all_assets(*nodes).values_list('id', flat=True)
-            assets = assets.filter(id__in=set(list(asset_ids) + list(node_asset_ids)))
+            node_asset_qs = Node.get_nodes_all_assets(*nodes).values_list('id', flat=True)
+            asset_ids |= {str(u) for u in node_asset_qs}
 
-        accounts = Account.objects.filter(asset__in=assets)
+        if asset_ids:
+            through = Asset.directory_services.through
+            ds_qs = through.objects.filter(asset_id__in=asset_ids) \
+                .values_list('directoryservice_id', flat=True)
+            asset_ids |= {str(u) for u in ds_qs}
+            accounts = Account.objects.filter(asset_id__in=list(asset_ids))
+        else:
+            accounts = Account.objects.all()
+
         if username:
             accounts = accounts.filter(username__icontains=username)
         usernames = list(accounts.values_list('username', flat=True).distinct()[:10])
@@ -82,13 +193,87 @@ class AccountViewSet(OrgBulkModelViewSet):
     @action(methods=['patch'], detail=False, url_path='clear-secret')
     def clear_secret(self, request, *args, **kwargs):
         account_ids = request.data.get('account_ids', [])
-        self.model.objects.filter(id__in=account_ids).update(secret=None)
+        detach = not drf_serializers.BooleanField().run_validation(
+            request.data.get('follow_template', True)
+        )
+        with transaction.atomic():
+            accounts = list(self.model.objects.select_for_update().filter(id__in=account_ids))
+            if not detach and any(account.follows_template for account in accounts):
+                raise TemplateFollowingConflict()
+            for account in accounts:
+                previous = copy(account)
+                update_fields = ['secret']
+                if account.follows_template:
+                    account.follow_template = False
+                    update_fields.append('follow_template')
+                account.secret = None
+                account._save_with_locked_previous(previous, update_fields=update_fields)
         return Response(status=HTTP_200_OK)
+
+    def _copy_or_move_to_assets(self, request, move=False):
+        account = self.get_object()
+        asset_ids = request.data.get('assets', [])
+        assets = Asset.objects.filter(id__in=asset_ids)
+        field_names = [
+            'name', 'username', 'secret_type', 'secret',
+            'privileged', 'is_active', 'source', 'source_id', 'follow_template', 'comment'
+        ]
+        if account.follows_template:
+            field_names.remove('secret')
+        account_data = {field: getattr(account, field) for field in field_names}
+
+        creation_results = {}
+        created_account_ids = []
+        success_count = 0
+
+        for asset in assets:
+            account_data['asset'] = asset
+            creation_results[asset] = {'state': 'created'}
+            try:
+                with transaction.atomic():
+                    created_account = self.model.objects.create(**account_data)
+                    created_account_ids.append(str(created_account.id))
+                    success_count += 1
+            except Exception as e:
+                logger.debug(f'{"Move" if move else "Copy"} to assets error: {e}')
+                creation_results[asset] = {'error': _('Account already exists'), 'state': 'error'}
+
+        results = [{'asset': str(asset), **res} for asset, res in creation_results.items()]
+
+        if move and success_count > 0:
+            account.delete()
+
+        if created_account_ids:
+            template_auto_push = (
+                account.source == Source.TEMPLATE and
+                AccountTemplate.objects.filter(id=account.source_id, auto_push=True).exists()
+            )
+            if not template_auto_push:
+                transaction.on_commit(
+                    lambda ids=tuple(created_account_ids): push_accounts_to_assets_task.delay(ids)
+                )
+
+        return Response(results, status=HTTP_200_OK)
+
+    @action(methods=['post'], detail=True, url_path='move-to-assets')
+    def move_to_assets(self, request, *args, **kwargs):
+        return self._copy_or_move_to_assets(request, move=True)
+
+    @action(methods=['post'], detail=True, url_path='copy-to-assets')
+    def copy_to_assets(self, request, *args, **kwargs):
+        return self._copy_or_move_to_assets(request, move=False)
+
+    @action(methods=['get'], detail=False, url_path='chat')
+    def chat(self, request, *args, **kwargs):
+        with tmp_to_root_org():
+            __, account = create_or_update_chatx_resources()
+            serializer = self.get_serializer(account)
+        return Response(serializer.data)
 
 
 class AccountSecretsViewSet(AccountRecordViewLogMixin, AccountViewSet):
     """
-    因为可能要导出所有账号，所以单独建立了一个 viewset
+    因为可能要导出所有账号,所以单独建立了一个 viewset
     """
     serializer_classes = {
         'default': serializers.AccountSecretSerializer,
@@ -100,6 +285,11 @@ class AccountSecretsViewSet(AccountRecordViewLogMixin, AccountViewSet):
         'retrieve': 'accounts.view_accountsecret',
     }
 
+    @classmethod
+    def get_extra_actions(cls):
+        # Secret endpoints expose list/retrieve, not the account management actions.
+        return []
+
 
 class AssetAccountBulkCreateApi(CreateAPIView):
     serializer_class = serializers.AssetAccountBulkSerializer
@@ -107,12 +297,92 @@ class AssetAccountBulkCreateApi(CreateAPIView):
         'POST': 'accounts.add_account',
     }
 
+    @staticmethod
+    def format_validation_error(detail):
+        # The bulk result modal expects a flat error string for each asset row.
+        if isinstance(detail, dict):
+            errors = []
+            for messages in detail.values():
+                if isinstance(messages, (list, tuple)):
+                    messages = ', '.join([str(message) for message in messages])
+                errors.append(str(messages))
+            return '; '.join(errors)
+        if isinstance(detail, (list, tuple)):
+            return '; '.join([str(item) for item in detail])
+        return str(detail)
+
+    @classmethod
+    def make_error_results(cls, assets, payload, detail):
+        account = payload.get('name') or payload.get('username') or ''
+        error = cls.format_validation_error(detail)
+        return [
+            {'asset': asset, 'account': account, 'state': 'error', 'error': error}
+            for asset in assets
+        ]
+
+    @staticmethod
+    def get_all_assets(base_payload: dict):
+        nodes = base_payload.pop('nodes', [])
+        asset_ids = base_payload.pop('assets', [])
+        nodes = Node.objects.filter(id__in=nodes).only('id', 'key')
+
+        node_asset_ids = Node.get_nodes_all_assets(*nodes).values_list('id', flat=True)
+        asset_ids = set(asset_ids + list(node_asset_ids))
+        return Asset.objects.filter(id__in=asset_ids)
+
     def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.create(serializer.validated_data)
-        serializer = serializers.AssetAccountBulkSerializerResultSerializer(data, many=True)
-        return Response(data=serializer.data, status=HTTP_200_OK)
+        if hasattr(request.data, "copy"):
+            base_payload = request.data.copy()
+        else:
+            base_payload = dict(request.data)
+
+        templates = base_payload.pop("template", None)
+        assets = self.get_all_assets(base_payload)
+        if not assets.exists():
+            error = _("No valid assets found for account creation.")
+            return Response(
+                data={
+                    "detail": error,
+                    "code": "no_valid_assets"
+                },
+                status=HTTP_400_BAD_REQUEST
+            )
+
+        result = []
+        errors = []
+
+        def handle_one(_payload):
+            try:
+                ser = self.get_serializer(data=_payload)
+                ser.is_valid(raise_exception=True)
+                data = ser.bulk_create(ser.validated_data, assets)
+                if isinstance(data, (list, tuple)):
+                    result.extend(data)
+                else:
+                    result.append(data)
+            except drf_serializers.ValidationError as e:
+                if isinstance(e.detail, (list, tuple)) and all(isinstance(item, dict) for item in e.detail):
+                    result.extend(e.detail)
+                else:
+                    result.extend(self.make_error_results(assets, _payload, e.detail))
+            except Exception as e:
+                errors.extend([str(e)])
+
+        if not templates:
+            handle_one(base_payload)
+        else:
+            if not isinstance(templates, (list, tuple)):
+                templates = [templates]
+            for tpl in templates:
+                payload = dict(base_payload)
+                payload["template"] = tpl
+                handle_one(payload)
+
+        if errors:
+            raise drf_serializers.ValidationError(errors)
+
+        out_ser = serializers.AssetAccountBulkSerializerResultSerializer(result, many=True)
+        return Response(data=out_ser.data, status=HTTP_200_OK)
 
 
 class AccountHistoriesSecretAPI(ExtraFilterFieldsMixin, AccountRecordViewLogMixin, ListAPIView):
@@ -123,18 +393,37 @@ class AccountHistoriesSecretAPI(ExtraFilterFieldsMixin, AccountRecordViewLogMixi
     rbac_perms = {
         'GET': 'accounts.view_accountsecret',
     }
+    queryset = Account.history.model.objects.none()
+
+    @lazyproperty
+    def account(self) -> Account:
+        return get_object_or_404(Account, pk=self.kwargs.get('pk'))
 
     def get_object(self):
-        return get_object_or_404(Account, pk=self.kwargs.get('pk'))
+        return self.account
+
+    @lazyproperty
+    def latest_history(self):
+        return self.account.history.first()
+
+    @property
+    def latest_change_secret_record(self) -> ChangeSecretRecord:
+        return self.account.changesecretrecords.filter(
+            status=ChangeSecretRecordStatusChoice.pending
+        ).order_by('-date_created').first()
 
     @staticmethod
     def filter_spm_queryset(resource_ids, queryset):
         return queryset.filter(history_id__in=resource_ids)
 
+    @staticmethod
+    def exclude_spm_queryset(resource_ids, queryset):
+        return queryset.exclude(history_id__in=resource_ids)
+
     def get_queryset(self):
-        account = self.get_object()
+        account = self.account
         histories = account.history.all()
-        latest_history = account.history.first()
+        latest_history = self.latest_history
         if not latest_history:
             return histories
         if account.secret != latest_history.secret:
@@ -143,3 +432,25 @@ class AccountHistoriesSecretAPI(ExtraFilterFieldsMixin, AccountRecordViewLogMixi
             return histories
         histories = histories.exclude(history_id=latest_history.history_id)
         return histories
+
+    def filter_queryset(self, queryset):
+        queryset = super().filter_queryset(queryset)
+        queryset = list(queryset)
+        latest_history = self.latest_history
+        if not latest_history:
+            return queryset
+
+        latest_change_secret_record = self.latest_change_secret_record
+        if not latest_change_secret_record:
+            return queryset
+
+        if latest_change_secret_record.date_created > latest_history.history_date:
+            temp_history = self.model(
+                secret=latest_change_secret_record.new_secret,
+                secret_type=self.account.secret_type,
+                version=latest_history.version,
+                history_date=latest_change_secret_record.date_created,
+            )
+            queryset = [temp_history] + queryset
+
+        return queryset

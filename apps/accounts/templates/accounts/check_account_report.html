@@ -1,0 +1,14 @@
+{% extends 'automations/base_report.html' %}
+{% load i18n %}
+
+{% block report_type %}{% trans 'Check account' %}{% endblock %}
+
+{% block report_body %}
+<section class="summary" aria-label="{% trans 'Result' %}">
+    <div class="metric"><span class="metric-label">{% trans 'Normal' %}</span><strong class="metric-value success">{{ summary.ok|default:0 }}</strong></div>
+    <div class="metric"><span class="metric-label">{% trans 'Weak password' %}</span><strong class="metric-value{% if summary.weak_password %} failed{% endif %}">{{ summary.weak_password|default:0 }}</strong></div>
+    <div class="metric"><span class="metric-label">{% trans 'Leaked password' %}</span><strong class="metric-value{% if summary.leaked_password %} failed{% endif %}">{{ summary.leaked_password|default:0 }}</strong></div>
+    <div class="metric"><span class="metric-label">{% trans 'Repeated password' %}</span><strong class="metric-value{% if summary.repeated_password %} unsupported{% endif %}">{{ summary.repeated_password|default:0 }}</strong></div>
+    <div class="metric"><span class="metric-label">{% trans 'No secret' %}</span><strong class="metric-value{% if summary.no_secret %} unsupported{% endif %}">{{ summary.no_secret|default:0 }}</strong></div>
+</section>
+{% endblock %}

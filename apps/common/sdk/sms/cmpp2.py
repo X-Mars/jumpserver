@@ -75,7 +75,7 @@ class CMPPSubmitRequestInstance(CMPPBaseRequestInstance):
         pk_number = struct.pack('!B', 1)
         registered_delivery = struct.pack('!B', 0)
         msg_level = struct.pack('!B', 0)
-        service_id = ((10 - len(service_id)) * '\x00' + service_id).encode('utf-8')
+        service_id = service_id.ljust(10, '\x00').encode('utf-8')
         fee_user_type = struct.pack('!B', 2)
         fee_terminal_id = ('0' * 21).encode('utf-8')
         tp_pid = struct.pack('!B', 0)
@@ -85,7 +85,7 @@ class CMPPSubmitRequestInstance(CMPPBaseRequestInstance):
         fee_code = '000000'.encode('utf-8')
         valid_time = ('\x00' * 17).encode('utf-8')
         at_time = ('\x00' * 17).encode('utf-8')
-        src_id = ((21 - len(src_id)) * '\x00' + src_id).encode('utf-8')
+        src_id = src_id.ljust(21, '\x00').encode('utf-8')
         reserve = b'\x00' * 8
         _msg_length = struct.pack('!B', len(msg_content) * 2)
         _msg_src = msg_src.encode('utf-8')
@@ -282,9 +282,9 @@ class CMPPClient(object):
             self._cmpp_connect()
             self._cmpp_send_sms(dest, sign_name, template_code, template_param)
         except Exception as e:
-            logger.error('CMPPv2.0 Error: %s', e)
+            logger.error('CMPPv2.0 SMS failed: %s', type(e).__name__)
             self.close()
-            raise JMSException(e)
+            raise JMSException('CMPPv2.0 SMS sending failed') from None
 
 
 class CMPP2SMS(BaseSMSClient):
@@ -314,11 +314,7 @@ class CMPP2SMS(BaseSMSClient):
 
     def send_sms(self, phone_numbers: list, sign_name: str, template_code: str, template_param: dict, **kwargs):
         try:
-            logger.info(f'CMPPv2.0 sms send: '
-                        f'phone_numbers={phone_numbers} '
-                        f'sign_name={sign_name} '
-                        f'template_code={template_code} '
-                        f'template_param={template_param}')
+            logger.info('CMPPv2.0 SMS send: recipients=%s', len(phone_numbers))
             self.client.send_sms(phone_numbers, sign_name, template_code, template_param)
         except Exception as e:
             raise JMSException(e)

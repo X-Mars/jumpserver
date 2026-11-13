@@ -1,16 +1,49 @@
 import base64
+import re
 
 from django.conf import settings
 from django.contrib.auth import logout as auth_logout
-from django.http import HttpResponse
+from django.core.cache import cache
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, reverse, render
 from django.utils.deprecation import MiddlewareMixin
 from django.utils.translation import gettext as _
 
-from apps.authentication import mixins
-from authentication.signals import post_auth_failed
-from common.utils import gen_key_pair
+from authentication import mixins
+from authentication.utils import is_logout_request
+from audits.signal_handlers import send_login_info_to_reviewers
+from common.utils import gen_key_pair, gen_gm_key_pair
 from common.utils import get_request_ip
+
+
+def _login_redirect(request, url):
+    # This bootstrap API must not turn an unfinished SSO login into an HTML lock-status response.
+    if request.path_info == '/api/v1/authentication/web-session/status/':
+        return JsonResponse({'code': 'authentication_required', 'login_url': url}, status=401)
+    return redirect(url)
+
+
+class WebSessionLockMiddleware(MiddlewareMixin):
+    # Legacy Django account and business views do not use DRF SessionAuthentication.
+    # Keep login, MFA, identity confirmation and independent credentials outside this gate.
+    protected_paths = re.compile(
+        r'^/core/(?:auth/(?:profile/|(?:wecom|dingtalk|feishu|lark|slack)/'
+        r'(?:bind/start/|qr/bind/))|reports/|ops/|tickets/direct-approve/)'
+    )
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        if not self.protected_paths.match(request.path_info) or not request.user.is_authenticated:
+            return None
+        session = request.session
+        if not session.session_key:
+            return None
+        from authentication.services.web_session_lock import WebSessionLocked
+        from common.sessions import policy_locked
+
+        if policy_locked(session.login_policy):
+            error = WebSessionLocked()
+            return JsonResponse(error.detail, status=error.status_code)
+        return None
 
 
 class MFAMiddleware:
@@ -23,109 +56,173 @@ class MFAMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        response = self.get_response(request)
-        # 没有校验
-        if not request.session.get('auth_mfa_required'):
-            return response
-        # 没有认证过，证明不是从 第三方 来的
-        if request.user.is_anonymous:
-            return response
+        # 必须先拦截再进 view。第三方登录可能已经 login()，MFA 尚未完成，
+        # 若先执行 view，拒绝响应返回时写操作已经提交。
+        if not request.session.get('auth_mfa_required') or request.user.is_anonymous:
+            return self.get_response(request)
+        if is_logout_request(request):
+            return self.get_response(request)
 
         # 这个是 mfa 登录页需要的请求, 也得放出来, 用户其实已经在 CAS/OIDC 中完成登录了
         white_urls = [
-            'login/mfa', 'mfa/select', 'jsi18n/', '/static/',
-            '/profile/otp', '/logout/',
+            'login/mfa', 'mfa/select', 'face/context', 'jsi18n/', '/static/',
+            '/profile/otp', '/media/',
+            '/api/v1/authentication/passkeys/login/'
         ]
         for url in white_urls:
             if request.path.find(url) > -1:
-                return response
+                return self.get_response(request)
 
         # 因为使用 CAS/OIDC 登录的，不小心去了别的页面就回不来了
         if request.path.find('users/profile') > -1:
             return HttpResponse('', status=401)
 
         url = reverse('authentication:login-mfa') + '?_=middleware'
-        return redirect(url)
+        return _login_redirect(request, url)
 
 
-class ThirdPartyLoginMiddleware(mixins.AuthMixin):
+class ThirdPartyLoginMiddleware:
     """OpenID、CAS、SAML2登录规则设置验证"""
 
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
-        response = self.get_response(request)
-        # 没有认证过，证明不是从 第三方 来的
-        if request.user.is_anonymous:
-            return response
-        if not request.session.get('auth_third_party_required'):
-            return response
+        # Third-party callbacks authenticate inside the view; finish before redirecting to the UI.
+        response = self.get_response(request) if request.user.is_anonymous else None
+        # 必须先做登录 ACL / 复核判断再进 view，否则拒绝或待审时写操作已经提交。
+        if request.user.is_anonymous or not request.session.get('auth_third_party_required'):
+            return response if response is not None else self.get_response(request)
+        if is_logout_request(request):
+            return response if response is not None else self.get_response(request)
         white_urls = [
             'jsi18n/', '/static/',
             'login/guard', 'login/wait-confirm',
             'login-confirm-ticket/status',
             'settings/public/open',
-            'core/auth/login', 'core/auth/logout'
+            'core/auth/login'
         ]
         for url in white_urls:
             if request.path.find(url) > -1:
-                return response
+                return response if response is not None else self.get_response(request)
 
         ip = get_request_ip(request)
+        # Middleware instances are shared by concurrent requests; authentication state is not.
+        auth = mixins.AuthMixin()
+        auth.request = request
         try:
-            self.request = request
-            self._check_third_party_login_acl()
-            self._check_login_acl(request.user, ip)
+            auth._check_is_block(request.user.username)
+            auth._check_third_party_login_acl()
+            auth._check_login_acl(request.user, ip)
         except Exception as e:
             if getattr(request, 'user_need_delete', False):
                 request.user.delete()
             else:
                 error_message = getattr(e, 'msg', None)
                 error_message = error_message or str(e)
-                post_auth_failed.send(
-                    sender=self.__class__, username=request.user.username,
-                    request=self.request, reason=error_message
+                auth.send_auth_signal(
+                    success=False, username=request.user.username,
+                    reason=error_message, request=request
                 )
             auth_logout(request)
+            if request.path_info == '/api/v1/authentication/web-session/status/':
+                return _login_redirect(request, reverse('authentication:login') + '?admin=1')
             context = {
                 'title': _('Authentication failed'),
                 'message': _('Authentication failed (before login check failed): {}').format(e),
                 'interval': 10,
-                'redirect_url': reverse('authentication:login'),
+                'redirect_url': reverse('authentication:login') + '?admin=1',
                 'auto_redirect': True,
             }
-            response = render(request, 'authentication/auth_fail_flash_message_standalone.html', context)
+            return render(request, 'authentication/auth_fail_flash_message_standalone.html', context)
         else:
-            if not self.request.session['auth_confirm_required']:
-                return response
-            guard_url = reverse('authentication:login-guard')
-            args = request.META.get('QUERY_STRING', '')
-            if args:
-                guard_url = "%s?%s" % (guard_url, args)
-            response = redirect(guard_url)
-        finally:
+            if request.session.get('auth_confirm_required'):
+                guard_url = reverse('authentication:login-guard')
+                args = request.META.get('QUERY_STRING', '')
+                if args:
+                    guard_url = "%s?%s" % (guard_url, args)
+                return _login_redirect(request, guard_url)
+            request.session['auth_third_party_done'] = 1
+            request.session.pop('auth_third_party_required', None)
+            if response is None:
+                response = self.get_response(request)
+            if not request.session.get('auth_mfa_required'):
+                auth.send_auth_signal(success=True, user=request.user, request=request)
             return response
+        finally:
+            if request.session.get('can_send_notifications') and \
+                    request.session.get('auth_notice_required'):
+                request.session['can_send_notifications'] = False
+                user_log_id = request.session.get('user_log_id')
+                auth_acl_id = request.session.get('auth_acl_id')
+                send_login_info_to_reviewers(user_log_id, auth_acl_id)
 
 
 class SessionCookieMiddleware(MiddlewareMixin):
+    USER_LOGIN_ENCRYPTION_KEY_PAIR = 'user_login_encryption_key_pair'
 
-    @staticmethod
-    def set_cookie_public_key(request, response):
-        if request.path.startswith('/api'):
-            return
-        pub_key_name = settings.SESSION_RSA_PUBLIC_KEY_NAME
-        public_key = request.session.get(pub_key_name)
-        cookie_key = request.COOKIES.get(pub_key_name)
-        if public_key and public_key == cookie_key:
+    def set_cookie_public_key(self, request, response):
+        whitelist = [
+            '/api/v1/authentication/sso/login/',
+        ]
+        if request.path.startswith('/api') and request.path not in whitelist:
             return
 
-        pri_key_name = settings.SESSION_RSA_PRIVATE_KEY_NAME
-        private_key, public_key = gen_key_pair()
+        session_public_key_name = settings.SESSION_RSA_PUBLIC_KEY_NAME
+        session_private_key_name = settings.SESSION_RSA_PRIVATE_KEY_NAME
+
+        session_public_key = request.session.get(session_public_key_name)
+        cookie_public_key = request.COOKIES.get(session_public_key_name)
+
+        gm_enabled = settings.GMSSL_ENABLED
+        cookie_gm_enabled = request.COOKIES.get('jms_gm_ssl') == '1'
+
+        if gm_enabled and cookie_public_key:
+            try:
+                public_key_decode = base64.b64decode(cookie_public_key.encode()).decode()
+                if 'PUBLIC KEY' in public_key_decode:
+                    cookie_public_key = ''
+            except Exception:
+                cookie_public_key = ''
+        
+        if session_public_key and session_public_key == cookie_public_key \
+                and gm_enabled == cookie_gm_enabled:
+            return
+        
+        private_key, public_key, gm_enabled = self.get_key_pair(gm_enabled)
         public_key_decode = base64.b64encode(public_key.encode()).decode()
-        request.session[pub_key_name] = public_key_decode
-        request.session[pri_key_name] = private_key
-        response.set_cookie(pub_key_name, public_key_decode)
+
+        request.session[session_public_key_name] = public_key_decode
+        request.session[session_private_key_name] = private_key
+        response.set_cookie(session_public_key_name, public_key_decode)
+
+        if gm_enabled:
+            response.set_cookie('jms_gm_ssl', '1')
+        elif cookie_gm_enabled:
+            response.delete_cookie('jms_gm_ssl')
+
+    def get_key_pair(self, gm_enabled=False):
+        key = self.USER_LOGIN_ENCRYPTION_KEY_PAIR
+        if gm_enabled:
+            key += '_gm'
+        key_pair = cache.get(key)
+
+        if key_pair:
+            return key_pair['private_key'], key_pair['public_key'], key_pair.get('gm', False)
+
+        if gm_enabled:
+            private_key, public_key = gen_gm_key_pair()
+        else:
+            private_key, public_key = gen_key_pair()
+
+        key_pair = {
+            'private_key': private_key,
+            'public_key': public_key,
+            'gm': gm_enabled
+        }
+        cache.set(key, key_pair, None)
+
+        return private_key, public_key, gm_enabled
 
     @staticmethod
     def set_cookie_session_prefix(request, response):
@@ -135,21 +232,7 @@ class SessionCookieMiddleware(MiddlewareMixin):
             return response
         response.set_cookie(key, value)
 
-    @staticmethod
-    def set_cookie_session_expire(request, response):
-        if not request.session.get('auth_session_expiration_required'):
-            return
-        value = 'age'
-        if settings.SESSION_EXPIRE_AT_BROWSER_CLOSE_FORCE or \
-                not request.session.get('auto_login', False):
-            value = 'close'
-
-        age = request.session.get_expiry_age()
-        response.set_cookie('jms_session_expire', value, max_age=age)
-        request.session.pop('auth_session_expiration_required', None)
-
     def process_response(self, request, response: HttpResponse):
         self.set_cookie_session_prefix(request, response)
         self.set_cookie_public_key(request, response)
-        self.set_cookie_session_expire(request, response)
         return response

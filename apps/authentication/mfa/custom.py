@@ -4,13 +4,14 @@ from django.utils.translation import gettext_lazy as _
 
 from common.utils import get_logger
 from .base import BaseMFA
+from ..const import MFAType
 
 logger = get_logger(__file__)
 
 mfa_custom_method = None
 
 if settings.MFA_CUSTOM:
-    """ 保证自定义认证方法在服务运行时不能被更改，只在第一次调用时加载一次 """
+    """ 保证自定义的方法在服务运行时不能被更改，只在第一次调用时加载一次 """
     try:
         mfa_custom_method_path = 'data.mfa.main.check_code'
         mfa_custom_method = import_string(mfa_custom_method_path)
@@ -21,11 +22,11 @@ custom_failed_msg = _("MFA Custom code invalid")
 
 
 class MFACustom(BaseMFA):
-    name = 'mfa_custom'
-    display_name = 'Custom'
+    name = MFAType.Custom.value
+    display_name = MFAType.Custom.name
     placeholder = _("MFA custom verification code")
 
-    def check_code(self, code):
+    def _check_code(self, code):
         assert self.is_authenticated()
         ok = False
         try:

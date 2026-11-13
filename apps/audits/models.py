@@ -1,20 +1,24 @@
 import os
 import uuid
-from importlib import import_module
+from datetime import timedelta, datetime
+from functools import lru_cache
 
+from django.apps import apps
 from django.conf import settings
-from django.core.cache import caches
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, CharField, F, Value
+from django.db.models.functions import Cast, Coalesce, Concat
 from django.utils import timezone
-from django.utils.translation import gettext, gettext_lazy as _
+from django.utils.translation import gettext, gettext_lazy as _, override
 
 from common.db.encoder import ModelJSONFieldEncoder
-from common.utils import lazyproperty
+from common.sessions.cache import user_session_manager
+from common.utils import lazyproperty, i18n_trans, get_ip_city
 from ops.models import JobExecution
 from orgs.mixins.models import OrgModelMixin, Organization
 from orgs.utils import current_org
 from terminal.models import default_storage
+from tickets.models import Ticket
 from .const import (
     OperateChoices,
     ActionChoices,
@@ -25,24 +29,51 @@ from .const import (
 )
 
 __all__ = [
+    "JobLog",
+    "TicketAudit",
     "FTPLog",
     "OperateLog",
+    "UserSession",
     "ActivityLog",
-    "PasswordChangeLog",
     "UserLoginLog",
-    "JobLog",
-    "UserSession"
+    "PasswordChangeLog",
+    "IntegrationApplicationLog",
 ]
+
+
+def _get_city_display(ip, city='') -> str:
+    try:
+        return get_ip_city(ip) or (gettext(city) if city else '')
+    except Exception:
+        return gettext(city) if city else ''
+
+
+@lru_cache(maxsize=1)
+def get_english_resource_type_names():
+    # Operation logs may store the English translation of a model's verbose name
+    # instead of its msgid (for example, "Operation Log" vs "Operate log").
+    with override('en'):
+        return {
+            str(model._meta.verbose_name): model._meta.verbose_name_raw
+            for model in apps.get_models()
+        }
 
 
 class JobLog(JobExecution):
     @property
-    def creator_name(self):
+    def creator_name(self) -> str:
         return self.creator.name
 
     class Meta:
         proxy = True
         verbose_name = _("Job audit log")
+
+
+class TicketAudit(Ticket):
+    class Meta:
+        proxy = True
+        default_permissions = ('view',)
+        verbose_name = _("Ticket audit")
 
 
 class FTPLog(OrgModelMixin):
@@ -53,19 +84,25 @@ class FTPLog(OrgModelMixin):
     remote_addr = models.CharField(
         max_length=128, verbose_name=_("Remote addr"), blank=True, null=True
     )
-    asset = models.CharField(max_length=1024, verbose_name=_("Asset"))
-    account = models.CharField(max_length=128, verbose_name=_("Account"))
+    asset = models.CharField(max_length=768, verbose_name=_("Asset"), db_index=True)
+    account = models.CharField(max_length=128, verbose_name=_("Account"), db_index=True)
     operate = models.CharField(
         max_length=16, verbose_name=_("Operate"), choices=OperateChoices.choices
     )
     filename = models.CharField(max_length=1024, verbose_name=_("Filename"))
     is_success = models.BooleanField(default=True, verbose_name=_("Success"))
-    date_start = models.DateTimeField(auto_now_add=True, verbose_name=_("Date start"), db_index=True)
-    has_file = models.BooleanField(default=False, verbose_name=_("File"))
+    date_start = models.DateTimeField(auto_now_add=True, verbose_name=_("Date start"))
+    has_file = models.BooleanField(default=False, verbose_name=_("Can Download"))
     session = models.CharField(max_length=36, verbose_name=_("Session"), default=uuid.uuid4)
 
     class Meta:
         verbose_name = _("File transfer log")
+        indexes = [
+            models.Index(fields=['date_start', 'org_id'], name='idx_date_start_org'),
+        ]
+
+    def __str__(self):
+        return "{0.id} of {0.user} to {0.asset}".format(self)
 
     @property
     def filepath(self):
@@ -104,7 +141,11 @@ class OperateLog(OrgModelMixin):
 
     @lazyproperty
     def resource_type_display(self):
-        return gettext(self.resource_type)
+        translated = gettext(self.resource_type)
+        if translated != self.resource_type:
+            return translated
+        msgid = get_english_resource_type_names().get(self.resource_type, self.resource_type)
+        return gettext(msgid)
 
     def save(self, *args, **kwargs):
         if current_org.is_root() and not self.org_id:
@@ -155,26 +196,54 @@ class ActivityLog(OrgModelMixin):
         verbose_name = _("Activity log")
         ordering = ('-datetime',)
 
+    def __str__(self):
+        detail = i18n_trans(self.detail)
+        return "{} {}".format(detail, self.resource_id)
+
     def save(self, *args, **kwargs):
         if current_org.is_root() and not self.org_id:
             self.org_id = Organization.ROOT_ID
         return super(ActivityLog, self).save(*args, **kwargs)
 
 
+def user_display_expression():
+    return Concat(
+        Coalesce(Cast(F('name'), CharField()), Value('None')),
+        Value('('),
+        Coalesce(Cast(F('username'), CharField()), Value('None')),
+        Value(')'),
+        output_field=CharField(),
+    )
+
+
 class PasswordChangeLog(models.Model):
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
-    user = models.CharField(max_length=128, verbose_name=_("User"))
-    change_by = models.CharField(max_length=128, verbose_name=_("Change by"))
+    # User displays contain name(username): 128 + 128 + 2 characters.
+    user = models.CharField(max_length=258, verbose_name=_("User"))
+    change_by = models.CharField(max_length=258, verbose_name=_("Change by"))
     remote_addr = models.CharField(
         max_length=128, verbose_name=_("Remote addr"), blank=True, null=True
     )
-    datetime = models.DateTimeField(auto_now=True, verbose_name=_("Datetime"))
+    datetime = models.DateTimeField(auto_now=True, verbose_name=_("Datetime"), db_index=True)
 
     def __str__(self):
         return "{} change {}'s password".format(self.change_by, self.user)
 
     class Meta:
         verbose_name = _("Password change log")
+
+    @staticmethod
+    def filter_queryset_by_org(queryset):
+        if not current_org.is_root():
+            users = (
+                current_org.get_members()
+                .annotate(user_display=user_display_expression())
+                .values_list('user_display', flat=True)
+            )
+            queryset = queryset.filter(
+                user__in=[str(user) for user in users]
+            )
+        return queryset
 
 
 class UserLoginLog(models.Model):
@@ -196,22 +265,32 @@ class UserLoginLog(models.Model):
     reason = models.CharField(
         default="", max_length=128, blank=True, verbose_name=_("Reason")
     )
+    reason_code = models.CharField(
+        default='', max_length=64, blank=True, verbose_name=_("Reason code")
+    )
+    reason_params = models.JSONField(
+        default=dict, blank=True, verbose_name=_("Reason params")
+    )
     status = models.BooleanField(
         default=LoginStatusChoices.success,
         choices=LoginStatusChoices.choices,
         verbose_name=_("Status"),
     )
-    datetime = models.DateTimeField(default=timezone.now, verbose_name=_("Date login"), db_index=True)
+    datetime = models.DateTimeField(default=timezone.now, verbose_name=_("Login Date"), db_index=True)
     backend = models.CharField(
-        max_length=32, default="", verbose_name=_("Authentication backend")
+        max_length=32, default="", verbose_name=_("Auth backend")
     )
 
     def __str__(self):
         return '%s(%s)' % (self.username, self.city)
 
     @property
-    def backend_display(self):
+    def backend_display(self) -> str:
         return gettext(self.backend)
+
+    @lazyproperty
+    def city_display(self) -> str:
+        return _get_city_display(self.ip, self.city)
 
     @classmethod
     def get_login_logs(cls, date_from=None, date_to=None, user=None, keyword=None):
@@ -236,8 +315,24 @@ class UserLoginLog(models.Model):
         return login_logs
 
     @property
-    def reason_display(self):
-        from authentication.errors import reason_choices, old_reason_choices
+    def reason_display(self) -> str:
+        from authentication.errors import (
+            reason_choices, reason_template_choices, old_reason_choices
+        )
+
+        template = reason_template_choices.get(self.reason_code)
+        if template:
+            reason_params = self.reason_params
+            if not isinstance(reason_params, dict):
+                reason_params = {}
+            try:
+                return template.format(**reason_params)
+            except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+                pass
+
+        reason = reason_choices.get(self.reason_code)
+        if reason:
+            return reason
 
         reason = reason_choices.get(self.reason)
         if reason:
@@ -245,21 +340,38 @@ class UserLoginLog(models.Model):
         reason = old_reason_choices.get(self.reason, self.reason)
         return reason
 
+    @staticmethod
+    def filter_queryset_by_org(queryset):
+        from audits.utils import construct_userlogin_usernames
+        if current_org.is_root() or not settings.XPACK_ENABLED:
+            return queryset
+        user_queryset = current_org.get_members()
+        users = construct_userlogin_usernames(user_queryset)
+        return queryset.filter(username__in=users)
+
     class Meta:
         ordering = ["-datetime", "username"]
         verbose_name = _("User login log")
+        indexes = [
+            models.Index(fields=['username', 'datetime'], name='login_log_username_date_idx'),
+            models.Index(
+                fields=['username', 'status', 'city', 'datetime'],
+                name='login_log_username_city_idx',
+            ),
+        ]
 
 
 class UserSession(models.Model):
+    _OPERATE_LOG_ACTION = {'delete': ActionChoices.finished}
+
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
     ip = models.GenericIPAddressField(verbose_name=_("Login IP"))
     key = models.CharField(max_length=128, verbose_name=_("Session key"))
     city = models.CharField(max_length=254, blank=True, null=True, verbose_name=_("Login city"))
     user_agent = models.CharField(max_length=254, blank=True, null=True, verbose_name=_("User agent"))
     type = models.CharField(choices=LoginTypeChoices.choices, max_length=2, verbose_name=_("Login type"))
-    backend = models.CharField(max_length=32, default="", verbose_name=_("Authentication backend"))
-    date_created = models.DateTimeField(null=True, blank=True, verbose_name=_('Date created'))
-    date_expired = models.DateTimeField(null=True, blank=True, verbose_name=_("Date expired"), db_index=True)
+    backend = models.CharField(max_length=32, default="", verbose_name=_("Auth backend"))
+    date_created = models.DateTimeField(null=True, blank=True, verbose_name=_('Login date'))
     user = models.ForeignKey(
         'users.User', verbose_name=_('User'), related_name='sessions', on_delete=models.CASCADE
     )
@@ -267,25 +379,51 @@ class UserSession(models.Model):
     def __str__(self):
         return '%s(%s)' % (self.user, self.ip)
 
+    @lazyproperty
+    def city_display(self) -> str:
+        return _get_city_display(self.ip, self.city)
+
     @property
-    def backend_display(self):
+    def backend_display(self) -> str:
         return gettext(self.backend)
 
-    @staticmethod
-    def get_keys():
-        session_store_cls = import_module(settings.SESSION_ENGINE).SessionStore
-        cache_key_prefix = session_store_cls.cache_key_prefix
-        keys = caches[settings.SESSION_CACHE_ALIAS].keys('*')
-        return [k.replace(cache_key_prefix, '') for k in keys]
+    @property
+    def is_active(self) -> bool:
+        return user_session_manager.check_active(self.key)
+
+    @property
+    def date_expired(self) -> datetime:
+        from common.sessions import session_expiry
+        return session_expiry(self.key)
 
     @classmethod
     def clear_expired_sessions(cls):
-        cls.objects.filter(date_expired__lt=timezone.now()).delete()
-        cls.objects.exclude(key__in=cls.get_keys()).delete()
+        keys = user_session_manager.get_keys()
+        cls.objects.exclude(key__in=keys).delete()
 
     class Meta:
         ordering = ['-date_created']
         verbose_name = _('User session')
         permissions = [
-            ('offline_usersession', _('Offline ussr session')),
+            ('offline_usersession', _('Offline user session')),
         ]
+
+
+class IntegrationApplicationLog(models.Model):
+    id = models.UUIDField(default=uuid.uuid4, primary_key=True)
+    remote_addr = models.GenericIPAddressField(null=True, verbose_name=_("Remote addr"))
+    service = models.CharField(max_length=128, verbose_name=_("Application"))
+    service_id = models.UUIDField(verbose_name=_("Application ID"))
+    asset = models.CharField(max_length=128, verbose_name=_("Asset"))
+    account = models.CharField(max_length=128, verbose_name=_("Account"))
+    datetime = models.DateTimeField(auto_now=True, verbose_name=_("Datetime"))
+    org_id = models.CharField(max_length=36, blank=True, default='', db_index=True)
+    asset_id = models.UUIDField(null=True, blank=True)
+    account_id = models.UUIDField(null=True, blank=True)
+    credential_id = models.UUIDField(null=True, blank=True)
+    credential_key = models.CharField(max_length=64, blank=True, default='')
+    instance_id = models.CharField(max_length=128, blank=True, default='')
+    source = models.CharField(max_length=16, blank=True, default='')
+    result = models.CharField(max_length=16, default='success')
+    revision = models.PositiveIntegerField(null=True, blank=True)
+    summary = models.CharField(max_length=512, blank=True, default='')

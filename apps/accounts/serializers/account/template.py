@@ -1,38 +1,66 @@
+from django.db import transaction
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
-from accounts.models import AccountTemplate, Account
-from common.serializers import SecretReadableMixin
+from accounts.models import Account, AccountTemplate
+from accounts.tasks import template_sync_related_accounts
+from common.serializers import SecretReadableMixin, SecretReadableCheckMixin
 from common.serializers.fields import ObjectRelatedField
 from .base import BaseAccountSerializer
 
 
 class PasswordRulesSerializer(serializers.Serializer):
-    length = serializers.IntegerField(min_value=8, max_value=30, default=16, label=_('Password length'))
+    length = serializers.IntegerField(min_value=8, max_value=36, default=16, label=_('Password length'))
     lowercase = serializers.BooleanField(default=True, label=_('Lowercase'))
     uppercase = serializers.BooleanField(default=True, label=_('Uppercase'))
     digit = serializers.BooleanField(default=True, label=_('Digit'))
     symbol = serializers.BooleanField(default=True, label=_('Special symbol'))
+    exclude_symbols = serializers.CharField(
+        default='', allow_blank=True, max_length=16, label=_('Exclude symbol')
+    )
+
+    @staticmethod
+    def get_render_help_text():
+        return _("""length is the length of the password, and the range is 8 to 36.
+lowercase indicates whether the password contains lowercase letters, 
+uppercase indicates whether it contains uppercase letters,
+digit indicates whether it contains numbers, and symbol indicates whether it contains special symbols.
+exclude_symbols is used to exclude specific symbols. You can fill in the symbol characters to be excluded (up to 16). 
+If you do not need to exclude symbols, you can leave it blank.
+default: {"length": 16, "lowercase": true, "uppercase": true, "digit": true, "symbol": true, "exclude_symbols": ""}""")
 
 
 class AccountTemplateSerializer(BaseAccountSerializer):
-    is_sync_account = serializers.BooleanField(default=False, write_only=True)
-    _is_sync_account = False
-
     password_rules = PasswordRulesSerializer(required=False, label=_('Password rules'))
     su_from = ObjectRelatedField(
         required=False, queryset=AccountTemplate.objects, allow_null=True,
         allow_empty=True, label=_('Su from'), attrs=('id', 'name', 'username')
     )
 
+    def update(self, instance, validated_data):
+        changed = any(
+            field in validated_data and validated_data[field] != getattr(instance, field)
+            for field in Account.TEMPLATE_SYNC_FIELDS
+        )
+        instance = super().update(instance, validated_data)
+        if changed:
+            request = self.context.get('request')
+            user_id = str(request.user.id) if request else None
+            template_id = str(instance.id)
+            transaction.on_commit(
+                lambda: template_sync_related_accounts.delay(template_id, user_id)
+            )
+        return instance
+
     class Meta(BaseAccountSerializer.Meta):
         model = AccountTemplate
         fields = BaseAccountSerializer.Meta.fields + [
             'secret_strategy', 'password_rules',
             'auto_push', 'push_params', 'platforms',
-            'is_sync_account', 'su_from'
+            'su_from'
         ]
         extra_kwargs = {
+            **BaseAccountSerializer.Meta.extra_kwargs,
             'secret_strategy': {'help_text': _('Secret generation strategy for account creation')},
             'auto_push': {'help_text': _('Whether to automatically push the account to the asset')},
             'platforms': {
@@ -43,38 +71,19 @@ class AccountTemplateSerializer(BaseAccountSerializer):
                 'required': False
             },
         }
-
-    def sync_accounts_secret(self, instance, diff):
-        if not self._is_sync_account or 'secret' not in diff:
-            return
-        query_data = {
-            'source_id': instance.id,
-            'username': instance.username,
-            'secret_type': instance.secret_type
-        }
-        accounts = Account.objects.filter(**query_data)
-        instance.bulk_sync_account_secret(accounts, self.context['request'].user.id)
-
-    def validate(self, attrs):
-        self._is_sync_account = attrs.pop('is_sync_account', None)
-        attrs = super().validate(attrs)
-        return attrs
-
-    def update(self, instance, validated_data):
-        diff = {
-            k: v for k, v in validated_data.items()
-            if getattr(instance, k, None) != v
-        }
-        instance = super().update(instance, validated_data)
-        if {'username', 'secret_type'} & set(diff.keys()):
-            Account.objects.filter(source_id=instance.id).update(source_id=None)
-        else:
-            self.sync_accounts_secret(instance, diff)
-        return instance
+        fields_unimport_template = ['push_params']
 
 
-class AccountTemplateSecretSerializer(SecretReadableMixin, AccountTemplateSerializer):
+class AccountDetailTemplateSerializer(AccountTemplateSerializer):
     class Meta(AccountTemplateSerializer.Meta):
+        fields = AccountTemplateSerializer.Meta.fields + ['spec_info']
+
+
+class AccountTemplateSecretSerializer(SecretReadableCheckMixin, SecretReadableMixin, AccountDetailTemplateSerializer):
+    class Meta(AccountDetailTemplateSerializer.Meta):
+        fields = AccountDetailTemplateSerializer.Meta.fields
         extra_kwargs = {
+            **AccountDetailTemplateSerializer.Meta.extra_kwargs,
             'secret': {'write_only': False},
         }
+        secret_fields = ['secret']

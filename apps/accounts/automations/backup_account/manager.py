@@ -1,44 +1,43 @@
 # -*- coding: utf-8 -*-
 #
-import time
 
-from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 
-from common.utils.timezone import local_now_display
+from assets.automations.base.manager import BaseManager
+from common.const import Status
 from .handlers import AccountBackupHandler
 
 
-class AccountBackupManager:
-    def __init__(self, execution):
-        self.execution = execution
-        self.date_start = timezone.now()
-        self.time_start = time.time()
-        self.date_end = None
-        self.time_end = None
-        self.timedelta = 0
-
+class AccountBackupManager(BaseManager):
     def do_run(self):
         execution = self.execution
-        print('\n\033[33m# 账号备份计划正在执行\033[0m')
-        handler = AccountBackupHandler(execution)
+        account_backup_execution_being_executed = _('The account backup plan is being executed')
+        self.print_log(account_backup_execution_being_executed, 'progress')
+        handler = AccountBackupHandler(self, execution)
         handler.run()
 
-    def pre_run(self):
-        self.execution.date_start = self.date_start
-        self.execution.save()
+    def send_report_if_need(self):
+        pass
 
-    def post_run(self):
-        self.time_end = time.time()
-        self.date_end = timezone.now()
+    def print_summary(self):
+        error = self.summary.get('error')
+        self.print_log(
+            _("Task execution completed"),
+            'error'
+            if error or self.status in (Status.failed, Status.error)
+            else 'success',
+        )
+        if error:
+            self.print_log(
+                _("Backup failed: %(error)s") % {'error': error}, 'error'
+            )
+        else:
+            self.print_log(_("Backed up %(count)s accounts") % {
+                'count': self.summary.get('total_accounts', 0),
+            }, 'success')
+        self.print_log(_("Duration: %(duration)s seconds") % {
+            'duration': self.duration,
+        }, 'info')
 
-        print('\n\n' + '-' * 80)
-        print('计划执行结束 {}\n'.format(local_now_display()))
-        self.timedelta = self.time_end - self.time_start
-        print('用时: {}s'.format(self.timedelta))
-        self.execution.timedelta = self.timedelta
-        self.execution.save()
-
-    def run(self):
-        self.pre_run()
-        self.do_run()
-        self.post_run()
+    def get_report_template(self):
+        return "accounts/backup_account_report.html"

@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 #
 from django import forms
+from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 
 from common.utils import validate_ssh_public_key
 from authentication.forms import EncryptedField, CaptchaMixin
 from ..models import User
-
 
 __all__ = [
     'UserProfileForm', 'UserMFAForm', 'UserFirstLoginFinishForm',
@@ -45,7 +45,6 @@ UserProfileForm.verbose_name = _("Profile")
 
 
 class UserMFAForm(forms.ModelForm):
-
     mfa_description = _(
         'When enabled, '
         'you will enter the MFA binding process the next time you log in. '
@@ -100,11 +99,14 @@ class UserTokenResetPasswordForm(forms.Form):
 
 class UserForgotPasswordForm(forms.Form):
     email = forms.CharField(label=_("Email"), required=False)
+    country_code = forms.CharField(required=False)
     sms = forms.CharField(
         label=_('SMS'), required=False,
         help_text=_('The phone number must contain an area code, for example, +86')
     )
-    code = forms.CharField(label=_('Verify code'), max_length=6, required=False)
+    code = forms.CharField(
+        label=_('Verify code'), max_length=settings.SMS_CODE_LENGTH, required=False
+    )
     form_type = forms.ChoiceField(
         choices=[('sms', _('SMS')), ('email', _('Email'))],
         widget=forms.HiddenInput({'value': 'email'})

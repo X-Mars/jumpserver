@@ -1,35 +1,57 @@
 # -*- coding: utf-8 -*-
 #
 import logging
+
+from django.core.cache import cache
 from django.db.models import Q
-from django.conf import settings
 from django.utils.translation import gettext_lazy as _
+from django_filters import rest_framework as filters
 from rest_framework import generics
 from rest_framework import status
 from rest_framework.views import APIView, Response
-from django_filters import rest_framework as filters
 
-from common.drf.filters import BaseFilterSet
 from common.api import JMSBulkModelViewSet
+from common.drf.filters import BaseFilterSet
 from common.exceptions import JMSException
-from common.permissions import WithBootstrapToken
+from common.permissions import WithBootstrapToken, IsServiceAccount
+from jumpserver.conf import ConfigCrypto
 from terminal import serializers
 from terminal.models import Terminal
 
 __all__ = [
     'TerminalViewSet', 'TerminalConfig',
-    'TerminalRegistrationApi',
+    'TerminalRegistrationApi', 'EncryptedTerminalConfig'
 ]
 logger = logging.getLogger(__file__)
 
 
 class TerminalFilterSet(BaseFilterSet):
-    name = filters.CharFilter(field_name='name', lookup_expr='icontains')
-    remote_addr = filters.CharFilter(field_name='remote_addr', lookup_expr='icontains')
+    name = filters.CharFilter(
+        field_name='name', lookup_expr='icontains', label=_('Name')
+    )
+    remote_addr = filters.CharFilter(
+        field_name='remote_addr', lookup_expr='icontains',
+        label=_('Remote address')
+    )
+    is_alive = filters.BooleanFilter(
+        method='filter_is_alive', label=_('Is alive')
+    )
+    load = filters.CharFilter(method='do_nothing', label=_('Load'))
 
     class Meta:
         model = Terminal
-        fields = ['name', 'remote_addr', 'type']
+        fields = ['name', 'remote_addr', 'type', 'is_alive', 'load']
+
+    def filter_is_alive(self, queryset, name, value):
+        ids = list(queryset.values_list('id', flat=True))
+        if not ids:
+            return queryset.none() if value else queryset
+
+        alive_ids = [pk for pk in ids if cache.get(Terminal.ALIVE_KEY.format(pk))]
+        if value:
+            return queryset.filter(id__in=alive_ids)
+        else:
+            return queryset.exclude(id__in=alive_ids)
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -45,7 +67,6 @@ class TerminalViewSet(JMSBulkModelViewSet):
     queryset = Terminal.objects.filter(is_deleted=False)
     serializer_class = serializers.TerminalSerializer
     filterset_class = TerminalFilterSet
-    custom_filter_fields = ['load']
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -83,9 +104,17 @@ class TerminalRegistrationApi(generics.CreateAPIView):
     permission_classes = [WithBootstrapToken]
     http_method_names = ['post']
 
-    def create(self, request, *args, **kwargs):
-        if not settings.SECURITY_SERVICE_ACCOUNT_REGISTRATION:
-            data = {"error": "service account registration disabled"}
-            return Response(data=data, status=status.HTTP_400_BAD_REQUEST)
-        return super().create(request, *args, **kwargs)
 
+class EncryptedTerminalConfig(generics.CreateAPIView):
+    serializer_class = serializers.EncryptedConfigSerializer
+    permission_classes = [IsServiceAccount]
+    http_method_names = ['post']
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        encrypt_key = serializer.validated_data['secret_encrypt_key']
+        encrypted_value = serializer.validated_data['encrypted_value']
+        config_crypto = ConfigCrypto(encrypt_key)
+        value = config_crypto.decrypt(encrypted_value)
+        return Response(data={'value': value}, status=200)

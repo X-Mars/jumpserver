@@ -8,6 +8,7 @@ GATEWAY_NAME = 'Gateway'
 class HostTypes(BaseType):
     LINUX = 'linux', 'Linux'
     WINDOWS = 'windows', 'Windows'
+    MacOS = 'macos', 'macOS'
     UNIX = 'unix', 'Unix'
     OTHER_HOST = 'other', _("Other")
 
@@ -17,9 +18,10 @@ class HostTypes(BaseType):
             '*': {
                 'charset_enabled': True,
                 'charset': 'utf-8',  # default
-                'domain_enabled': True,
+                'gateway_enabled': True,
                 'su_enabled': True,
-                'su_methods': ['sudo', 'su'],
+                'ds_enabled': True,
+                'su_methods': ['sudo', 'su', 'only_sudo', 'only_su'],
             },
             cls.WINDOWS: {
                 'su_enabled': False,
@@ -53,7 +55,8 @@ class HostTypes(BaseType):
                 'gather_accounts_enabled': True,
                 'verify_account_enabled': True,
                 'change_secret_enabled': True,
-                'push_account_enabled': True
+                'push_account_enabled': True,
+                'remove_account_enabled': True,
             },
             cls.WINDOWS: {
                 'ansible_config': {
@@ -66,7 +69,6 @@ class HostTypes(BaseType):
                 'ping_enabled': False,
                 'gather_facts_enabled': False,
                 'gather_accounts_enabled': False,
-                'verify_account_enabled': False,
                 'change_secret_enabled': False,
                 'push_account_enabled': False
             },
@@ -78,8 +80,23 @@ class HostTypes(BaseType):
             cls.LINUX: [
                 {'name': 'Linux'},
                 {
+                    'name': 'VirtualAppHost',
+                    '_protocols': ['ssh'],
+                    'protocols_setting': {
+                        'ssh': {
+                            'required': True,
+                            'default': True,
+                        }
+                    },
+                    'automation': {
+                        'ansible_config': {
+                            'ansible_connection': 'ssh',
+                        }
+                    },
+                },
+                {
                     'name': GATEWAY_NAME,
-                    'domain_enabled': True,
+                    'gateway_enabled': True,
                 }
             ],
             cls.UNIX: [
@@ -123,5 +140,5 @@ class HostTypes(BaseType):
     @classmethod
     def get_community_types(cls) -> list:
         return [
-            cls.LINUX, cls.UNIX, cls.WINDOWS, cls.OTHER_HOST
+            cls.LINUX, cls.WINDOWS, cls.UNIX, cls.OTHER_HOST
         ]

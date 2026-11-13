@@ -16,7 +16,7 @@
             {% if error %}
                 {{ error }}
             {% else %}
-                {{ message|safe }}
+                {{ message | safe }}
             {% endif %}
             </div>
         </p>
@@ -44,7 +44,7 @@
 
 {% block custom_foot_js %}
     <script>
-    var ttl = 2
+    var ttl = 1
     var message = ''
     var time = '{{ interval }}'
     {% if error %}
@@ -52,15 +52,16 @@
     {% else %}
         message = '{{ message|safe }}'
     {% endif %}
+    var redirect_url = '{{ redirect_url|escapejs }}'
 
     function redirect_page() {
-        if (time >= 0) {
+        if (time > 0) {
             var msg = message + '， <b>' + time + '</b> ...';
             $('#messages').html(msg);
             time -= ttl;
             setTimeout(redirect_page, ttl * 1000);
         } else {
-            window.location.href = "{{ redirect_url }}";
+            window.location.href = redirect_url
         }
     }
     {% if auto_redirect %}
@@ -68,4 +69,3 @@
     {% endif %}
 </script>
 {% endblock %}
-

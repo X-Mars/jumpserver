@@ -5,8 +5,11 @@ from .. import api
 user_permission_urlpatterns = [
     # <str:user> such as: my | self | user.id
     # assets
+    path('<str:user>/assets/<uuid:pk>/', api.UserPermedAssetRetrieveApi.as_view(),
+         name='user-permed-asset'),
     path('<str:user>/assets/', api.UserAllPermedAssetsApi.as_view(),
          name='user-all-assets'),
+
     path('<str:user>/nodes/ungrouped/assets/', api.UserDirectPermedAssetsApi.as_view(),
          name='user-direct-assets'),
     path('<str:user>/nodes/favorite/assets/', api.UserFavoriteAssetsApi.as_view(),
@@ -40,16 +43,14 @@ user_permission_urlpatterns = [
     path('<str:user>/nodes/children-with-assets/category/tree/',
          api.UserPermedNodeChildrenWithAssetsAsCategoryTreeApi.as_view(),
          name='user-node-children-with-assets-as-category-tree'),
+    path('<str:user>/favorite-tree/', api.UserFavoriteTreeApi.as_view(),
+         name='user-favorite-tree'),
+    path('<str:user>/tree-metrics/', api.UserAssetTreeMetricsApi.as_view(),
+         name='user-asset-tree-metrics'),
     # 同步树
     path('<str:user>/nodes/all-with-assets/tree/',
          api.UserPermedNodesWithAssetsAsTreeApi.as_view(),
          name='user-nodes-with-assets-as-tree'),
-    path('<str:user>/nodes/children-with-k8s/tree/',
-         api.UserGrantedK8sAsTreeApi.as_view(),
-         name='user-nodes-children-with-k8s-as-tree'),
-    # accounts
-    path('<str:user>/assets/<uuid:asset_id>/accounts/', api.UserPermedAssetAccountsApi.as_view(),
-         name='user-permed-asset-accounts'),
 ]
 
 user_group_permission_urlpatterns = [

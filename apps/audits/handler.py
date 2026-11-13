@@ -1,18 +1,22 @@
 import json
 from datetime import datetime
+from uuid import UUID
 
 from django.core.cache import cache
 from django.db import transaction
 from django.utils.translation import gettext_lazy as _
 
-from common.local import encrypted_field_set
+from common.local import similar_encrypted_pattern, exclude_encrypted_fields
 from common.utils import get_request_ip, get_logger
 from common.utils.encode import Singleton
 from common.utils.timezone import as_current_tz
 from jumpserver.utils import current_request
 from orgs.models import Organization
 from orgs.utils import get_current_org_id
+from settings.models import Setting
 from settings.serializers import SettingsSerializer
+from users.models import Preference
+from users.serializers import PreferenceSerializer
 from .backends import get_operate_log_storage
 
 logger = get_logger(__name__)
@@ -20,6 +24,8 @@ logger = get_logger(__name__)
 
 class OperatorLogHandler(metaclass=Singleton):
     CACHE_KEY = 'OPERATOR_LOG_CACHE_KEY'
+    SYSTEM_OBJECTS = frozenset({"Role"})
+    PREFER_CURRENT_ELSE_USER = frozenset({"SSOToken"})
 
     def __init__(self):
         self.log_client = self.get_storage_client()
@@ -37,13 +43,33 @@ class OperatorLogHandler(metaclass=Singleton):
             value2 = as_current_tz(value2).strftime('%Y-%m-%d %H:%M:%S')
         return value1, value2
 
+    @classmethod
+    def _normalize_diff_value(cls, value):
+        if isinstance(value, datetime):
+            return as_current_tz(value).strftime('%Y-%m-%d %H:%M:%S')
+        if isinstance(value, UUID):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: cls._normalize_diff_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [cls._normalize_diff_value(v) for v in value]
+        return value
+
+    @classmethod
+    def _value_equal_for_diff(cls, left, right):
+        left = cls._normalize_diff_value(left)
+        right = cls._normalize_diff_value(right)
+        if left == right:
+            return True
+
+        return str(left) == str(right)
+
     def _look_for_two_dict_change(self, left_dict, right_dict):
-        # 以右边的字典为基础
         before, after = {}, {}
-        for key, value in right_dict.items():
+        for key in left_dict.keys() | right_dict.keys():
             pre_value = left_dict.get(key, '')
-            pre_value, value = self._consistent_type_to_str(pre_value, value)
-            if sorted(str(value)) == sorted(str(pre_value)):
+            value = right_dict.get(key, '')
+            if self._value_equal_for_diff(pre_value, value):
                 continue
             before[key] = pre_value
             after[key] = value
@@ -55,7 +81,7 @@ class OperatorLogHandler(metaclass=Singleton):
             return
 
         key = '%s_%s' % (self.CACHE_KEY, instance_id)
-        cache.set(key, instance_dict, 3 * 60)
+        cache.set(key, instance_dict, 3)
 
     def get_instance_dict_from_cache(self, instance_id):
         if instance_id is None:
@@ -87,19 +113,15 @@ class OperatorLogHandler(metaclass=Singleton):
         return log_id, before, after
 
     @staticmethod
-    def get_resource_display_from_setting(resource):
-        resource_display = None
-        setting_serializer = SettingsSerializer()
-        label = setting_serializer.get_field_label(resource)
-        if label is not None:
-            resource_display = label
-        return resource_display
-
-    def get_resource_display(self, resource):
-        resource_display = str(resource)
-        return_value = self.get_resource_display_from_setting(resource_display)
-        if return_value is not None:
-            resource_display = return_value
+    def get_resource_display(resource):
+        if isinstance(resource, Setting):
+            serializer = SettingsSerializer()
+            resource_display = serializer.get_field_label(resource.name)
+        elif isinstance(resource, Preference):
+            serializer = PreferenceSerializer()
+            resource_display = serializer.get_field_label(resource.name)
+        else:
+            resource_display = str(resource)
         return resource_display
 
     @staticmethod
@@ -110,19 +132,31 @@ class OperatorLogHandler(metaclass=Singleton):
             return ','.join(value)
         return json.dumps(value)
 
+    @staticmethod
+    def __similar_check(key):
+        if not key or key in exclude_encrypted_fields:
+            return False
+
+        return bool(similar_encrypted_pattern.search(key))
+
     def __data_processing(self, dict_item, loop=True):
         encrypt_value = '******'
-        for key, value in dict_item.items():
+        new_data = {}
+        for label, item in dict_item.items():
+            if not isinstance(item, (dict,)):
+                continue
+            value = item.get('value', '')
+            field_name = item.get('name', '')
             if isinstance(value, bool):
                 value = _('Yes') if value else _('No')
             elif isinstance(value, (list, tuple)):
                 value = self.serialized_value(value)
             elif isinstance(value, dict) and loop:
                 self.__data_processing(value, loop=False)
-            if key in encrypted_field_set:
+            if self.__similar_check(field_name):
                 value = encrypt_value
-            dict_item[key] = value
-        return dict_item
+            new_data[label] = value
+        return new_data
 
     def data_processing(self, before, after):
         if before:
@@ -131,33 +165,47 @@ class OperatorLogHandler(metaclass=Singleton):
             after = self.__data_processing(after)
         return before, after
 
-    @staticmethod
-    def get_org_id(object_name):
-        system_obj = ('Role',)
-        org_id = get_current_org_id()
-        if object_name in system_obj:
-            org_id = Organization.SYSTEM_ID
-        return org_id
+    def get_org_id(self, user, object_name):
+        if object_name in self.SYSTEM_OBJECTS:
+            return Organization.SYSTEM_ID
+
+        current = get_current_org_id()
+        current_id = str(current) if current else None
+
+        if object_name in self.PREFER_CURRENT_ELSE_USER:
+            if current_id and current_id != Organization.DEFAULT_ID:
+                return current_id
+
+            org = user.orgs.distinct().first()
+            return str(org.id) if org else Organization.DEFAULT_ID
+
+        return current_id or Organization.DEFAULT_ID
 
     def create_or_update_operate_log(
             self, action, resource_type, resource=None, resource_display=None,
             force=False, log_id=None, before=None, after=None,
-            object_name=None
+            object_name=None, user=None, org_id=None, remote_addr=None,
+            resource_id=None,
     ):
-        user = current_request.user if current_request else None
+        request = current_request if current_request else None
+        if user is None:
+            user = request.user if request else None
         if not user or not user.is_authenticated:
             return
 
-        remote_addr = get_request_ip(current_request)
+        if remote_addr is None:
+            remote_addr = get_request_ip(request) if request else ''
         if resource_display is None:
             resource_display = self.get_resource_display(resource)
-        resource_id = getattr(resource, 'pk', '')
+        if resource_id is None:
+            resource_id = getattr(resource, 'pk', '')
         before, after = self.data_processing(before, after)
-        if not force and not any([before, after]):
+        if not force and (before == after):
             # 前后都没变化，没必要生成日志，除非手动强制保存
             return
 
-        org_id = self.get_org_id(object_name)
+        if org_id is None:
+            org_id = self.get_org_id(user, object_name)
         data = {
             'id': log_id, "user": str(user), 'action': action,
             'resource_type': str(resource_type), 'org_id': org_id,

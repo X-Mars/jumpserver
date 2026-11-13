@@ -3,6 +3,8 @@
   vars:
     ansible_shell_type: sh
     ansible_connection: local
+    ansible_python_interpreter: "{{ local_python_interpreter }}"
+    ansible_timeout: 30
 
   tasks:
     - name: Test asset connection (pyfreerdp)
@@ -12,4 +14,3 @@
         login_host: "{{ jms_asset.address }}"
         login_port: "{{ jms_asset.port }}"
         login_secret_type: "{{ jms_account.secret_type }}"
-        login_private_key_path: "{{ jms_account.private_key_path }}"

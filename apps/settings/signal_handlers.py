@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 #
 import json
-
-from django.conf import LazySettings
+import os
+import shutil
+from django.db import connections
+from django.conf import LazySettings, settings
 from django.db.models.signals import post_save
 from django.db.utils import ProgrammingError, OperationalError
 from django.dispatch import receiver
+from django.db.models.signals import post_migrate
 from django.utils.functional import LazyObject
+from django.apps import apps
 
+from jumpserver.const import BASE_DIR
 from common.decorators import on_transaction_commit
 from common.signals import django_ready
 from common.utils import get_logger, ssh_key_gen
@@ -30,12 +35,15 @@ setting_pub_sub = SettingSubPub()
 def refresh_settings_on_changed(sender, instance=None, **kwargs):
     if not instance:
         return
+    from authentication.services.client_login_session import CLIENT_LOGIN_POLICY_CACHE_KEY, POLICY_FIELDS
+    if instance.name in POLICY_FIELDS:
+        from django.core.cache import cache
+        cache.delete(CLIENT_LOGIN_POLICY_CACHE_KEY)
+    from authentication.services.idle_lock import TIME_SETTINGS, IDLE_LOCK_LIMITS_CACHE_KEY
+    if instance.name in TIME_SETTINGS.values():
+        from django.core.cache import cache
+        cache.delete(IDLE_LOCK_LIMITS_CACHE_KEY)
     setting_pub_sub.publish(instance.name)
-    if instance.is_name('PERM_SINGLE_ASSET_TO_UNGROUP_NODE'):
-        """ 过期所有用户授权树 """
-        logger.debug('Expire all user perm tree')
-        from perms.utils import UserPermTreeExpireUtil
-        UserPermTreeExpireUtil().expire_perm_tree_for_all_user()
 
 
 @receiver(django_ready)
@@ -62,6 +70,27 @@ def subscribe_settings_change(sender, **kwargs):
     setting_pub_sub.subscribe(lambda name: Setting.refresh_item(name))
 
 
+def update_site_url():
+    site_url = Setting.objects.filter(name='SITE_URL').first()
+    host_ip = os.environ.get('HOST_IP')
+    if not host_ip:
+        return
+    scheme = 'https' if os.environ.get('HTTPS_PORT') else 'http'
+    if not site_url:
+        site_url = Setting.objects.create(name='SITE_URL')
+
+    if site_url.cleaned_value == f'http://127.0.0.1' or not site_url.cleaned_value:
+        site_url.cleaned_value = f'{scheme}://{host_ip}'
+        site_url.save()
+
+
+@receiver(post_migrate)
+def after_migrate_some_config(sender, app_config, **kwargs):
+    last_app = list(apps.get_app_configs())[-1]
+    if app_config.name == last_app.name:
+        update_site_url()
+
+
 @receiver(django_ready)
 def monkey_patch_settings(sender, **kwargs):
     def monkey_patch_getattr(self, name):
@@ -75,3 +104,36 @@ def monkey_patch_settings(sender, **kwargs):
         LazySettings.__getattr__ = monkey_patch_getattr
     except (ProgrammingError, OperationalError):
         pass
+
+
+@receiver(post_migrate, dispatch_uid='settings.signal_handlers.init_sqlite_db')
+def init_sqlite_db(sender, app_config, **kwargs):
+    if app_config.name != 'settings':
+         return
+    db_path = settings.LEAK_PASSWORD_DB_PATH
+    if not os.path.isfile(db_path):
+        # 这里处理一下历史数据，有可能用户 copy 了旧的文件到 目录下
+        src = os.path.join(settings.PROJECT_DIR, 'data', 'leak_passwords.db')
+        if not os.path.isfile(src):
+            src = os.path.join(
+                settings.APPS_DIR, 'accounts', 'automations',
+                'check_account', 'leak_passwords.db'
+            )
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        shutil.copy(src, db_path)
+    logger.info(f'init sqlite db {db_path}')
+    return db_path
+
+
+@receiver(django_ready)
+def register_sqlite_connection(sender, **kwargs):
+    connections.databases['sqlite'] = {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'ATOMIC_REQUESTS': False,
+        'NAME': settings.LEAK_PASSWORD_DB_PATH,
+        'TIME_ZONE': None,
+        'CONN_HEALTH_CHECKS': False,
+        'CONN_MAX_AGE': 0,
+        'OPTIONS': {},
+        'AUTOCOMMIT': True,
+    }

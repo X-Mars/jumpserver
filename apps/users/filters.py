@@ -1,35 +1,152 @@
-from django.utils.translation import gettext as _
+from django.conf import settings
+from django.db.models import Q
+from django.utils import timezone
+from django.utils.translation import gettext, gettext_lazy as _
 from django_filters import rest_framework as filters
 
 from common.drf.filters import BaseFilterSet
-from common.utils import is_uuid
-from rbac.models import Role
+from common.utils import is_uuid, text_hmac_sha256
+from rbac.models import Role, OrgRoleBinding, SystemRoleBinding
 from users.models.user import User
 
 
 class UserFilter(BaseFilterSet):
-    system_roles = filters.CharFilter(method='filter_system_roles')
-    org_roles = filters.CharFilter(method='filter_org_roles')
-    groups = filters.CharFilter(field_name="groups__name", lookup_expr='exact')
-    group_id = filters.CharFilter(field_name="groups__id", lookup_expr='exact')
+    email = filters.CharFilter(method='filter_email', label=_('Email'))
+    mfa_level = filters.TypedChoiceFilter(
+        choices=User.MFA_LEVEL_CHOICES,
+        coerce=int,
+        method='filter_mfa_level',
+    )
+    groups = filters.CharFilter(
+        field_name="groups__name", lookup_expr='iexact',
+        label=_('User group name')
+    )
+    group_id = filters.CharFilter(
+        field_name="groups__id", label=_('User group ID')
+    )
     exclude_group_id = filters.CharFilter(
-        field_name="groups__id", lookup_expr='exact', exclude=True
+        field_name="groups__id", exclude=True,
+        label=_('Exclude user group ID')
+    )
+    system_roles = filters.CharFilter(
+        method='filter_system_roles', label=_('System role name or ID')
+    )
+    org_roles = filters.CharFilter(
+        method='filter_org_roles', label=_('Org role name or ID')
+    )
+    is_expired = filters.BooleanFilter(
+        method='filter_is_expired', label=_('Is expired')
+    )
+    is_valid = filters.BooleanFilter(
+        method='filter_is_valid', label=_('Is valid')
+    )
+    is_password_expired = filters.BooleanFilter(
+        method='filter_is_password_expired', label=_('Password expired')
+    )
+    is_long_time_no_login = filters.BooleanFilter(
+        method='filter_long_time', label=_('Long time no login')
+    )
+    is_login_blocked = filters.BooleanFilter(
+        method='filter_is_blocked', label=_('Login blocked')
     )
 
     class Meta:
         model = User
         fields = (
-            'id', 'username', 'email', 'name',
-            'groups', 'group_id', 'exclude_group_id',
-            'source', 'org_roles', 'system_roles', 'is_active',
+            'id', 'name', 'username', 'email',
+            'system_roles', 'org_roles', 'groups', 'source',
+            'mfa_level',
+            'is_active', 'is_valid', 'is_expired', 'is_login_blocked',
+            'group_id', 'exclude_group_id',
+            'is_password_expired', 'is_long_time_no_login', 'is_first_login',
+            'ukey_sn',
         )
 
+    def filter_email(self, queryset, name, value):
+        q = Q(email_lookup=text_hmac_sha256(value))
+        return queryset.filter(q)
+
     @staticmethod
-    def get_role(value):
+    def filter_mfa_level(queryset, name, value):
+        queryset = queryset.filter(**{name: value})
+        if value != 0:
+            return queryset
+
+        force_level = settings.SECURITY_MFA_AUTH
+        if force_level in [True, 1]:
+            return queryset.none()
+        if force_level == 2:
+            admins = User.get_super_and_org_admins()
+            return queryset.exclude(id__in=admins)
+        return queryset
+
+    def filter_is_blocked(self, queryset, name, value):
+        from users.utils import LoginBlockUtil
+        usernames = LoginBlockUtil.get_blocked_usernames()
+        if value:
+            queryset = queryset.filter(username__in=usernames)
+        else:
+            queryset = queryset.exclude(username__in=usernames)
+        return queryset
+    
+    def filter_is_password_expired(self, queryset, name, value):
+        now = timezone.now()
+        key = 'date_password_last_updated'
+        if value:
+            operator = 'lt'
+        else:            
+            operator = 'gt'
+
+        admins = User.get_super_and_org_admins()
+        interval = settings.SECURITY_PASSWORD_EXPIRATION_TIME_ADMIN
+        admins_date_expired = now - timezone.timedelta(days=int(interval))
+        admins_q = Q(**{f'{key}__{operator}': admins_date_expired})
+        admins_ids = admins.filter(admins_q).values_list('id', flat=True)
+
+        users = User.get_org_users(exclude_admins=True)
+        interval = settings.SECURITY_PASSWORD_EXPIRATION_TIME
+        users_date_expired = now - timezone.timedelta(days=int(interval))
+        users_q = Q(**{f'{key}__{operator}': users_date_expired})
+        users_ids = users.filter(users_q).values_list('id', flat=True)
+
+        q = Q(id__in=admins_ids) | Q(id__in=users_ids) | Q(**{f'{key}__isnull': True})
+        return queryset.filter(q)
+
+    def filter_long_time(self, queryset, name, value):
+        if not value:
+            return queryset
+
+        no_login_days = self.request.GET.get('no_login_days', 30)
+        cutoff_time = timezone.now() - timezone.timedelta(days=int(no_login_days))
+
+        return queryset.filter(
+            Q(last_login__lt=cutoff_time) |
+            Q(last_login__isnull=True)
+        )
+
+    def filter_is_valid(self, queryset, name, value):
+        if value:
+            queryset = self.filter_is_expired(queryset, name, False).filter(is_active=True)
+        else:
+            q = Q(date_expired__lt=timezone.now()) | Q(is_active=False)
+            queryset = queryset.filter(q)
+        return queryset
+
+    @staticmethod
+    def filter_is_expired(queryset, name, value):
+        now = timezone.now()
+        if value:
+            queryset = queryset.filter(date_expired__lt=now)
+        else:
+            queryset = queryset.filter(date_expired__gte=now)
+        return queryset
+
+    @staticmethod
+    def _get_role(value):
         from rbac.builtin import BuiltinRole
         roles = BuiltinRole.get_roles()
         for role in roles.values():
-            if _(role.name) == value:
+            if gettext(role.name) == value:
                 return role
 
         if is_uuid(value):
@@ -37,22 +154,20 @@ class UserFilter(BaseFilterSet):
         else:
             return Role.objects.filter(name=value).first()
 
-    def filter_system_roles(self, queryset, name, value):
-        role = self.get_role(value)
+    def _filter_roles(self, queryset, value, scope):
+        role = self._get_role(value)
         if not role:
             return queryset.none()
-        queryset = queryset.prefetch_related('role_bindings') \
-            .filter(role_bindings__role_id=role.id) \
-            .filter(role_bindings__role__scope='system') \
-            .distinct()
+
+        rb_model = SystemRoleBinding if scope == Role.Scope.system.value else OrgRoleBinding
+        user_ids = rb_model.objects.filter(role_id=role.id).values_list('user_id', flat=True)
+        queryset = queryset.filter(id__in=user_ids).distinct()
+        return queryset
+
+    def filter_system_roles(self, queryset, name, value):
+        queryset = self._filter_roles(queryset=queryset, value=value, scope=Role.Scope.system.value)
         return queryset
 
     def filter_org_roles(self, queryset, name, value):
-        role = self.get_role(value)
-        if not role:
-            return queryset.none()
-        queryset = queryset.prefetch_related('role_bindings') \
-            .filter(role_bindings__role_id=role.id) \
-            .filter(role_bindings__role__scope='org') \
-            .distinct()
+        queryset = self._filter_roles(queryset=queryset, value=value, scope=Role.Scope.org.value)
         return queryset

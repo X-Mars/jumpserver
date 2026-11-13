@@ -1,229 +1,186 @@
 import os
 import time
-from collections import defaultdict
-from copy import deepcopy
 
 from django.conf import settings
-from django.utils import timezone
-from openpyxl import Workbook
+from django.utils.translation import gettext_lazy as _
 
-from accounts.const import AutomationTypes, SecretType, SSHKeyStrategy, SecretStrategy
+from accounts.const import (
+    AutomationTypes, SecretStrategy, ChangeSecretRecordStatusChoice
+)
 from accounts.models import ChangeSecretRecord
 from accounts.notifications import ChangeSecretExecutionTaskMsg
 from accounts.serializers import ChangeSecretRecordBackUpSerializer
-from assets.const import HostTypes
+from common.const import Status
 from common.utils import get_logger
 from common.utils.file import encrypt_and_compress_zip_file
-from common.utils.timezone import local_now_display
-from users.models import User
-from ..base.manager import AccountBasePlaybookManager
-from ...utils import SecretGenerator
+from common.utils.timezone import local_now_filename
+from ops.ansible.utils import escape_jinja2_syntax
+from ..base.manager import BaseChangeSecretPushManager
 
 logger = get_logger(__name__)
 
 
-class ChangeSecretManager(AccountBasePlaybookManager):
+class ChangeSecretManager(BaseChangeSecretPushManager):
     ansible_account_prefer = ''
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.method_hosts_mapper = defaultdict(list)
-        self.secret_type = self.execution.snapshot.get('secret_type')
-        self.secret_strategy = self.execution.snapshot.get(
-            'secret_strategy', SecretStrategy.custom
-        )
-        self.ssh_key_change_strategy = self.execution.snapshot.get(
-            'ssh_key_change_strategy', SSHKeyStrategy.add
-        )
-        self.account_ids = self.execution.snapshot['accounts']
-        self.name_recorder_mapper = {}  # 做个映射，方便后面处理
 
     @classmethod
     def method_type(cls):
         return AutomationTypes.change_secret
 
-    def get_ssh_params(self, account, secret, secret_type):
-        kwargs = {}
-        if secret_type != SecretType.SSH_KEY:
-            return kwargs
-        kwargs['strategy'] = self.ssh_key_change_strategy
-        kwargs['exclusive'] = 'yes' if kwargs['strategy'] == SSHKeyStrategy.set else 'no'
+    def gen_account_inventory(self, account, asset, h, path_dir):
+        record = self.get_or_create_record(asset, account, h['name'])
+        new_secret, private_key_path = self.handle_ssh_secret(account.secret_type, record.new_secret, path_dir)
+        h = self.gen_inventory(h, account, new_secret, private_key_path, asset, path_dir)
+        if (
+                asset.platform.type == 'oracle'
+                and h['jms_asset'].get(
+                    'oracle_change_secret_with_old_password', False
+                )
+        ):
+            if not record.old_secret:
+                raise ValueError(_(
+                    'The currently managed password is required when Oracle '
+                    'password changes use the REPLACE clause'
+                ))
+            h['account']['old_secret'] = escape_jinja2_syntax(
+                record.old_secret
+            )
+        return h, record
 
-        if kwargs['strategy'] == SSHKeyStrategy.set_jms:
-            kwargs['dest'] = '/home/{}/.ssh/authorized_keys'.format(account.username)
-            kwargs['regexp'] = '.*{}$'.format(secret.split()[2].strip())
-        return kwargs
+    def get_or_create_record(self, asset, account, name):
+        asset_account_id = f'{asset.id}-{account.id}'
 
-    def secret_generator(self, secret_type):
-        return SecretGenerator(
-            self.secret_strategy, secret_type,
-            self.execution.snapshot.get('password_rules')
-        )
-
-    def get_secret(self, secret_type):
-        if self.secret_strategy == SecretStrategy.custom:
-            return self.execution.snapshot['secret']
+        if asset_account_id in self.record_map:
+            record_id = self.record_map[asset_account_id]
+            record = ChangeSecretRecord.objects.filter(id=record_id).first()
+            if not record:
+                raise ValueError(_(
+                    'Change secret record not found: %(record_id)s'
+                ) % {'record_id': record_id})
+            record.status = ChangeSecretRecordStatusChoice.pending.value
+            record.error = ''
+            record.date_finished = None
+            record.save(update_fields=['status', 'error', 'date_finished'])
         else:
-            return self.secret_generator(secret_type).get_secret()
+            new_secret = self.get_secret(account)
+            record = self.create_record(asset, account, new_secret)
 
-    def get_accounts(self, privilege_account):
-        if not privilege_account:
-            print(f'not privilege account')
-            return []
+        self.name_record_mapper[name] = record
+        return record
 
-        asset = privilege_account.asset
-        accounts = asset.accounts.all()
-        accounts = accounts.filter(id__in=self.account_ids)
-        if self.secret_type:
-            accounts = accounts.filter(secret_type=self.secret_type)
-
-        if settings.CHANGE_AUTH_PLAN_SECURE_MODE_ENABLED:
-            accounts = accounts.filter(privileged=False).exclude(
-                username__in=['root', 'administrator', privilege_account.username]
-            )
-        return accounts
-
-    def host_callback(
-            self, host, asset=None, account=None,
-            automation=None, path_dir=None, **kwargs
-    ):
-        host = super().host_callback(
-            host, asset=asset, account=account, automation=automation,
-            path_dir=path_dir, **kwargs
+    def create_record(self, asset, account, new_secret):
+        # Persist both the old and candidate secret before touching the remote
+        # account. If the worker is killed after the remote change, the
+        # candidate remains recoverable and the record stays pending.
+        record = ChangeSecretRecord.objects.create(
+            asset=asset, account=account, execution=self.execution,
+            old_secret=account.secret, new_secret=new_secret,
+            account_version=account.version,
+            comment=f'{account.username}@{asset.address}'
         )
-        if host.get('error'):
-            return host
-
-        accounts = self.get_accounts(account)
-        if not accounts:
-            print('没有发现待改密账号: %s 用户ID: %s 类型: %s' % (
-                asset.name, self.account_ids, self.secret_type
-            ))
-            return []
-
-        method_attr = getattr(automation, self.method_type() + '_method')
-        method_hosts = self.method_hosts_mapper[method_attr]
-        method_hosts = [h for h in method_hosts if h != host['name']]
-        inventory_hosts = []
-        records = []
-
-        if asset.type == HostTypes.WINDOWS and self.secret_type == SecretType.SSH_KEY:
-            print(f'Windows {asset} does not support ssh key push')
-            return inventory_hosts
-
-        host['ssh_params'] = {}
-        for account in accounts:
-            h = deepcopy(host)
-            secret_type = account.secret_type
-            h['name'] += '(' + account.username + ')'
-            new_secret = self.get_secret(secret_type)
-
-            recorder = ChangeSecretRecord(
-                asset=asset, account=account, execution=self.execution,
-                old_secret=account.secret, new_secret=new_secret,
-            )
-            records.append(recorder)
-            self.name_recorder_mapper[h['name']] = recorder
-
-            private_key_path = None
-            if secret_type == SecretType.SSH_KEY:
-                private_key_path = self.generate_private_key_path(new_secret, path_dir)
-                new_secret = self.generate_public_key(new_secret)
-
-            h['ssh_params'].update(self.get_ssh_params(account, new_secret, secret_type))
-            h['account'] = {
-                'name': account.name,
-                'username': account.username,
-                'secret_type': secret_type,
-                'secret': new_secret,
-                'private_key_path': private_key_path
-            }
-            if asset.platform.type == 'oracle':
-                h['account']['mode'] = 'sysdba' if account.privileged else None
-            inventory_hosts.append(h)
-            method_hosts.append(h['name'])
-        self.method_hosts_mapper[method_attr] = method_hosts
-        ChangeSecretRecord.objects.bulk_create(records)
-        return inventory_hosts
-
-    def on_host_success(self, host, result):
-        recorder = self.name_recorder_mapper.get(host)
-        if not recorder:
-            return
-        recorder.status = 'success'
-        recorder.date_finished = timezone.now()
-        recorder.save()
-        account = recorder.account
-        if not account:
-            print("Account not found, deleted ?")
-            return
-        account.secret = recorder.new_secret
-        account.save(update_fields=['secret'])
-
-    def on_host_error(self, host, error, result):
-        recorder = self.name_recorder_mapper.get(host)
-        if not recorder:
-            return
-        recorder.status = 'failed'
-        recorder.date_finished = timezone.now()
-        recorder.error = error
-        recorder.save()
-
-    def on_runner_failed(self, runner, e):
-        logger.error("Change secret error: ", e)
+        return record
 
     def check_secret(self):
         if self.secret_strategy == SecretStrategy.custom \
-                and not self.execution.snapshot['secret']:
-            print('Custom secret is empty')
+                and not self.execution.snapshot.get('secret'):
+            print(_("Secret cannot be empty"))
             return False
         return True
 
-    def run(self, *args, **kwargs):
+    def get_runners(self):
         if not self.check_secret():
-            return
-        super().run(*args, **kwargs)
-        recorders = self.name_recorder_mapper.values()
-        recorders = list(recorders)
-        self.send_recorder_mail(recorders)
+            self.status = Status.failed
+            return []
+        return super().get_runners()
 
-    def send_recorder_mail(self, recorders):
+    @staticmethod
+    def get_summary(records):
+        succeed, failed, unverified = (
+            BaseChangeSecretPushManager.get_record_result_counts(records)
+        )
+        total = succeed + failed + unverified
+        summary = _(
+            'Successful: %(success)s, Needs verification: %(unverified)s, '
+            'Failed: %(failed)s, Total: %(total)s'
+        ) % {
+            'success': succeed,
+            'unverified': unverified,
+            'failed': failed,
+            'total': total,
+        }
+        return summary
+
+    def print_summary(self):
+        records = list(self.name_record_mapper.values())
+        success, failed, unverified = self.get_record_result_counts(records)
+        self.print_result_summary(
+            success,
+            failed,
+            unverified,
+            total=success + failed + unverified,
+            include_unverified=True,
+        )
+
+    def send_report_if_need(self, *args, **kwargs):
+        if self.secret_type and not self.check_secret():
+            return
+
+        records = list(self.name_record_mapper.values())
+        if self.record_map:
+            return
+
         recipients = self.execution.recipients
-        if not recorders or not recipients:
+        if not recipients:
             return
 
-        recipients = User.objects.filter(id__in=list(recipients.keys()))
+        if not records:
+            return
 
+        summary = self.get_summary(records)
+        self.send_record_mail(recipients, records, summary)
+
+    def send_record_mail(self, recipients, records, summary):
         name = self.execution.snapshot['name']
         path = os.path.join(os.path.dirname(settings.BASE_DIR), 'tmp')
-        filename = os.path.join(path, f'{name}-{local_now_display()}-{time.time()}.xlsx')
-        if not self.create_file(recorders, filename):
+        filename = os.path.join(path, f'{name}-{local_now_filename()}-{time.time()}.xlsx')
+        if not self.create_file(records, filename):
             return
 
         for user in recipients:
             attachments = []
             if user.secret_key:
-                password = user.secret_key.encode('utf8')
-                attachment = os.path.join(path, f'{name}-{local_now_display()}-{time.time()}.zip')
-                encrypt_and_compress_zip_file(attachment, password, [filename])
+                attachment = os.path.join(path, f'{name}-{local_now_filename()}-{time.time()}.zip')
+                encrypt_and_compress_zip_file(attachment, user.secret_key, [filename])
                 attachments = [attachment]
-            ChangeSecretExecutionTaskMsg(name, user).publish(attachments)
+            ChangeSecretExecutionTaskMsg(name, user, summary).publish(attachments)
         os.remove(filename)
 
     @staticmethod
-    def create_file(recorders, filename):
-        serializer_cls = ChangeSecretRecordBackUpSerializer
-        serializer = serializer_cls(recorders, many=True)
+    def create_file(records, filename):
+        from itertools import islice
+        from xlsxwriter import Workbook
 
-        header = [str(v.label) for v in serializer.child.fields.values()]
-        rows = [[str(i) for i in row.values()] for row in serializer.data]
-        if not rows:
+        serializer_cls = ChangeSecretRecordBackUpSerializer
+        records = iter(records)
+        batch = list(islice(records, 500))
+        if not batch:
             return False
 
-        rows.insert(0, header)
-        wb = Workbook(filename)
-        ws = wb.create_sheet('Sheet1')
-        for row in rows:
-            ws.append(row)
-        wb.save(filename)
+        with Workbook(filename, {'constant_memory': True}) as wb:
+            ws = wb.add_worksheet('Sheet1')
+            serializer = serializer_cls(batch, many=True)
+            header = [str(v.label) for v in serializer.child.fields.values()]
+            for col_index, value in enumerate(header):
+                ws.write_string(0, col_index, value)
+            row_index = 1
+            while batch:
+                serializer = serializer_cls(batch, many=True)
+                for row in serializer.data:
+                    for col_index, value in enumerate(row.values()):
+                        ws.write_string(row_index, col_index, str(value))
+                    row_index += 1
+                batch = list(islice(records, 500))
         return True
+
+    def get_report_template(self):
+        return "accounts/change_secret_report.html"

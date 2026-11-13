@@ -2,7 +2,7 @@ from django.db.models.signals import post_save, pre_delete, pre_save, post_delet
 from django.dispatch import receiver
 
 from accounts.models import Account
-from assets.models import Asset, Domain
+from assets.models import Asset, Zone
 from assets.models import Node
 from common.decorators import merge_delay_run
 from common.utils import get_logger
@@ -64,7 +64,7 @@ def on_user_delete_refresh_cache(sender, instance, **kwargs):
 
 model_cache_field_mapper = {
     Node: ['nodes_amount'],
-    Domain: ['domains_amount'],
+    Zone: ['zones_amount'],
     UserGroup: ['groups_amount'],
     Account: ['accounts_amount'],
     RoleBinding: ['users_amount', 'new_users_amount_this_week'],
@@ -75,7 +75,7 @@ model_cache_field_mapper = {
 
 class OrgResourceStatisticsRefreshUtil:
     @staticmethod
-    @merge_delay_run(ttl=5)
+    @merge_delay_run(ttl=30)
     def refresh_org_fields(org_fields=()):
         for org, cache_field_name in org_fields:
             OrgResourceStatisticsCache(org).expire(*cache_field_name)
@@ -87,7 +87,10 @@ class OrgResourceStatisticsRefreshUtil:
         if not cache_field_name:
             return
         org = getattr(instance, 'org', None)
-        cls.refresh_org_fields(((org, cache_field_name),))
+        if not org:
+            return
+        cache_field_name = tuple(cache_field_name)
+        cls.refresh_org_fields.delay(org_fields=((org, cache_field_name),))
 
 
 @receiver(post_save)
@@ -104,7 +107,7 @@ def on_post_delete_refresh_org_resource_statistics_cache(sender, instance, **kwa
 def _refresh_session_org_resource_statistics_cache(instance: Session):
     cache_field_name = [
         'total_count_online_users', 'total_count_online_sessions',
-        'total_count_today_active_assets','total_count_today_failed_sessions'
+        'total_count_today_active_assets', 'total_count_today_failed_sessions'
     ]
 
     org_cache = OrgResourceStatisticsCache(instance.org)

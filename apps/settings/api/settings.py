@@ -1,17 +1,28 @@
 # -*- coding: utf-8 -*-
-#
+
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 from django.conf import settings
+from django.core.cache import cache
+from django.db import transaction
 from django.http import HttpResponse
+from django.utils.decorators import method_decorator
+from django.utils.translation import gettext_lazy as _
 from django.views.static import serve
+from drf_spectacular.utils import extend_schema, OpenApiParameter
 from rest_framework import generics
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.utils import get_logger
 from jumpserver.conf import Config
+from rbac.models import RoleBinding
 from rbac.permissions import RBACPermission
+from users.models import User
 from .. import serializers
 from ..models import Setting
 from ..signals import category_setting_updated
@@ -20,6 +31,7 @@ from ..utils import get_interface_setting_or_default
 logger = get_logger(__file__)
 
 
+@method_decorator(transaction.non_atomic_requests, name='dispatch')
 class SettingsApi(generics.RetrieveUpdateAPIView):
     permission_classes = (RBACPermission,)
 
@@ -27,6 +39,7 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         'all': serializers.SettingsSerializer,
         'basic': serializers.BasicSettingSerializer,
         'terminal': serializers.TerminalSettingSerializer,
+        'luna': serializers.LunaSettingSerializer,
         'security': serializers.SecuritySettingSerializer,
         'security_auth': serializers.SecurityAuthSerializer,
         'security_basic': serializers.SecurityBasicSerializer,
@@ -34,11 +47,14 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         'security_password': serializers.SecurityPasswordRuleSerializer,
         'security_login_limit': serializers.SecurityLoginLimitSerializer,
         'ldap': serializers.LDAPSettingSerializer,
+        'ldap_ha': serializers.LDAPHASettingSerializer,
         'email': serializers.EmailSettingSerializer,
         'email_content': serializers.EmailContentSettingSerializer,
         'wecom': serializers.WeComSettingSerializer,
         'dingtalk': serializers.DingTalkSettingSerializer,
         'feishu': serializers.FeiShuSettingSerializer,
+        'lark': serializers.LarkSettingSerializer,
+        'slack': serializers.SlackSettingSerializer,
         'auth': serializers.AuthSettingSerializer,
         'oidc': serializers.OIDCSettingSerializer,
         'keycloak': serializers.KeycloakSettingSerializer,
@@ -47,6 +63,7 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         'saml2': serializers.SAML2SettingSerializer,
         'oauth2': serializers.OAuth2SettingSerializer,
         'passkey': serializers.PasskeySettingSerializer,
+        'ukey': serializers.UKeySettingSerializer,
         'clean': serializers.CleaningSerializer,
         'other': serializers.OtherSettingSerializer,
         'sms': serializers.SMSSettingSerializer,
@@ -56,53 +73,128 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         'cmpp2': serializers.CMPP2SMSSettingSerializer,
         'custom': serializers.CustomSMSSettingSerializer,
         'vault': serializers.VaultSettingSerializer,
+        'openbao': serializers.OpenBaoSerializer,
+        'ssh_ca': serializers.SSHCAOpenBaoSerializer,
+        'azure_kv': serializers.AzureKVSerializer,
+        'aws_sm': serializers.AmazonSMSerializer,
+        'hcp': serializers.HashicorpKVSerializer,
+        'chat': serializers.ChatAISettingSerializer,
         'announcement': serializers.AnnouncementSettingSerializer,
         'ticket': serializers.TicketSettingSerializer,
         'ops': serializers.OpsSettingSerializer,
+        'virtualapp': serializers.VirtualAppSerializer,
+        'tool': serializers.ToolSerializer,
+        'task_notice': serializers.TaskNoticeSettingSerializer,
     }
 
     rbac_category_permissions = {
-        'basic': 'settings.view_setting',
+        'basic': 'settings.change_basic',
+        'tool': 'settings.change_systemtools',
         'terminal': 'settings.change_terminal',
+        'luna': 'settings.change_terminal',
+        'ops': 'settings.change_ops',
+        'ticket': 'settings.change_ticket',
+        'virtualapp': 'settings.change_virtualapp',
+        'announcement': 'settings.change_announcement',
         'security': 'settings.change_security',
+        'security_basic': 'settings.change_security',
+        'security_auth': 'settings.change_security',
+        'security_session': 'settings.change_security',
+        'security_password': 'settings.change_security',
+        'security_login_limit': 'settings.change_security',
+        'task_notice': 'settings.change_security',
         'ldap': 'settings.change_auth',
-        'email': 'settings.change_email',
-        'email_content': 'settings.change_email',
+        'ldap_ha': 'settings.change_auth',
+        'cas': 'settings.change_auth',
+        'oidc': 'settings.change_auth',
+        'saml2': 'settings.change_auth',
+        'oauth2': 'settings.change_auth',
         'wecom': 'settings.change_auth',
         'dingtalk': 'settings.change_auth',
         'feishu': 'settings.change_auth',
+        'lark': 'settings.change_auth',
+        'slack': 'settings.change_auth',
         'auth': 'settings.change_auth',
-        'oidc': 'settings.change_auth',
+        'passkey': 'settings.change_auth',
         'keycloak': 'settings.change_auth',
         'radius': 'settings.change_auth',
-        'cas': 'settings.change_auth',
         'sso': 'settings.change_auth',
-        'saml2': 'settings.change_auth',
-        'oauth2': 'settings.change_auth',
+        'ukey': 'settings.change_auth',
         'clean': 'settings.change_clean',
         'other': 'settings.change_other',
+        'chat': 'settings.change_chatai',
+        'email': 'settings.change_email',
+        'email_content': 'settings.change_email',
         'sms': 'settings.change_sms',
         'alibaba': 'settings.change_sms',
         'tencent': 'settings.change_sms',
+        'huawei': 'settings.change_sms',
+        'cmpp2': 'settings.change_sms',
         'vault': 'settings.change_vault',
+        'openbao': 'settings.change_vault',
+        'ssh_ca': 'settings.change_vault',
+        'azure_kv': 'settings.change_vault',
+        'aws_sm': 'settings.change_vault',
+        'hcp': 'settings.change_vault',
     }
 
     def get_queryset(self):
         return Setting.objects.all()
 
-    def check_permissions(self, request):
-        category = request.query_params.get('category', 'basic')
-        perm_required = self.rbac_category_permissions.get(category)
-        has = self.request.user.has_perm(perm_required)
+    def get_category(self):
+        category = self.request.query_params.get('category', 'basic')
+        if category not in self.serializer_class_mapper:
+            raise ValidationError({
+                'category': [_('Invalid settings category.')],
+                'valid_categories': list(self.serializer_class_mapper),
+            })
+        return category
 
+    def check_permissions(self, request):
+        category = self.get_category()
+        perm_required = self.rbac_category_permissions.get(category)
+
+        if perm_required == 'settings.view_setting' and \
+                RoleBinding.is_org_admin(request.user):
+            return True
+
+        has = request.user.has_perm(perm_required)
         if not has:
             self.permission_denied(request)
 
     def get_serializer_class(self):
-        category = self.request.query_params.get('category', 'basic')
-        default = serializers.BasicSettingSerializer
-        cls = self.serializer_class_mapper.get(category, default)
-        return cls
+        return self.serializer_class_mapper[self.get_category()]
+
+    category_parameters = [
+        OpenApiParameter(
+            'category', str, OpenApiParameter.QUERY,
+            enum=list(serializer_class_mapper), default='basic',
+            description='Settings group. Omitted values default to basic; unknown values return 400.',
+        ),
+        OpenApiParameter(
+            'X-Settings-Category', str, OpenApiParameter.HEADER,
+            enum=list(serializer_class_mapper), response=True,
+            description='The settings group used for this request.',
+        ),
+    ]
+
+    @extend_schema(parameters=category_parameters)
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    @extend_schema(parameters=category_parameters)
+    def put(self, request, *args, **kwargs):
+        return super().put(request, *args, **kwargs)
+
+    @extend_schema(parameters=category_parameters)
+    def patch(self, request, *args, **kwargs):
+        return super().patch(request, *args, **kwargs)
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if 200 <= response.status_code < 300:
+            response['X-Settings-Category'] = self.get_category()
+        return response
 
     def get_fields(self):
         serializer = self.get_serializer_class()()
@@ -110,20 +202,30 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         return fields
 
     def get_object(self):
-        items = self.get_fields().keys()
+        fields = self.get_fields()
         obj = {}
-        for item in items:
+        for item, field in fields.items():
+            if field.source == '*':
+                continue
             if hasattr(settings, item):
                 obj[item] = getattr(settings, item)
             else:
                 obj[item] = Config.defaults[item]
+        if 'SESSION_RENEW_ON_REQUEST' in fields:
+            from common.sessions import web_login_policy
+            policy = web_login_policy()
+            obj.update({
+                'SESSION_COOKIE_AGE': policy['duration'],
+                'SESSION_RENEW_ON_REQUEST': policy['renew'],
+                'SESSION_EXPIRE_AT_BROWSER_CLOSE': policy['browser_close'],
+            })
         return obj
 
     def parse_serializer_data(self, serializer):
         data = []
         fields = self.get_fields()
         encrypted_items = [name for name, field in fields.items() if field.write_only]
-        category = self.request.query_params.get('category', '')
+        category = self.get_category()
         for name, value in serializer.validated_data.items():
             encrypted = name in encrypted_items
             if encrypted and value in ['', None]:
@@ -135,10 +237,34 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         return data
 
     def send_signal(self, serializer):
-        category = self.request.query_params.get('category', '')
+        category = self.get_category()
         category_setting_updated.send(sender=self.__class__, category=category, serializer=serializer)
 
     def perform_update(self, serializer):
+        self.validate_ssh_ca_fallback_destination(serializer)
+        self.prepare_openbao_mount_change(serializer)
+        self.prepare_ssh_ca_config(serializer)
+        from authentication.services.client_login_session import (
+            client_login_policy, client_policy_lock, update_client_session_lifetimes,
+        )
+
+        policy_fields = {
+            'SECURITY_CLIENT_REAUTH_ON_EXIT', 'SECURITY_CLIENT_IDLE_LOCK_TIME',
+            'SECURITY_CLIENT_MAX_SESSION_TIME',
+        }
+        updating_policy = bool(policy_fields.intersection(self.request.data))
+        # Serialize policy writes with client authorization and refresh.
+        # Read the database here: another worker's settings pub/sub may lag behind.
+        with client_policy_lock() if (updating_policy or 'SECURITY_WEB_IDLE_LOCK_TIME' in self.request.data) else nullcontext():
+            with transaction.atomic():
+                old_policy = client_login_policy(use_cache=False) if updating_policy else None
+                self.save_settings(serializer)
+                if updating_policy:
+                    policy = client_login_policy(use_cache=False)
+                    if old_policy['max_session_time'] != policy['max_session_time']:
+                        update_client_session_lifetimes(policy)
+
+    def save_settings(self, serializer):
         post_data_names = list(self.request.data.keys())
         settings_items = self.parse_serializer_data(serializer)
         serializer_data = getattr(serializer, 'data', {})
@@ -149,12 +275,112 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
             changed, setting = Setting.update_or_create(**item)
             if not changed:
                 continue
+            from authentication.services.idle_lock import clamp_idle_lock_preferences
+            if setting.name in ('SECURITY_WEB_IDLE_LOCK_TIME', 'SECURITY_CLIENT_IDLE_LOCK_TIME', 'SECURITY_CLIENT_MAX_SESSION_TIME'):
+                clamp_idle_lock_preferences(setting.name, setting.cleaned_value)
             serializer_data[setting.name] = setting.cleaned_value
 
         setattr(serializer, '_data', serializer_data)
         if hasattr(serializer, 'post_save'):
             serializer.post_save()
         self.send_signal(serializer)
+        if self.request.query_params.get('category') == User.Source.ldap.value:
+            self.clean_ldap_user_dn_cache()
+
+    def validate_ssh_ca_fallback_destination(self, serializer):
+        if self.get_category() != 'openbao':
+            return
+        if settings.SSH_CA_OPENBAO_ADDR or not settings.SSH_CA_OPENBAO_TOKEN:
+            return
+
+        address_field = 'VAULT_OPENBAO_ADDR'
+        new_address = serializer.validated_data.get(address_field, settings.VAULT_OPENBAO_ADDR)
+        if (new_address or '') == (settings.VAULT_OPENBAO_ADDR or ''):
+            return
+
+        # Protect retained SSH CA tokens even while SSH CA is disabled.
+        raise ValidationError({
+            address_field: _(
+                'Set an explicit OpenBao address in the SSH CA settings before changing '
+                'the Vault address. The stored SSH CA token still uses this address.'
+            )
+        })
+
+    def prepare_ssh_ca_config(self, serializer):
+        if self.request.query_params.get('category') != 'ssh_ca':
+            return
+
+        data = {**self.get_object(), **serializer.validated_data}
+        if not data.get('SSH_CA_ENABLED'):
+            return
+        if not data.get('SSH_CA_OPENBAO_TOKEN'):
+            data['SSH_CA_OPENBAO_TOKEN'] = settings.SSH_CA_OPENBAO_TOKEN
+        if not data.get('SSH_CA_OPENBAO_CACERT_CONTENT'):
+            data['SSH_CA_OPENBAO_CACERT_CONTENT'] = settings.SSH_CA_OPENBAO_CACERT_CONTENT
+        data['SSH_CA_OPENBAO_CACERT_FILE'] = settings.SSH_CA_OPENBAO_CACERT_FILE
+
+        from authentication.services import get_ssh_ca_client
+
+        client = get_ssh_ca_client(SimpleNamespace(**data))
+        ok, error = client.is_active(ttl=data['SSH_CA_OPENBAO_TTL'])
+        if not ok:
+            raise ValidationError({'SSH_CA_OPENBAO_MOUNT_POINT': error})
+
+    def prepare_openbao_mount_change(self, serializer):
+        if self.request.query_params.get('category') != 'openbao':
+            return
+
+        new_mount_point = serializer.validated_data.get('VAULT_OPENBAO_MOUNT_POINT')
+        old_mount_point = settings.VAULT_OPENBAO_MOUNT_POINT
+        if not new_mount_point or new_mount_point.strip('/') == old_mount_point.strip('/'):
+            return
+
+        from accounts.backends.openbao.service import OpenBaoKVClient
+
+        data = serializer.validated_data
+
+        def target_value(name):
+            value = data.get(name)
+            if value in ('', None):
+                return getattr(settings, name, None)
+            return value
+
+        source = OpenBaoKVClient(
+            addr=settings.VAULT_OPENBAO_ADDR,
+            token=settings.VAULT_OPENBAO_TOKEN,
+            mount_point=old_mount_point,
+            timeout=settings.VAULT_OPENBAO_TIMEOUT,
+            verify_tls=settings.VAULT_OPENBAO_VERIFY_TLS,
+            ca_cert=settings.VAULT_OPENBAO_CACERT_CONTENT,
+            ca_cert_file=settings.VAULT_OPENBAO_CACERT_FILE,
+        )
+        target = OpenBaoKVClient(
+            addr=target_value('VAULT_OPENBAO_ADDR'),
+            token=target_value('VAULT_OPENBAO_TOKEN'),
+            mount_point=new_mount_point,
+            timeout=target_value('VAULT_OPENBAO_TIMEOUT'),
+            verify_tls=target_value('VAULT_OPENBAO_VERIFY_TLS'),
+            ca_cert=target_value('VAULT_OPENBAO_CACERT_CONTENT'),
+            ca_cert_file=settings.VAULT_OPENBAO_CACERT_FILE,
+        )
+
+        ok, error = target.is_active()
+        if not ok:
+            raise ValidationError({'VAULT_OPENBAO_MOUNT_POINT': error})
+
+        if settings.VAULT_ENABLED and settings.VAULT_BACKEND == 'openbao':
+            try:
+                target.copy_current_secrets_from(source)
+            except Exception as e:
+                logger.exception('Migrate OpenBao mount point failed: %s', e)
+                raise ValidationError({
+                    'VAULT_OPENBAO_MOUNT_POINT': f'Migrate OpenBao data failed: {e}'
+                }) from e
+
+    @staticmethod
+    def clean_ldap_user_dn_cache():
+        del_count = cache.delete_pattern('django_auth_ldap.user_dn.*')
+        logger.debug(f'clear LDAP user_dn_cache count={del_count}')
 
 
 class SettingsLogoApi(APIView):
@@ -177,3 +403,26 @@ class SettingsLogoApi(APIView):
         else:
             return HttpResponse(status=status.HTTP_404_NOT_FOUND)
         return serve(request, logo_path, document_root=document_root)
+
+
+class ClientCompatibilityView(APIView):
+    # This endpoint is used before login; stale cookies/tokens must not require authentication.
+    authentication_classes = ()
+    permission_classes = (AllowAny,)
+    throttle_classes = ()
+
+    def get(self, request, *args, **kwargs):
+        response = Response({
+            'schema_version': 1,
+            'core_version': settings.VERSION,
+            'min_client_version': settings.MIN_CLIENT_VERSION,
+        })
+        response['Cache-Control'] = 'no-store'
+        return response
+
+
+class ClientVersionView(APIView):
+    permission_classes = (AllowAny,)
+
+    def get(self, request, *args, **kwargs):
+        return Response(['4.0.0', '4.1.0', '4.1.1', '4.1.2', '5.0.0', '5.1.0'], status=status.HTTP_200_OK)

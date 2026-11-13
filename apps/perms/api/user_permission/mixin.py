@@ -4,8 +4,8 @@ from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from rest_framework.request import Request
 
-from common.exceptions import JMSObjectDoesNotExist
 from common.utils import is_uuid
+from common.exceptions import JMSObjectDoesNotExist
 from rbac.permissions import RBACPermission
 from users.models import User
 

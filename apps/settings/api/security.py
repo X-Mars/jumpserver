@@ -2,11 +2,19 @@ from uuid import uuid4
 
 from django.conf import settings
 from django.core.cache import cache
+from drf_spectacular.utils import extend_schema
 from rest_framework.generics import ListAPIView, CreateAPIView
 from rest_framework.views import Response
+from rest_framework_bulk.generics import BulkModelViewSet
 
+from common.api.action import RenderToJsonMixin
+from common.drf.filters import IDSpmFilterBackend
 from users.utils import LoginIpBlockUtil
-from ..serializers import SecurityBlockIPSerializer
+from ..models import LeakPasswords
+from ..serializers import (
+    SecurityBlockIPSerializer, SecurityUnlockIPSerializer,
+    SecurityUnlockIPResultSerializer, LeakPasswordPSerializer,
+)
 
 
 class BlockIPSecurityAPI(ListAPIView):
@@ -37,22 +45,59 @@ class BlockIPSecurityAPI(ListAPIView):
 
     def list(self, request, *args, **kwargs):
         ips = self.get_ips()
-        offset, limit = self.get_page_offset_and_limit()
-        slice_ips = ips[offset:offset + limit]
-        data = [{'id': str(uuid4()), 'ip': ip} for ip in slice_ips]
+        # offset, limit = self.get_page_offset_and_limit()
+        # slice_ips = ips[offset:offset + limit]
+        data = [{'id': str(uuid4()), 'ip': ip} for ip in ips]
         ser = self.get_serializer(data, many=True)
         data = {'count': len(ips), 'results': ser.data}
         return Response(data=data, status=200)
 
 
 class UnlockIPSecurityAPI(CreateAPIView):
-    serializer_class = SecurityBlockIPSerializer
+    serializer_class = SecurityUnlockIPSerializer
     rbac_perms = {
         'POST': 'settings.change_security',
     }
 
+    @extend_schema(
+        description='Unlock a single ip or a non-empty ips list. Supply exactly one of these fields.',
+        responses={200: SecurityUnlockIPResultSerializer},
+    )
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
     def create(self, request, *args, **kwargs):
-        ips = request.data.get('ips')
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        ips = data['ips'] if 'ips' in data else [data['ip']]
         for ip in ips:
             LoginIpBlockUtil(ip).clean_block_if_need()
-        return Response(status=200)
+        return Response({'ips': ips}, status=200)
+
+
+class LeakPasswordViewSet(BulkModelViewSet, RenderToJsonMixin):
+    serializer_class = LeakPasswordPSerializer
+    model = LeakPasswords
+    rbac_perms = {
+        '*': 'settings.change_security'
+    }
+    queryset = LeakPasswords.objects.none()
+    search_fields = ['password']
+
+    def get_object(self):
+        pk = self.kwargs.get('pk')
+        if pk:
+            return self.get_queryset().get(id=pk)
+        return super().get_object()
+
+    def get_queryset(self):
+        return LeakPasswords.objects.using('sqlite').all()
+
+    def allow_bulk_destroy(self, qs, filtered):
+        return True
+
+    def filter_queryset(self, queryset):
+        queryset = super().filter_queryset(queryset)
+        queryset = IDSpmFilterBackend().filter_queryset(self.request, queryset, self)
+        return queryset

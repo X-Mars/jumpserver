@@ -2,38 +2,75 @@ import base64
 import json
 import os
 import urllib.parse
+from collections.abc import Mapping
+from datetime import timedelta
+from struct import pack
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.serialization import pkcs7
 from django.conf import settings
+from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext, gettext_lazy as _
 from rest_framework import status, serializers
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.settings import api_settings
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from accounts.const import AliasAccount
+from accounts.const import AliasAccount, SecretType
+from accounts.personal_credentials import (
+    get_personal_credential_for_use,
+    get_personal_credential_failure_reason,
+    get_personal_credential_permission_context,
+    record_personal_credential_audit,
+    save_personal_credential,
+    validate_personal_credential_secret_type,
+    validate_personal_credential_ssh_key,
+)
+from accounts.utils import validate_account_username
+from acls.models import ConnectMethodACL
+from acls.notifications import AssetLoginReminderMsg
+from assets.const import Protocol
+from assets.models import Asset
 from common.api import JMSModelViewSet
 from common.exceptions import JMSException
-from common.utils import random_string, get_logger, get_request_ip
+from common.utils import (
+    random_string, get_logger, get_request_ip_or_data, is_uuid,
+)
 from common.utils.django import get_request_os
-from common.utils.http import is_true, is_false
+from common.utils.http import is_true
 from orgs.mixins.api import RootOrgViewMixin
+from orgs.models import Organization
+from orgs.utils import get_org_from_request, tmp_to_org, tmp_to_root_org
 from perms.models import ActionChoices
-from terminal.connect_methods import NativeClient, ConnectMethodUtil
+from terminal.connect_methods import NativeClient, ConnectMethodUtil, WebMethod
 from terminal.models import EndpointRule, Endpoint
-from users.const import FileNameConflictResolution
+from users.const import RDPKeyboardHook
 from users.models import Preference
-from ..models import ConnectionToken, date_expired_default
+from .face import FaceMonitorContext
+from ..const import ConnectionTokenType
+from ..mixins import AuthFaceMixin
+from ..models import ConnectionToken, AdminConnectionToken, date_expired_default
+from ..services.connection_token import (
+    get_connection_token_secret, record_connection_token_credential_audit,
+)
+from ..utils import (
+    build_absolute_uri, get_effective_connect_options,
+    should_use_oracle_sysdba,
+)
 from ..serializers import (
     ConnectionTokenSerializer, ConnectionTokenSecretSerializer,
     SuperConnectionTokenSerializer, ConnectTokenAppletOptionSerializer,
-    ConnectionTokenReusableSerializer,
+    ConnectionTokenReusableSerializer, ConnectTokenVirtualAppOptionSerializer,
+    AdminConnectionTokenSerializer,
 )
 
-__all__ = ['ConnectionTokenViewSet', 'SuperConnectionTokenViewSet']
+__all__ = ['ConnectionTokenViewSet', 'SuperConnectionTokenViewSet', 'AdminConnectionTokenViewSet']
 logger = get_logger(__name__)
 
 
@@ -41,12 +78,159 @@ class RDPFileClientProtocolURLMixin:
     request: Request
     get_serializer: callable
 
+    RDP_SIGN_SECURE_SETTINGS = [
+        ('full address:s:', 'Full Address'),
+        ('alternate full address:s:', 'Alternate Full Address'),
+        ('pcb:s:', 'PCB'),
+        ('use redirection server name:i:', 'Use Redirection Server Name'),
+        ('server port:i:', 'Server Port'),
+        ('negotiate security layer:i:', 'Negotiate Security Layer'),
+        ('enablecredsspsupport:i:', 'EnableCredSspSupport'),
+        ('disableconnectionsharing:i:', 'DisableConnectionSharing'),
+        ('autoreconnection enabled:i:', 'AutoReconnection Enabled'),
+        ('gatewayhostname:s:', 'GatewayHostname'),
+        ('gatewayusagemethod:i:', 'GatewayUsageMethod'),
+        ('gatewayprofileusagemethod:i:', 'GatewayProfileUsageMethod'),
+        ('gatewaycredentialssource:i:', 'GatewayCredentialsSource'),
+        ('support url:s:', 'Support URL'),
+        ('promptcredentialonce:i:', 'PromptCredentialOnce'),
+        ('require pre-authentication:i:', 'Require pre-authentication'),
+        ('pre-authentication server address:s:', 'Pre-authentication server address'),
+        ('alternate shell:s:', 'Alternate Shell'),
+        ('shell working directory:s:', 'Shell Working Directory'),
+        ('remoteapplicationprogram:s:', 'RemoteApplicationProgram'),
+        ('remoteapplicationexpandworkingdir:s:', 'RemoteApplicationExpandWorkingdir'),
+        ('remoteapplicationmode:i:', 'RemoteApplicationMode'),
+        ('remoteapplicationguid:s:', 'RemoteApplicationGuid'),
+        ('remoteapplicationname:s:', 'RemoteApplicationName'),
+        ('remoteapplicationicon:s:', 'RemoteApplicationIcon'),
+        ('remoteapplicationfile:s:', 'RemoteApplicationFile'),
+        ('remoteapplicationfileextensions:s:', 'RemoteApplicationFileExtensions'),
+        ('remoteapplicationcmdline:s:', 'RemoteApplicationCmdLine'),
+        ('remoteapplicationexpandcmdline:s:', 'RemoteApplicationExpandCmdLine'),
+        ('prompt for credentials:i:', 'Prompt For Credentials'),
+        ('authentication level:i:', 'Authentication Level'),
+        ('audiomode:i:', 'AudioMode'),
+        ('redirectdrives:i:', 'RedirectDrives'),
+        ('redirectprinters:i:', 'RedirectPrinters'),
+        ('redirectcomports:i:', 'RedirectCOMPorts'),
+        ('redirectsmartcards:i:', 'RedirectSmartCards'),
+        ('redirectposdevices:i:', 'RedirectPOSDevices'),
+        ('redirectclipboard:i:', 'RedirectClipboard'),
+        ('devicestoredirect:s:', 'DevicesToRedirect'),
+        ('drivestoredirect:s:', 'DrivesToRedirect'),
+        ('loadbalanceinfo:s:', 'LoadBalanceInfo'),
+        ('redirectdirectx:i:', 'RedirectDirectX'),
+        ('rdgiskdcproxy:i:', 'RDGIsKDCProxy'),
+        ('kdcproxyname:s:', 'KDCProxyName'),
+        ('eventloguploadaddress:s:', 'EventLogUploadAddress'),
+        ('redirectwebauthn:i:', 'RedirectWebAuthn'),
+    ]
+
+    @classmethod
+    def _collect_rdp_sign_lines(cls, settings_lines):
+        signnames = []
+        signlines = []
+        for prefix, sign_name in cls.RDP_SIGN_SECURE_SETTINGS:
+            for line in settings_lines:
+                if line.startswith(prefix):
+                    signnames.append(sign_name)
+                    signlines.append(line)
+        return signnames, signlines
+
+    @classmethod
+    def _try_sign_rdp_content(cls, content):
+        if not settings.RDP_SIGN_ENABLED:
+            return content
+        cert_dir = os.path.join(settings.PROJECT_DIR, 'data', 'certs')
+        if not os.path.exists(cert_dir):
+            logger.error(f'rdp sign cert dir [{cert_dir}] not exists')
+            return content
+        
+        certfile = os.path.join(cert_dir, settings.RDP_SIGN_CERT)
+        if not os.path.exists(certfile):
+            logger.error(f'rdp sign cert file [{certfile}] not exists')
+            return content
+        
+        keyfile = os.path.join(cert_dir, settings.RDP_SIGN_CERT_KEY)
+        if not os.path.exists(keyfile):
+            logger.warning(f'rdp sign cert file [{keyfile}] not exists')
+            keyfile = None
+            return content
+
+        settings_lines = []
+        full_address = None
+        alternate_full_address = None
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('signature:s:') or line.startswith('signscope:s:'):
+                continue
+            if line.startswith('full address:s:'):
+                full_address = line[15:]
+            elif line.startswith('alternate full address:s:'):
+                alternate_full_address = line[25:]
+            settings_lines.append(line)
+
+        # Keep alternate full address aligned with full address to prevent tampering.
+        if full_address and not alternate_full_address:
+            settings_lines.append(f'alternate full address:s:{full_address}')
+
+        signnames, signlines = cls._collect_rdp_sign_lines(settings_lines)
+        if not signnames or not signlines:
+            return content
+
+        msgtext = '\r\n'.join(signlines) + '\r\n' + 'signscope:s:' + ','.join(signnames) + '\r\n' + '\x00'
+        msgblob = msgtext.encode('UTF-16LE')
+
+        try:
+            with open(certfile, 'rb') as f:
+                cert_pem = f.read()
+            cert = x509.load_pem_x509_certificate(cert_pem)
+            if keyfile:
+                with open(keyfile, 'rb') as f:
+                    key_pem = f.read()
+            else:
+                key_pem = cert_pem
+            private_key = serialization.load_pem_private_key(key_pem, password=None)
+            pkcs7_der = (
+                pkcs7.PKCS7SignatureBuilder()
+                .set_data(msgblob)
+                .add_signer(cert, private_key, hashes.SHA256())
+                .sign(
+                    serialization.Encoding.DER,
+                    [
+                        pkcs7.PKCS7Options.Binary,
+                        pkcs7.PKCS7Options.DetachedSignature,
+                        pkcs7.PKCS7Options.NoAttributes,
+                    ],
+                )
+            )
+        except OSError as e:
+            logger.warning('RDP file sign failed to read cert/key: %s', e)
+            return content
+        except ValueError as e:
+            logger.warning('RDP file sign failed (invalid cert/key PEM): %s', e)
+            return content
+        except Exception as e:
+            logger.warning('RDP file sign failed: %s', e)
+            return content
+
+        msgsig = pack('<I', 0x00010001)
+        msgsig += pack('<I', 0x00000001)
+        msgsig += pack('<I', len(pkcs7_der))
+        msgsig += pkcs7_der
+        sigval = base64.b64encode(msgsig).decode('ascii')
+
+        signed_lines = settings_lines + [f'signscope:s:{",".join(signnames)}', f'signature:s:{sigval}']
+        return '\n'.join(signed_lines) + '\n'
+
     def get_rdp_file_info(self, token: ConnectionToken):
         rdp_options = {
             'full address:s': '',
             'username:s': '',
             'use multimon:i': '0',
-            'session bpp:i': '32',
             'audiomode:i': '0',
             'disable wallpaper:i': '0',
             'disable full window drag:i': '0',
@@ -64,26 +248,102 @@ class RDPFileClientProtocolURLMixin:
             'autoreconnection enabled:i': '1',
             'bookmarktype:i': '3',
             'use redirection server name:i': '0',
-            'smart sizing:i': '1',
+            'bitmapcachepersistenable:i': '0',
+            'bitmapcachesize:i': '1500',
         }
+
+        # copy from
+        # https://learn.microsoft.com/zh-cn/windows-server/administration/performance-tuning/role/remote-desktop/session-hosts
+        rdp_low_speed_broadband_option = {
+            "connection type:i": 2,
+            "disable wallpaper:i": 1,
+            "disable full window drag:i": 1,
+            "disable menu anims:i": 1,
+            "allow font smoothing:i": 0,
+            "allow desktop composition:i": 0,
+            "disable themes:i": 0
+        }
+
+        rdp_high_speed_broadband_option = {
+            "connection type:i": 4,
+            "disable wallpaper:i": 0,
+            "disable full window drag:i": 1,
+            "disable menu anims:i": 0,
+            "allow font smoothing:i": 0,
+            "allow desktop composition:i": 1,
+            "disable themes:i": 0
+        }
+
+        RDP_CONNECTION_SPEED_OPTION_MAP = {
+            "auto": {},
+            "low_speed_broadband": rdp_low_speed_broadband_option,
+            "high_speed_broadband": rdp_high_speed_broadband_option,
+        }
+
+        client_options = token.user.preference.get_value(
+            'rdp_client_option', category='luna',
+            default=settings.LUNA_DEFAULT_RDP_CLIENT_OPTION
+        )
+        if isinstance(client_options, str):
+            try:
+                client_options = json.loads(client_options)
+            except json.JSONDecodeError:
+                client_options = settings.LUNA_DEFAULT_RDP_CLIENT_OPTION
+        if not isinstance(client_options, (list, set, tuple)):
+            client_options = settings.LUNA_DEFAULT_RDP_CLIENT_OPTION
+        client_options = set(client_options)
+
         # 设置多屏显示
-        multi_mon = is_true(self.request.query_params.get('multi_mon'))
+        multi_mon_value = self.request.query_params.get('multi_mon')
+        multi_mon = 'multi_screen' in client_options if multi_mon_value is None else is_true(multi_mon_value)
         if multi_mon:
             rdp_options['use multimon:i'] = '1'
 
-        # 设置多屏显示
-        multi_mon = is_true(self.request.query_params.get('multi_mon'))
-        if multi_mon:
-            rdp_options['use multimon:i'] = '1'
+        # 设置打印机重定向
+        printers_redirect_value = self.request.query_params.get('printers_redirect')
+        if printers_redirect_value is None:
+            printers_redirect_value = token.connect_options.get('printers_redirect')
+        if printers_redirect_value is None:
+            printers_redirect_value = token.user.preference.get_value(
+                'printers_redirect', category='luna', default=False
+            )
+        # Boolean preferences are stored as "True"/"False" in a TextField.
+        if isinstance(printers_redirect_value, str):
+            printers_redirect_value = printers_redirect_value.lower()
+        if is_true(printers_redirect_value):
+            rdp_options['redirectprinters:i'] = '1'
+
+        # Windows key combinations: this preference applies to desktop sessions.
+        if token.connect_method == NativeClient.mstsc:
+            keyboard_hook_value = self.request.query_params.get('rdp_keyboard_hook')
+            keyboard_hook = keyboard_hook_value
+            if keyboard_hook is None:
+                keyboard_hook = token.user.preference.get_value(
+                    'rdp_keyboard_hook', category='luna', default=RDPKeyboardHook.FULL_SCREEN
+                )
+            field = serializers.ChoiceField(choices=RDPKeyboardHook.choices)
+            try:
+                keyboard_hook = field.run_validation(keyboard_hook)
+            except ValidationError as exc:
+                if keyboard_hook_value is not None:
+                    raise ValidationError({'rdp_keyboard_hook': exc.detail})
+                # A stale or invalid stored preference must not prevent connecting.
+                keyboard_hook = RDPKeyboardHook.FULL_SCREEN
+            rdp_options['keyboardhook:i'] = keyboard_hook
 
         # 设置磁盘挂载
-        drives_redirect = is_true(self.request.query_params.get('drives_redirect'))
+        drives_redirect_value = self.request.query_params.get('drives_redirect')
+        drives_redirect = (
+            'drives_redirect' in client_options
+            if drives_redirect_value is None else is_true(drives_redirect_value)
+        )
         if drives_redirect:
             if ActionChoices.contains(token.actions, ActionChoices.transfer()):
                 rdp_options['drivestoredirect:s'] = '*'
 
         # 设置全屏
-        full_screen = is_true(self.request.query_params.get('full_screen'))
+        full_screen_value = self.request.query_params.get('full_screen')
+        full_screen = 'full_screen' in client_options if full_screen_value is None else is_true(full_screen_value)
         rdp_options['screen mode id:i'] = '2' if full_screen else '1'
 
         # 设置 RDP Server 地址
@@ -95,17 +355,51 @@ class RDPFileClientProtocolURLMixin:
         # rdp_options['domain:s'] = token.account_ad_domain
 
         # 设置宽高
-        height = self.request.query_params.get('height')
-        width = self.request.query_params.get('width')
-        if width and height:
-            rdp_options['desktopwidth:i'] = width
-            rdp_options['desktopheight:i'] = height
-            rdp_options['winposstr:s'] = f'0,1,0,0,{width},{height}'
-            rdp_options['dynamic resolution:i'] = '0'
+
+        resolution_value = token.connect_options.get('resolution')
+        if not resolution_value:
+            resolution_value = token.user.preference.get_value(
+                'rdp_resolution', category='luna',
+                default=settings.LUNA_DEFAULT_RDP_RESOLUTION
+            )
+        if resolution_value != 'auto':
+            width, height = resolution_value.split('x')
+            if width and height:
+                rdp_options['desktopwidth:i'] = width
+                rdp_options['desktopheight:i'] = height
+                rdp_options['winposstr:s'] = f'0,1,0,0,{width},{height}'
+                rdp_options['dynamic resolution:i'] = '0'
+
+        color_quality = self.request.query_params.get('rdp_color_quality')
+        if not color_quality:
+            color_quality = token.user.preference.get_value(
+                'rdp_color_quality', category='luna',
+                default=os.getenv('JUMPSERVER_COLOR_DEPTH', settings.LUNA_DEFAULT_RDP_COLOR_QUALITY)
+            )
 
         # 设置其他选项
-        rdp_options['session bpp:i'] = os.getenv('JUMPSERVER_COLOR_DEPTH', '32')
+        rdp_options['session bpp:i'] = color_quality
         rdp_options['audiomode:i'] = self.parse_env_bool('JUMPSERVER_DISABLE_AUDIO', 'false', '2', '0')
+
+        # 设置远程麦克风。请求参数用于兼容直接下载 RDP 文件的场景，
+        # 连接令牌中的临时配置优先于用户偏好。
+        remote_microphone_value = self.request.query_params.get('remote_microphone')
+        if remote_microphone_value is None:
+            remote_microphone_value = token.connect_options.get('remote_microphone')
+        if remote_microphone_value is None:
+            remote_microphone = 'remote_microphone' in client_options
+        else:
+            remote_microphone = is_true(remote_microphone_value)
+        if remote_microphone:
+            rdp_options['audiocapturemode:i'] = '1'
+
+        smart_size = self.request.query_params.get('rdp_smart_size')
+        if smart_size is None:
+            smart_size = token.user.preference.get_value(
+                'rdp_smart_size', category='luna',
+                default=settings.LUNA_DEFAULT_RDP_SMART_SIZE
+            )
+        rdp_options['smart sizing:i'] = smart_size
 
         # 设置远程应用, 不是 Mstsc
         if token.connect_method != NativeClient.mstsc:
@@ -115,6 +409,8 @@ class RDPFileClientProtocolURLMixin:
         rdp = token.asset.platform.protocols.filter(name='rdp').first()
         if rdp and rdp.setting.get('console'):
             rdp_options['administrative session:i'] = '1'
+        rdp_connection_speed = token.connect_options.get('rdp_connection_speed', 'auto')
+        rdp_options.update(RDP_CONNECTION_SPEED_OPTION_MAP.get(rdp_connection_speed, {}))
 
         # 文件名
         name = token.asset.name
@@ -125,6 +421,7 @@ class RDPFileClientProtocolURLMixin:
         for k, v in rdp_options.items():
             content += f'{k}:{v}\n'
 
+        content = self._try_sign_rdp_content(content)
         return filename, content
 
     @staticmethod
@@ -136,10 +433,26 @@ class RDPFileClientProtocolURLMixin:
         return name
 
     def get_connect_filename(self, prefix_name):
-        filename = f'{prefix_name}-jumpserver'
+        filename = prefix_name
         filename = self.escape_name(filename)
         return filename
 
+    @staticmethod
+    def get_token_account_display(token):
+        if token.personal_credential_id:
+            return token.input_username or token.account
+        try:
+            account = token.account_object
+        except Exception:
+            account = None
+        if account:
+            return (
+                account.full_username
+                or account.username
+                or account.name
+                or token.account
+            )
+        return token.input_username or token.account
     @staticmethod
     def parse_env_bool(env_key, env_default, true_value, false_value):
         return true_value if is_true(os.getenv(env_key, env_default)) else false_value
@@ -155,15 +468,17 @@ class RDPFileClientProtocolURLMixin:
         if connect_method_dict is None:
             raise ValueError('Connect method not support: {}'.format(connect_method_name))
 
-        account = token.account or token.input_username
+        account = self.get_token_account_display(token)  #修改account
         datetime = timezone.localtime(timezone.now()).strftime('%Y-%m-%d_%H:%M:%S')
-        name = account + '@' + str(asset) + '[' + datetime + ']'
+        name = account + '@' + asset.name + '[' + datetime + ']'
         data = {
             'version': 2,
             'id': str(token.id),  # 兼容老的，未来几个版本删掉
             'value': token.value,  # 兼容老的，未来几个版本删掉
             'name': self.escape_name(name),
             'protocol': token.protocol,
+            'site_url': build_absolute_uri(self.request, '/').rstrip('/'),
+            'org_id': str(token.org_id),
             'token': {
                 'id': str(token.id),
                 'value': token.value,
@@ -171,6 +486,13 @@ class RDPFileClientProtocolURLMixin:
             'file': {},
             'command': ''
         }
+
+        if token.protocol == Protocol.oracle:
+            data['connect_options'] = {
+                'use_sysdba': should_use_oracle_sysdba(
+                    token.connect_options, token.protocol, token.asset
+                )
+            }
 
         if connect_method_name == NativeClient.mstsc or connect_method_dict['type'] == 'applet':
             filename, content = self.get_rdp_file_info(token)
@@ -182,8 +504,18 @@ class RDPFileClientProtocolURLMixin:
                 }
             })
         else:
+            if connect_method_dict['type'] == 'virtual_app':
+                endpoint_protocol = 'vnc'
+                token_protocol = 'vnc'
+                data.update({
+                    'protocol': 'vnc',
+                })
+            else:
+                endpoint_protocol = connect_method_dict['endpoint_protocol']
+                token_protocol = token.protocol
+
             endpoint = self.get_smart_endpoint(
-                protocol=connect_method_dict['endpoint_protocol'],
+                protocol=endpoint_protocol,
                 asset=asset
             )
             data.update({
@@ -199,13 +531,13 @@ class RDPFileClientProtocolURLMixin:
                 },
                 'endpoint': {
                     'host': endpoint.host,
-                    'port': endpoint.get_port(token.asset, token.protocol),
+                    'port': endpoint.get_port(token.asset, token_protocol),
                 }
             })
         return data
 
     def get_smart_endpoint(self, protocol, asset=None):
-        endpoint = Endpoint.match_by_instance_label(asset, protocol)
+        endpoint = Endpoint.match_by_instance_label(asset, protocol, self.request)
         if not endpoint:
             target_ip = asset.get_target_ip() if asset else ''
             endpoint = EndpointRule.match_endpoint(
@@ -221,14 +553,21 @@ class ExtraActionApiMixin(RDPFileClientProtocolURLMixin):
     get_serializer: callable
     perform_create: callable
     validate_exchange_token: callable
+    need_face_verify: bool
+    create_face_verify: callable
 
     @action(methods=['POST', 'GET'], detail=True, url_path='rdp-file')
-    def get_rdp_file(self, *args, **kwargs):
+    def get_rdp_file(self, request, *args, **kwargs):
         token = self.get_object()
         token.is_valid()
         filename, content = self.get_rdp_file_info(token)
-        filename = '{}.rdp'.format(filename)
         response = HttpResponse(content, content_type='application/octet-stream')
+
+        if is_true(request.query_params.get('reusable')):
+            token.set_reusable(True)
+            filename = '{}-{}'.format(filename, token.date_expired.strftime('%Y%m%d_%H%M%S'))
+
+        filename += '.rdp'
         response['Content-Disposition'] = 'attachment; filename*=UTF-8\'\'%s' % filename
         return response
 
@@ -243,7 +582,7 @@ class ExtraActionApiMixin(RDPFileClientProtocolURLMixin):
         protocol_data = json.dumps(protocol_data).encode()
         protocol_data = base64.b64encode(protocol_data).decode()
         data = {
-            'url': 'jms://{}'.format(protocol_data)
+            'url': 'jms2://{}'.format(protocol_data)
         }
         return Response(data=data)
 
@@ -266,19 +605,31 @@ class ExtraActionApiMixin(RDPFileClientProtocolURLMixin):
         return Response(data=serializer.data)
 
     @action(methods=['POST'], detail=False)
+    @transaction.atomic
     def exchange(self, request, *args, **kwargs):
         pk = request.data.get('id', None) or request.data.get('pk', None)
         # 只能兑换自己使用的 Token
         instance = get_object_or_404(ConnectionToken, pk=pk, user=request.user)
         instance.id = None
-        self.validate_exchange_token(instance)
+        instance.from_ticket = None
+        try:
+            self.validate_exchange_token(instance)
+        except APIException as error:
+            record_connection_token_credential_audit(
+                instance, result='failed', error=error, request=request,
+            )
+            raise
         instance.date_expired = date_expired_default()
         instance.save()
         serializer = self.get_serializer(instance)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        response = Response(serializer.data, status=status.HTTP_201_CREATED)
+        if self.need_face_verify and not is_true(request.query_params.get('acl_stepwise')):
+            self.create_face_verify(response)
+        return response
 
 
-class ConnectionTokenViewSet(ExtraActionApiMixin, RootOrgViewMixin, JMSModelViewSet):
+class ConnectionTokenViewSet(AuthFaceMixin, ExtraActionApiMixin, RootOrgViewMixin, JMSModelViewSet):
+    queryset = ConnectionToken.objects.none()
     filterset_fields = (
         'user_display', 'asset_display'
     )
@@ -293,34 +644,127 @@ class ConnectionTokenViewSet(ExtraActionApiMixin, RootOrgViewMixin, JMSModelView
         'retrieve': 'authentication.view_connectiontoken',
         'create': 'authentication.add_connectiontoken',
         'exchange': 'authentication.add_connectiontoken',
+        'acl_controls': 'authentication.add_connectiontoken',
+        'acl_batch': 'authentication.add_connectiontoken',
         'reuse': 'authentication.reuse_connectiontoken',
         'expire': 'authentication.expire_connectiontoken',
         'get_rdp_file': 'authentication.add_connectiontoken',
         'get_client_protocol_url': 'authentication.add_connectiontoken',
     }
+    input_username = ''
+    need_face_verify = False
+    face_monitor_token = ''
+    personal_credential_audit_context = None
+    personal_credential_saved = None
 
     def get_queryset(self):
-        queryset = ConnectionToken.objects \
-            .filter(user=self.request.user) \
-            .filter(date_expired__gt=timezone.now())
+        queryset = ConnectionToken.objects.filter(user=self.request.user)
+        if self.action != 'acl_controls':
+            queryset = queryset.filter(date_expired__gt=timezone.now())
         return queryset
 
     def get_user(self, serializer):
         return self.request.user
 
+    @transaction.atomic
     def perform_create(self, serializer):
         self.validate_serializer(serializer)
         return super().perform_create(serializer)
 
+    def record_personal_credential_failure(self, reason):
+        context = self.personal_credential_audit_context
+        if not context:
+            return
+        try:
+            record_personal_credential_audit(
+                result='failed',
+                failure_reason=reason,
+                user=self.request.user,
+                remote_addr=get_request_ip_or_data(self.request),
+                **context,
+            )
+        except Exception:
+            logger.exception('Record personal credential failure audit failed')
+
+
     def _insert_connect_options(self, data, user):
-        name = 'file_name_conflict_resolution'
         connect_options = data.pop('connect_options', {})
-        preference = Preference.objects.filter(
-            name=name, user=user, category='koko'
-        ).first()
-        value = preference.value if preference else FileNameConflictResolution.REPLACE
-        connect_options[name] = value
+        default_name_opts = {
+            'file_name_conflict_resolution': settings.LUNA_DEFAULT_FILE_NAME_CONFLICT_RESOLUTION,
+            'terminal_theme_name': settings.LUNA_DEFAULT_TERMINAL_THEME_NAME,
+        }
+        backspace_preference_name = 'is_backspace_as_ctrl_h'
+        resolution_preference_name = 'rdp_resolution'
+        rdp_client_option_preference_name = 'rdp_client_option'
+        preferences_query = Preference.objects.filter(
+            user=user, category='luna',
+            name__in=(
+                *default_name_opts.keys(),
+                backspace_preference_name,
+                resolution_preference_name,
+                rdp_client_option_preference_name,
+                'printers_redirect',
+            )
+        ).values_list('name', 'value')
+        preferences = dict(preferences_query)
+        for name in default_name_opts.keys():
+            value = preferences.get(name, default_name_opts[name])
+            connect_options[name] = value
+
+        # Applet connections can also use RDP regardless of the asset protocol.
+        printers_redirect = connect_options.get('printers_redirect')
+        if printers_redirect is None:
+            printers_redirect = preferences.get('printers_redirect', False)
+        if isinstance(printers_redirect, str):
+            printers_redirect = printers_redirect.lower()
+        connect_options['printers_redirect'] = is_true(printers_redirect)
+
+        # The advanced option submitted by Luna takes precedence.  When it is
+        # absent, use the personal preference as the connection default.
+        if 'backspaceAsCtrlH' not in connect_options:
+            # Koko consumes this option using camelCase. Preferences are stored
+            # in a TextField, so convert the value back to a real boolean.
+            backspace_as_ctrl_h = preferences.get(
+                backspace_preference_name, settings.LUNA_DEFAULT_IS_BACKSPACE_AS_CTRL_H
+            )
+            connect_options['backspaceAsCtrlH'] = is_true(backspace_as_ctrl_h)
+
+        if data.get('protocol') == 'rdp':
+            if 'resolution' not in connect_options:
+                connect_options['resolution'] = preferences.get(
+                    resolution_preference_name, settings.LUNA_DEFAULT_RDP_RESOLUTION
+                )
+
+            if 'remote_microphone' not in connect_options:
+                rdp_client_options = preferences.get(
+                    rdp_client_option_preference_name,
+                    settings.LUNA_DEFAULT_RDP_CLIENT_OPTION,
+                )
+                if isinstance(rdp_client_options, str):
+                    try:
+                        rdp_client_options = json.loads(rdp_client_options)
+                    except json.JSONDecodeError:
+                        rdp_client_options = settings.LUNA_DEFAULT_RDP_CLIENT_OPTION
+                if not isinstance(rdp_client_options, (list, set, tuple)):
+                    rdp_client_options = settings.LUNA_DEFAULT_RDP_CLIENT_OPTION
+                connect_options['remote_microphone'] = 'remote_microphone' in rdp_client_options
+        connect_options['lang'] = getattr(user, 'lang') or settings.LANGUAGE_CODE
         data['connect_options'] = connect_options
+
+    @staticmethod
+    def get_input_username(data):
+        input_username = data.get('input_username', '')
+        if input_username:
+            return input_username
+
+        account = data.get('account', '')
+        if account == '@USER':
+            input_username = str(data.get('user', ''))
+        elif account == '@INPUT':
+            input_username = '@INPUT'
+        else:
+            input_username = account
+        return input_username
 
     def validate_serializer(self, serializer):
         data = serializer.validated_data
@@ -328,45 +772,224 @@ class ConnectionTokenViewSet(ExtraActionApiMixin, RootOrgViewMixin, JMSModelView
         self._insert_connect_options(data, user)
         asset = data.get('asset')
         account_name = data.get('account')
-        _data = self._validate(user, asset, account_name)
+        protocol = data.get('protocol')
+        connect_method = data.get('connect_method')
+        save_credential = data.pop('save_personal_credential', False)
+        credential_version = data.pop('personal_credential_version', None)
+        credential_id = data.get('personal_credential_id')
+        personal_permission_context = None
+        personal_permission_account = None
+        if credential_id or save_credential:
+            self.personal_credential_audit_context = {
+                'operation': (
+                    'update' if credential_id and save_credential
+                    else 'create' if save_credential
+                    else 'use'
+                ),
+                'asset': asset,
+                'credential_id': credential_id,
+                'username': data.get('input_username', ''),
+                'secret_type': data.get('input_secret_type', ''),
+            }
+        data['connect_options'] = get_effective_connect_options(
+            data['connect_options'], protocol, asset
+        )
+
+        if credential_id or save_credential:
+            if user != self.request.user:
+                raise PermissionDenied(_(
+                    'Personal credentials can only be managed by their owner'
+                ))
+            personal_permission_context = get_personal_credential_permission_context(
+                user, asset, protocol, account_alias=account_name,
+            )
+            platform_protocol, personal_permission_account = personal_permission_context
+            if save_credential and account_name != AliasAccount.INPUT:
+                # Same-name and hosted accounts fix the username.
+                data['input_username'] = personal_permission_account.full_username
+
+        if save_credential:
+            if not data.get('input_username'):
+                raise ValidationError({'input_username': _('This field is required.')})
+            if not data.get('input_secret'):
+                raise ValidationError({'input_secret': _('This field is required.')})
+            input_secret_type = (
+                data.get('input_secret_type') or SecretType.PASSWORD
+            )
+            validate_personal_credential_secret_type(
+                platform_protocol,
+                input_secret_type,
+                field_name='input_secret_type',
+            )
+            if input_secret_type == SecretType.SSH_KEY:
+                data['input_secret'] = validate_personal_credential_ssh_key(data['input_secret'])
+            if credential_id and credential_version is None:
+                raise ValidationError({
+                    'personal_credential_version': _('This field is required.')
+                })
+        if credential_version is not None and not credential_id:
+            raise ValidationError({
+                'personal_credential_version': _(
+                    'A personal credential ID is required when a version is provided'
+                )
+            })
+
+        if credential_id:
+            if not save_credential and (data.get('input_username') or data.get('input_secret')):
+                raise ValidationError({
+                    'personal_credential_id': _(
+                        'Do not submit a username or secret when using a saved credential'
+                    )
+                })
+            credential = get_personal_credential_for_use(
+                user, asset, protocol, credential_id,
+                # Updates check the submitted version under the write lock,
+                # including idempotent retries; use binds the exact version.
+                version=None if save_credential else credential_version,
+                permission_context=personal_permission_context,
+            )
+            if not save_credential:
+                data['input_username'] = credential.username
+                data['input_secret'] = ''
+                data['input_secret_type'] = credential.secret_type
+                data['personal_credential_version'] = credential.authentication_version
+                self.personal_credential_audit_context.update({
+                    'username': credential.username,
+                    'secret_type': credential.secret_type,
+                })
+
+        self.input_username = self.get_input_username(data)
+        if account_name == AliasAccount.INPUT:
+            # Manual account input can reach Luna directly, so validate before ACL/token creation.
+            self.input_username = validate_account_username(data.get('input_username', ''))
+            data['input_username'] = self.input_username
+        _data = self._validate(
+            user, asset, account_name, protocol, connect_method,
+            permed_account=personal_permission_account,
+        )
+        _data['remote_addr'] = get_request_ip_or_data(self.request)
         data.update(_data)
+        if 'push_account' in data.get('acl_context', {}).get('requirements', {}):
+            supplied = {
+                field: _('Same-name account provisioning uses server-managed credentials.')
+                for field in ('input_username', 'input_secret', 'input_secret_type',
+                              'personal_credential_id', 'personal_credential_version', 'save_personal_credential')
+                if self.request.data.get(field)
+            }
+            if supplied:
+                raise ValidationError(supplied)
+            data['input_username'] = ''
+            data['input_secret'] = ''
+            data['date_expired'] = timezone.now() + timedelta(minutes=15)
+
+
+        if save_credential:
+            credential = save_personal_credential(
+                user=user,
+                asset=asset,
+                protocol=protocol,
+                username=self.input_username,
+                secret=data.get('input_secret', ''),
+                secret_type=data.get('input_secret_type') or SecretType.PASSWORD,
+                credential_id=credential_id,
+                version=credential_version,
+                permission_context=personal_permission_context,
+            )
+            data['personal_credential_id'] = credential.id
+            data['personal_credential_version'] = credential.authentication_version
+            data['input_username'] = credential.username
+            data['input_secret'] = ''
+            data['input_secret_type'] = credential.secret_type
+            self.personal_credential_audit_context.update({
+                'credential_id': credential.id,
+                'username': credential.username,
+                'secret_type': credential.secret_type,
+            })
+            self.personal_credential_saved = (
+                'update' if credential_id else 'create', credential
+            )
         return serializer
 
     def validate_exchange_token(self, token):
+        token.connect_options = get_effective_connect_options(
+            token.connect_options, token.protocol, token.asset
+        )
         user = token.user
         asset = token.asset
-        account_name = token.account
-        _data = self._validate(user, asset, account_name)
+        account_alias = token.account
+        self.input_username = token.input_username
+        self.face_monitor_token = token.face_monitor_token or ''
+        personal_permission_account = None
+        if token.personal_credential_id:
+            credential, permission_context = (
+                token.validate_personal_credential()
+            )
+            personal_permission_account = permission_context[1]
+            self.input_username = credential.username
+            token.input_username = credential.username
+            token.input_secret = ''
+            token.input_secret_type = credential.secret_type
+        _data = self._validate(
+            user, asset, account_alias, token.protocol, token.connect_method,
+            permed_account=personal_permission_account,
+        )
+        _data['remote_addr'] = get_request_ip_or_data(self.request)
         for k, v in _data.items():
             setattr(token, k, v)
         return token
 
-    def _validate(self, user, asset, account_name):
+    def _validate(
+            self, user, asset, account_alias, protocol, connect_method,
+            permed_account=None,
+    ):
+        if not ConnectMethodACL.is_method_allowed(user, asset, connect_method, protocol):
+            raise JMSException(
+                code='connect_method_rejected',
+                detail=_('Connect method is not allowed for this asset')
+            )
         data = dict()
         data['org_id'] = asset.org_id
         data['user'] = user
         data['value'] = random_string(16)
 
-        if account_name == AliasAccount.ANON and asset.category not in ['web', 'custom']:
+        if account_alias == AliasAccount.ANON and asset.category not in ['web', 'custom']:
             raise ValidationError(_('Anonymous account is not supported for this asset'))
 
-        account = self._validate_perm(user, asset, account_name)
+        account = permed_account
+        if account is None:
+            account = self._validate_perm(
+                user, asset, account_alias, protocol
+            )
         if account.has_secret:
             data['input_secret'] = ''
+            data['input_secret_type'] = account.secret_type
 
-        if account.username != AliasAccount.INPUT:
+        if account_alias != AliasAccount.INPUT and account_alias != AliasAccount.USER:
             data['input_username'] = ''
-        ticket = self._validate_acl(user, asset, account)
-        if ticket:
-            data['from_ticket'] = ticket
-            data['is_active'] = False
+            if account.has_secret:
+                data['input_secret_type'] = ''
+
+        data['acl_context'] = self._validate_acl(user, asset, account, connect_method, protocol)
+        data['is_active'] = not data['acl_context'].get('requirements')
+        if self.face_monitor_token and data['acl_context'].get('face_online'):
+            context = FaceMonitorContext.get_or_create_context(self.face_monitor_token, self.request.user.id)
+            if str(context.user_id) != str(user.id):
+                raise PermissionDenied(_('Face monitoring context belongs to a different user'))
+            data['face_monitor_token'] = self.face_monitor_token
+        else:
+            data['face_monitor_token'] = ''
         return data
 
     @staticmethod
-    def _validate_perm(user, asset, account_name):
-        from perms.utils.account import PermAccountUtil
-        account = PermAccountUtil().validate_permission(user, asset, account_name)
-        if not account or not account.actions:
+    def get_permed_account(user, asset, account_alias, protocol):
+        return ConnectionToken.get_user_permed_account(user, asset, account_alias, protocol)
+
+    def _validate_perm(self, user, asset, account_alias, protocol, token_type=None):
+        get_permed_account = self.get_permed_account
+        if token_type == ConnectionTokenType.ADMIN:
+            get_permed_account = AdminConnectionToken.get_user_permed_account
+        account = get_permed_account(user, asset, account_alias, protocol)
+        if not ConnectionToken.has_account_permission(account, protocol):
             msg = _('Account not found')
             raise JMSException(code='perm_account_invalid', detail=msg)
         if account.date_expired < timezone.now():
@@ -374,28 +997,256 @@ class ConnectionTokenViewSet(ExtraActionApiMixin, RootOrgViewMixin, JMSModelView
             raise JMSException(code='perm_expired', detail=msg)
         return account
 
-    def _validate_acl(self, user, asset, account):
-        from acls.models import LoginAssetACL
-        acls = LoginAssetACL.filter_queryset(user=user, asset=asset, account=account)
-        ip = get_request_ip(self.request)
-        acl = LoginAssetACL.get_match_rule_acls(user, ip, acls)
-        if not acl:
-            return
-        if acl.is_action(acl.ActionChoices.accept):
-            return
-        if acl.is_action(acl.ActionChoices.reject):
-            msg = _('ACL action is reject: {}({})'.format(acl.name, acl.id))
-            raise JMSException(code='acl_reject', detail=msg)
-        if acl.is_action(acl.ActionChoices.review):
-            if not self.request.query_params.get('create_ticket'):
-                msg = _('ACL action is review')
-                raise JMSException(code='acl_review', detail=msg)
-
-            ticket = LoginAssetACL.create_login_asset_review_ticket(
-                user=user, asset=asset, account_username=account.username,
-                assignees=acl.reviewers.all(), org_id=asset.org_id
+    def _record_operate_log(self, acl, asset):
+        from audits.handler import create_or_update_operate_log
+        with tmp_to_org(asset.org_id):
+            after = {
+                str(_('Assets')): str(asset),
+                str(_('Account')): self.input_username
+            }
+            object_name = acl._meta.object_name
+            resource_type = acl._meta.verbose_name
+            create_or_update_operate_log(
+                acl.action, resource_type, resource=acl,
+                after=after, object_name=object_name
             )
-            return ticket
+
+    def _validate_acl(self, user, asset, account, connect_method, protocol):
+        from acls.models import LoginAssetACL
+        kwargs = {'user': user, 'asset': asset, 'account': account}
+        if account.username == AliasAccount.INPUT:
+            kwargs['account_username'] = self.input_username
+        ip = get_request_ip_or_data(self.request)
+        policy = LoginAssetACL.get_match_rule_acls(user, ip, LoginAssetACL.filter_queryset(**kwargs))
+        if not policy:
+            return {}
+        self._record_operate_log(policy.decision_rule, asset)
+        if policy.action == policy.ActionChoices.reject:
+            raise JMSException(code='acl_reject', detail=_('ACL action is reject: {}({})').format(policy.name, policy.id))
+        username = self.input_username if account.username == AliasAccount.INPUT else account.username
+        reviews = policy.pending_reviews(user, asset, username)
+        requirements = {}
+        for control in ('reason', 'mfa'):
+            if policy.enabled(f'{control}_enabled'):
+                requirements[control] = 'pending'
+        self.need_face_verify = policy.enabled('face_verify_enabled') or policy.enabled('face_online_enabled')
+        if self.need_face_verify:
+            if user != self.request.user:
+                raise JMSException(code='acl_face_verify', detail=_('Use Web Terminal to complete face verification'))
+            requirements['face'] = 'pending'
+        if reviews:
+            requirements['review'] = 'pending'
+        if policy.enabled('push_account_enabled') and LoginAssetACL.is_same_account(user, account, username):
+            from accounts.provisioning import needs_account_preparation
+            if needs_account_preparation(account):
+                requirements['push_account'] = 'pending'
+        if policy.enabled('face_online_enabled'):
+            if connect_method not in [WebMethod.web_cli, WebMethod.web_gui]:
+                raise JMSException(code='acl_face_online_not_supported', detail=_('Online face verification requires Web Terminal'))
+            self.face_monitor_token = self.request.query_params.get('face_monitor_token', self.face_monitor_token)
+            if not self.face_monitor_token:
+                raise JMSException(code='acl_face_online', detail=_('Online face monitoring context is required'))
+            from authentication.serializers.face import FaceMonitorContextSerializer
+            try:
+                self.face_monitor_token = FaceMonitorContextSerializer().fields['face_monitor_token'].run_validation(self.face_monitor_token)
+            except ValidationError as error:
+                raise ValidationError({'face_monitor_token': error.detail}) from error
+        # Preserve the existing request/validation trigger, including while
+        # approval or face verification is still pending.
+        recipients = {}
+        for rule in policy.rules:
+            if rule.notice_enabled:
+                for recipient in rule.recipients.all():
+                    recipients.setdefault(recipient.pk, (recipient, rule))
+        os_name = get_request_os(self.request) if self.request else 'windows'
+        method = ConnectMethodUtil.get_connect_method(connect_method, protocol=protocol, os=os_name)
+        login_from = method['label'] if method else connect_method
+        for recipient, rule in recipients.values():
+            AssetLoginReminderMsg(recipient, asset, user, account, rule, ip, self.input_username, login_from).publish_async()
+        return {
+            'requirements': requirements, 'username': username,
+            'review_acls': [str(rule.id) for rule in reviews],
+            'face_online': policy.enabled('face_online_enabled'),
+        }
+
+    @action(methods=['GET', 'POST'], detail=True, url_path='acl')
+    @transaction.atomic
+    def acl_controls(self, request, *args, **kwargs):
+        from authentication.services.connection_acl import advance_acl
+        instance = self.get_object()
+        if request.method == 'GET':
+            return Response(self.get_serializer(instance).data)
+        token = advance_acl(instance, request)
+        response = Response(self.get_serializer(token).data)
+        if request.method == 'POST' and is_true(request.data.get('retry_face')) and not token.acl_context.get('cancelled') and token.acl_context.get('requirements', {}).get('face') == 'pending':
+            self.create_face_verify(response)
+        return response
+
+    @action(methods=['POST'], detail=False, url_path='acl/batch')
+    @transaction.atomic
+    def acl_batch(self, request, *args, **kwargs):
+        from authentication.serializers.connection_token import ConnectionACLBatchInputSerializer
+        from authentication.services.connection_acl_batch import advance_acl_batch
+        serializer = ConnectionACLBatchInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        # Scope is server-derived. A token ID never grants access to another user or token type.
+        model = AdminConnectionToken if isinstance(self, AdminConnectionTokenViewSet) else ConnectionToken
+        with tmp_to_root_org():
+            tokens = list(model.objects.select_for_update().filter(
+                pk__in=data['token_ids'], user=request.user, type=model._type,
+            ).order_by('pk'))
+        if len(tokens) != len(data['token_ids']):
+            raise PermissionDenied(_('Connection is no longer available'), code='connection_unavailable')
+        for token in tokens:
+            with tmp_to_org(token.org_id):
+                self.check_permissions(request)
+        tokens = advance_acl_batch(tokens, request, data)
+        if data['step'] == 'face' and data.get('retry_face'):
+            pending = [token for token in tokens if token.acl_context['requirements'].get('face') == 'pending']
+            if pending:
+                response = Response(self.get_serializer(pending[0]).data)
+                with tmp_to_org(pending[0].org_id):
+                    self.create_face_verify(response, tokens=pending)
+                with tmp_to_root_org():
+                    tokens = [model.objects.get(pk=token.pk) for token in tokens]
+        return Response(self.get_serializer(tokens, many=True).data)
+
+    def create_face_verify(self, response, *, tokens=None):
+        if not self.request.user.is_face_code_set:
+            raise JMSException(code='no_face_feature', detail=_('No available face feature'))
+        connection_token_id = response.data.get('id')
+        with transaction.atomic():
+            token = ConnectionToken.objects.select_for_update().get(pk=connection_token_id)
+            states = token.acl_context.get('requirements', {})
+            if (token.acl_context.get('cancelled') or token.is_expired
+                    or token.user_id != self.request.user.id or states.get('face') != 'pending'):
+                raise PermissionDenied(_('Face verification is no longer available'))
+            if self.request.data.get('retry_face') and any(states.get(key, 'passed') != 'passed' for key in ('reason', 'mfa')):
+                raise ValidationError({'step': _('Complete the current connection step first')})
+        context_data = {
+            "action": "login_asset",
+            "connection_token_id": connection_token_id,
+        }
+        if tokens:
+            context_data['connection_token_ids'] = [str(item.pk) for item in tokens]
+        face_verify_token = self.create_face_verify_context(
+            context_data, user_id=self.request.user.id
+        )
+        response.data['face_token'] = face_verify_token
+        with transaction.atomic(), tmp_to_root_org():
+            for item in tokens or [token]:
+                item = ConnectionToken.objects.select_for_update().get(pk=item.pk)
+                if item.acl_context.get('cancelled'):
+                    raise PermissionDenied(_('Connection is no longer available'), code='connection_unavailable')
+                item.acl_context['face_token'] = face_verify_token
+                item.save(update_fields=['acl_context'])
+                if item.pk == token.pk:
+                    token = item
+        from authentication.services.connection_acl import acl_state
+        response.data['acl'] = acl_state(token)
+
+    @staticmethod
+    def serialize_validation_error(detail):
+        if isinstance(detail, dict):
+            data = {}
+            for field, messages in detail.items():
+                if isinstance(messages, dict):
+                    data[field] = ConnectionTokenViewSet.serialize_validation_error(messages)
+                elif isinstance(messages, (list, tuple)):
+                    data[field] = [str(message) for message in messages]
+                else:
+                    data[field] = [str(messages)]
+            return data
+        if isinstance(detail, (list, tuple)):
+            return {api_settings.NON_FIELD_ERRORS_KEY: [str(item) for item in detail]}
+        return {api_settings.NON_FIELD_ERRORS_KEY: [str(detail)]}
+
+    def create(self, request, *args, **kwargs):
+        self.personal_credential_audit_context = None
+        self.personal_credential_saved = None
+        raw_data = request.data if isinstance(request.data, Mapping) else {}
+        raw_save = raw_data.get('save_personal_credential', False)
+        save_credential = raw_save in (True, 1, '1', 'true', 'True')
+        credential_id = raw_data.get('personal_credential_id')
+        if credential_id or save_credential:
+            raw_asset_id = raw_data.get('asset')
+            if isinstance(raw_asset_id, Mapping):
+                raw_asset_id = raw_asset_id.get('id') or raw_asset_id.get('pk')
+            raw_asset = None
+            if (
+                    raw_asset_id
+                    and not isinstance(raw_asset_id, (list, tuple))
+                    and is_uuid(raw_asset_id)
+            ):
+                raw_asset = Asset.objects.filter(id=raw_asset_id).first()
+            request_org = get_org_from_request(request)
+            requested_audit_org_id = (
+                raw_asset.org_id if raw_asset else request_org.id
+            )
+            can_audit_requested_org = (
+                request.user.is_superuser
+                or request.user.orgs.filter(
+                    id=requested_audit_org_id
+                ).exists()
+            )
+            if not can_audit_requested_org:
+                raw_asset = None
+                requested_audit_org_id = Organization.DEFAULT_ID
+            self.personal_credential_audit_context = {
+                'operation': (
+                    'update' if credential_id and save_credential
+                    else 'create' if save_credential
+                    else 'use'
+                ),
+                'asset': raw_asset,
+                'credential_id': credential_id,
+                'username': raw_data.get('input_username', ''),
+                'secret_type': raw_data.get('input_secret_type', ''),
+                'org_id': requested_audit_org_id,
+            }
+        failure_reason = ''
+        try:
+            # Face context creation is part of the connection/save operation.
+            # If it fails, roll back both the token and any inline credential.
+            with transaction.atomic():
+                response = super().create(request, *args, **kwargs)
+                if self.need_face_verify and not is_true(request.query_params.get('acl_stepwise')):
+                    self.create_face_verify(response)
+        except JMSException as e:
+            failure_reason = str(e.detail.code)
+            data = {'code': e.detail.code, 'detail': e.detail}
+            response = Response(data, status=e.status_code)
+        except ValidationError as e:
+            failure_reason = get_personal_credential_failure_reason(e)
+            data = self.serialize_validation_error(e.detail)
+            response = Response(data, status=e.status_code)
+        except APIException as error:
+            self.record_personal_credential_failure(
+                get_personal_credential_failure_reason(error)
+            )
+            raise
+        except Exception as error:
+            self.record_personal_credential_failure(
+                error.__class__.__name__
+            )
+            raise
+        if failure_reason:
+            self.record_personal_credential_failure(failure_reason)
+        elif self.personal_credential_saved:
+            operation, credential = self.personal_credential_saved
+            try:
+                record_personal_credential_audit(
+                    operation=operation,
+                    result='success',
+                    user=self.request.user,
+                    credential=credential,
+                )
+            except Exception:
+                logger.exception(
+                    'Record personal credential success audit failed'
+                )
+        return response
 
 
 class SuperConnectionTokenViewSet(ConnectionTokenViewSet):
@@ -406,16 +1257,63 @@ class SuperConnectionTokenViewSet(ConnectionTokenViewSet):
     rbac_perms = {
         'create': 'authentication.add_superconnectiontoken',
         'renewal': 'authentication.add_superconnectiontoken',
+        'list': 'authentication.view_superconnectiontoken',
+        'check': 'authentication.view_superconnectiontoken',
+        'retrieve': 'authentication.view_superconnectiontoken',
+        'acl_controls': 'authentication.add_superconnectiontoken',
         'get_secret_detail': 'authentication.view_superconnectiontokensecret',
         'get_applet_info': 'authentication.view_superconnectiontoken',
         'release_applet_account': 'authentication.view_superconnectiontoken',
+        'get_virtual_app_info': 'authentication.view_superconnectiontoken',
     }
 
     def get_queryset(self):
-        return ConnectionToken.objects.all()
+        return ConnectionToken.objects.none()
+
+    def get_object(self):
+        pk = self.kwargs.get(self.lookup_field)
+        token = get_object_or_404(
+            ConnectionToken.objects.select_related(
+                'user', 'asset__platform'
+            ),
+            pk=pk,
+        )
+        return token
 
     def get_user(self, serializer):
         return serializer.validated_data.get('user')
+
+    @action(methods=['GET'], detail=True, url_path='check')
+    def check(self, request, *args, **kwargs):
+        instance = self.get_object()
+        data = {
+            "detail": "OK",
+            "code": "perm_ok",
+            "expired": instance.is_expired
+        }
+        try:
+            # Components check established sessions after the one-time token
+            # has been consumed. Revalidate access without reviving that token.
+            instance.is_valid(check_expiration=False)
+            if not instance.personal_credential_id:
+                self._validate_perm(
+                    instance.user,
+                    instance.asset,
+                    instance.account,
+                    instance.protocol,
+                    token_type=instance.type,
+                )
+        except JMSException as e:
+            data['code'] = e.detail.code
+            data['detail'] = str(e.detail)
+            return Response(data=data, status=status.HTTP_400_BAD_REQUEST)
+        except APIException as error:
+            data['code'] = get_personal_credential_failure_reason(error)
+            data['detail'] = str(error.detail)
+            record_connection_token_credential_audit(instance, result='failed', error=error)
+            return Response(data=data, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(data=data, status=status.HTTP_200_OK)
 
     @action(methods=['PATCH'], detail=False)
     def renewal(self, request, *args, **kwargs):
@@ -425,7 +1323,7 @@ class SuperConnectionTokenViewSet(ConnectionTokenViewSet):
         token = get_object_or_404(ConnectionToken, pk=token_id)
         date_expired = as_current_tz(token.date_expired)
         if token.is_expired:
-            raise PermissionDenied('Token is expired at: {}'.format(date_expired))
+            raise PermissionDenied(gettext('Token is expired at: {}').format(date_expired))
         token.renewal()
         data = {
             'ok': True,
@@ -438,50 +1336,70 @@ class SuperConnectionTokenViewSet(ConnectionTokenViewSet):
         """ 非常重要的 api, 在逻辑层再判断一下 rbac 权限, 双重保险 """
         rbac_perm = 'authentication.view_superconnectiontokensecret'
         if not request.user.has_perm(rbac_perm):
-            raise PermissionDenied('Not allow to view secret')
+            raise PermissionDenied(gettext('Not allow to view secret'))
+
+        from .rdp_login import is_tinker
+        if is_tinker(request.user):
+            raise PermissionDenied(gettext('Tinker must redeem its RDP login ticket to obtain credentials'))
 
         token_id = request.data.get('id') or ''
-        token = get_object_or_404(ConnectionToken, pk=token_id)
-        token.is_valid()
-        serializer = self.get_serializer(instance=token)
-
-        expire_now = request.data.get('expire_now', None)
-        asset_type = token.asset.type
-        # 设置默认值
-        if expire_now is None:
-            # TODO 暂时特殊处理 k8s 不过期
-            if asset_type in ['k8s', 'kubernetes']:
-                expire_now = False
-            else:
-                expire_now = not settings.CONNECTION_TOKEN_REUSABLE
-
-        if is_false(expire_now):
-            logger.debug('Api specified, now expire now')
-        elif token.is_reusable and settings.CONNECTION_TOKEN_REUSABLE:
-            logger.debug('Token is reusable, not expire now')
-        else:
-            token.expire()
-
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        token = ConnectionToken.get_typed_connection_token(token_id)
+        if not token:
+            raise PermissionDenied(gettext('Token {} is not valid').format(token))
+        return Response(get_connection_token_secret(
+            token, self.get_serializer,
+            expire_now=request.data.get('expire_now', True),
+            public_key=request.data.get('public_key', ''),
+        ))
 
     @action(methods=['POST'], detail=False, url_path='applet-option')
-    def get_applet_info(self, *args, **kwargs):
+    def get_applet_info(self, request, *args, **kwargs):
+        from .rdp_login import issue_applet_ticket, private_response
+        from ..serializers.rdp_login import NonzeroUUIDField
+
+        user = request.user
+        terminal = getattr(user, 'terminal', None)
+        if (not user.is_service_account or not terminal
+                or terminal.type not in ('razor', 'koko', 'lion')
+                or not user.has_perm('authentication.view_superconnectiontoken')):
+            raise PermissionDenied()
+        token_id = NonzeroUUIDField().run_validation(request.data.get('id'))
+        with transaction.atomic(), tmp_to_root_org():
+            token = ConnectionToken.get_typed_connection_token(token_id)
+            if token is None:
+                raise PermissionDenied(gettext('Invalid connection token'))
+            data = issue_applet_ticket(token)
+            return private_response(ConnectTokenAppletOptionSerializer(data).data)
+
+    @action(methods=['POST'], detail=False, url_path='virtual-app-option')
+    def get_virtual_app_info(self, *args, **kwargs):
         token_id = self.request.data.get('id')
         token = get_object_or_404(ConnectionToken, pk=token_id)
         if token.is_expired:
-            return Response({'error': 'Token expired'}, status=status.HTTP_400_BAD_REQUEST)
-        data = token.get_applet_option()
-        serializer = ConnectTokenAppletOptionSerializer(data)
+            return Response({'error': gettext('Token expired')}, status=status.HTTP_400_BAD_REQUEST)
+        data = token.get_virtual_app_option()
+        serializer = ConnectTokenVirtualAppOptionSerializer(data)
         return Response(serializer.data)
 
     @action(methods=['DELETE', 'POST'], detail=False, url_path='applet-account/release')
     def release_applet_account(self, *args, **kwargs):
-        account_id = self.request.data.get('id')
-        released = ConnectionToken.release_applet_account(account_id)
+        # Older components still send this after disconnect. Account ownership
+        # and safe reuse now follow the actual Windows session in Tinker.
+        return Response({'msg': 'released'})
 
-        if released:
-            logger.debug('Release applet account success: {}'.format(account_id))
-            return Response({'msg': 'released'})
-        else:
-            logger.error('Release applet account error: {}'.format(account_id))
-            return Response({'error': 'not found or expired'}, status=400)
+
+class AdminConnectionTokenViewSet(ConnectionTokenViewSet):
+    serializer_classes = {
+        'default': AdminConnectionTokenSerializer,
+    }
+
+    def check_permissions(self, request):
+        user = request.user
+        if not user.is_superuser:
+            self.permission_denied(request)
+
+    def get_queryset(self):
+        return AdminConnectionToken.objects.all().filter(user=self.request.user)
+
+    def get_permed_account(self, user, asset, account_name, protocol):
+        return AdminConnectionToken.get_user_permed_account(user, asset, account_name, protocol)

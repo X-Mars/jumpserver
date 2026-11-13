@@ -2,7 +2,7 @@
 #
 from django.db.models import QuerySet
 from rest_framework.viewsets import ModelViewSet, GenericViewSet
-from rest_framework_bulk import BulkModelViewSet
+from rest_framework_bulk.generics import BulkModelViewSet
 
 from common.api import CommonApiMixin, RelationMixin
 from orgs.utils import current_org
@@ -70,6 +70,6 @@ class OrgRelationMixin(RelationMixin):
     def get_queryset(self):
         queryset = super().get_queryset()
         if not current_org.is_root():
-            org_id = current_org.org_id()
+            org_id = current_org.id
             queryset = queryset.filter(**{f'{self.from_field}__org_id': org_id})
         return queryset

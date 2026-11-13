@@ -1,9 +1,44 @@
-ARG VERSION
-FROM registry.fit2cloud.com/jumpserver/xpack:${VERSION} as build-xpack
-FROM jumpserver/core:${VERSION}
+ARG VERSION=dev
+ARG MODELS_TAG=latest
+FROM jumpserver/gmssl:3.1.1-trixie AS gmssl-builder
 
+FROM registry.fit2cloud.com/jumpserver/core-models:${MODELS_TAG} AS build-models
+FROM registry.fit2cloud.com/jumpserver/xpack:${VERSION} AS build-xpack
+FROM jumpserver/core:${VERSION}-ce
+
+ENV INSIGHTFACE_MODEL_ROOT=/root/.insightface/models
+
+COPY --from=build-models /root/.insightface/models/ /root/.insightface/models/
 COPY --from=build-xpack /opt/xpack /opt/jumpserver/apps/xpack
 
-RUN --mount=type=cache,target=/root/.cache \
-    set -ex \
-    && poetry install --only=xpack
+ARG TOOLS="                           \
+        g++                           \
+        iputils-ping                  \
+        netcat-openbsd                \
+        telnet"
+
+ARG FACE_RUNTIME_DEPENDENCIES="       \
+        libgl1                        \
+        libglib2.0-0t64"
+
+RUN set -ex \
+    && apt-get update \
+    && apt-get -y install --no-install-recommends ${TOOLS} ${FACE_RUNTIME_DEPENDENCIES} \
+    && apt-get clean all \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/jumpserver
+
+ARG PIP_MIRROR=https://pypi.org/simple
+
+RUN set -ex \
+    && uv pip install -i${PIP_MIRROR} --extra-index-url https://pypi.org/simple/ --group xpack \
+    && python -c "import cv2" \
+    && rm -rf /root/.cache/
+
+COPY --from=gmssl-builder /usr/local/lib/libgmssl.so* /usr/local/lib/
+COPY --from=gmssl-builder /usr/local/include/gmssl /usr/local/include/gmssl
+COPY --from=gmssl-builder /usr/local/bin/gmssl /usr/local/bin/gmssl
+
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local-lib.conf \
+    && ldconfig

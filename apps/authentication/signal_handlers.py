@@ -1,18 +1,64 @@
-from importlib import import_module
-
 from django.conf import settings
-from django.contrib.auth import user_logged_in
+from django.contrib.auth import user_logged_in, user_logged_out, BACKEND_SESSION_KEY
 from django.core.cache import cache
+from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django_cas_ng.signals import cas_user_authenticated
 
-from apps.jumpserver.settings.auth import AUTHENTICATION_BACKENDS_THIRD_PARTY
+from jumpserver.settings.auth import AUTHENTICATION_BACKENDS_THIRD_PARTY
 from audits.models import UserSession
-from .signals import post_auth_success, post_auth_failed, user_auth_failed, user_auth_success
+from common.sessions.cache import user_session_manager
+from .models import AccessKey, Passkey, PrivateToken, SSHKey, TempToken
+from .notifications import publish_credential_created
+from .signals import post_auth_failed, backend_auth_failed
+
+from .backends.oauth2_provider.signal_handlers import *
+
+
+@receiver(post_save, sender=AccessKey)
+@receiver(post_save, sender=TempToken)
+@receiver(post_save, sender=PrivateToken)
+@receiver(post_save, sender=Passkey)
+@receiver(post_save, sender=SSHKey)
+def on_credential_created(sender, instance, created, raw=False, **kwargs):
+    if not created or raw:
+        return
+    credential_type = {
+        AccessKey: 'access_key',
+        TempToken: 'temp_token',
+        PrivateToken: 'private_token',
+        Passkey: 'passkey',
+        SSHKey: 'ssh_key',
+    }[sender]
+    # PrivateToken's primary key is the secret itself.
+    identifier = '' if sender is PrivateToken else instance.pk
+    publish_credential_created(instance.user, credential_type, identifier)
+
+
+@receiver(user_logged_in)
+@receiver(user_logged_out)
+def clear_user_confirmation(sender, request, **kwargs):
+    if request is None:
+        return
+    for key in (
+        'CONFIRM_LEVEL', 'CONFIRM_TYPE', 'CONFIRM_TIME', 'CONFIRM_USER_ID',
+        'passkey_confirm_mfa', 'fido2_state',
+    ):
+        request.session.pop(key, None)
+
+
+@receiver(user_logged_out)
+def clear_logged_out_web_session(sender, request, **kwargs):
+    if request is not None:
+        from authentication.services.web_session_lock import clear_web_session_cache
+        clear_web_session_cache(request.session.session_key)
 
 
 @receiver(user_logged_in)
 def on_user_auth_login_success(sender, user, request, **kwargs):
+    if hasattr(request.session, 'start_login') and not request.session.login_policy:
+        # SSO callbacks and the final guard may log in the same Session twice.
+        request.session.start_login()
     # 失效 perms 缓存
     user.expire_rbac_perms_cache()
 
@@ -21,8 +67,10 @@ def on_user_auth_login_success(sender, user, request, **kwargs):
             and user.mfa_enabled \
             and not request.session.get('auth_mfa'):
         request.session['auth_mfa_required'] = 1
+    auth_backend = request.session.get(BACKEND_SESSION_KEY) or request.session.get('auth_backend')
+    request.session['auth_backend'] = auth_backend
     if not request.session.get("auth_third_party_done") and \
-            request.session.get('auth_backend') in AUTHENTICATION_BACKENDS_THIRD_PARTY:
+            auth_backend in AUTHENTICATION_BACKENDS_THIRD_PARTY:
         request.session['auth_third_party_required'] = 1
 
     user_session_id = request.session.get('user_session_id')
@@ -32,28 +80,20 @@ def on_user_auth_login_success(sender, user, request, **kwargs):
         lock_key = 'single_machine_login_' + str(user.id)
         session_key = cache.get(lock_key)
         if session_key and session_key != request.session.session_key:
-            session = import_module(settings.SESSION_ENGINE).SessionStore(session_key)
-            session.delete()
+            user_session_manager.remove(session_key)
             UserSession.objects.filter(key=session_key).delete()
         cache.set(lock_key, request.session.session_key, None)
 
-    # 标记登录，设置 cookie，前端可以控制刷新, Middleware 会拦截这个生成 cookie
-    request.session['auth_session_expiration_required'] = 1
+    lang = request.COOKIES.get('django_language')
+    if lang:
+        user.lang = lang
 
 
-@receiver(cas_user_authenticated)
-def on_cas_user_login_success(sender, request, user, **kwargs):
-    request.session['auth_backend'] = settings.AUTH_BACKEND_CAS
-    post_auth_success.send(sender, user=user, request=request)
-
-
-@receiver(user_auth_success)
-def on_user_login_success(sender, request, user, backend, create=False, **kwargs):
-    request.session['auth_backend'] = backend
-    post_auth_success.send(sender, user=user, request=request)
-
-
-@receiver(user_auth_failed)
+@receiver(backend_auth_failed)
 def on_user_login_failed(sender, username, request, reason, backend, **kwargs):
     request.session['auth_backend'] = backend
-    post_auth_failed.send(sender, username=username, request=request, reason=reason)
+    post_auth_failed.send(
+        sender, username=username, request=request, reason=reason,
+        reason_code=kwargs.get('reason_code') or '',
+        reason_params=kwargs.get('reason_params') or {},
+    )

@@ -1,3 +1,7 @@
+from collections import Counter
+
+from django.utils.translation import gettext as _
+
 __all__ = ['FormatAssetInfo']
 
 
@@ -7,13 +11,46 @@ class FormatAssetInfo:
         self.tp = tp
 
     @staticmethod
-    def posix_format(info):
-        for cpu_model in info.get('cpu_model', []):
-            if cpu_model.endswith('GHz') or cpu_model.startswith("Intel"):
-                break
-        else:
-            cpu_model = ''
-        info['cpu_model'] = cpu_model[:48]
+    def get_cpu_model_count(cpus):
+        try:
+            if len(cpus) % 3 == 0:
+                step = 3
+                models = [cpus[i + 2] for i in range(0, len(cpus), step)]
+            elif len(cpus) % 2 == 0:
+                step = 2
+                models = [cpus[i + 1] for i in range(0, len(cpus), step)]
+            else:
+                raise ValueError(_("CPU list format not recognized"))
+
+            model_counts = Counter(models)
+            result = ', '.join([f"{model} x{count}" for model, count in model_counts.items()])
+        except Exception as e:
+            print(_("Error processing CPU model list: %(error)s") % {
+                'error': e,
+            })
+            result = ''
+        return result
+
+    @staticmethod
+    def get_gpu_model_count(gpus):
+        try:
+            model_counts = Counter(gpus)
+
+            result = ', '.join([f"{model} x{count}" for model, count in model_counts.items()])
+        except Exception as e:
+            print(_("Error processing GPU model list: %(error)s") % {
+                'error': e,
+            })
+            result = ''
+
+        return result
+
+    def posix_format(self, info):
+        cpus = self.get_cpu_model_count(info.get('cpu_model', []))
+        gpus = self.get_gpu_model_count(info.get('gpu_model', []))
+
+        info['gpu_model'] = gpus
+        info['cpu_model'] = cpus
         info['cpu_count'] = info.get('cpu_count', 0)
         return info
 

@@ -2,6 +2,7 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from common.serializers.fields import EncryptedField
+from .base import OrgListField
 
 __all__ = ['WeComSettingSerializer']
 
@@ -9,7 +10,15 @@ __all__ = ['WeComSettingSerializer']
 class WeComSettingSerializer(serializers.Serializer):
     PREFIX_TITLE = _('WeCom')
 
-    WECOM_CORPID = serializers.CharField(max_length=256, required=True, label='corpid')
-    WECOM_AGENTID = serializers.CharField(max_length=256, required=True, label='agentid')
-    WECOM_SECRET = EncryptedField(max_length=256, required=False, label='secret')
-    AUTH_WECOM = serializers.BooleanField(default=False, label=_('Enable WeCom Auth'))
+    WECOM_CORPID = serializers.CharField(max_length=256, required=True, label=_('Corporation ID'))
+    WECOM_AGENTID = serializers.CharField(max_length=256, required=True, label=_('App Agent ID'))
+    WECOM_SECRET = EncryptedField(max_length=256, required=False, label=_('App Secret'))
+    AUTH_WECOM = serializers.BooleanField(default=False, label=_('WeCom'))
+    WECOM_RENAME_ATTRIBUTES = serializers.JSONField(
+        required=False, label=_('User attribute'),
+        help_text=_(
+            'User attribute mapping, where the `key` is this system user attribute name and the '
+            '`value` is the WeCom service user attribute name'
+        )
+    )
+    WECOM_ORG_IDS = OrgListField()

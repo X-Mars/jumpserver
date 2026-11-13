@@ -1,4 +1,5 @@
-import ast
+import json
+import time
 
 from celery import signals
 from django.core.cache import cache
@@ -7,10 +8,16 @@ from django.db.models.signals import pre_save
 from django.db.utils import ProgrammingError
 from django.dispatch import receiver
 from django.utils import translation, timezone
+from django.utils.functional import LazyObject
+from rest_framework.utils.encoders import JSONEncoder
 
 from common.db.utils import close_old_connections, get_logger
 from common.signals import django_ready
+from common.utils.connection import RedisPubSub
+from common.utils.verify_code import VERIFY_CODE_TASKS
+from jumpserver.utils import get_current_request
 from orgs.utils import get_current_org_id, set_current_org
+from .ansible.runner import interface
 from .celery import app
 from .models import CeleryTaskExecution, CeleryTask, Job
 
@@ -50,13 +57,15 @@ def check_registered_tasks(*args, **kwargs):
         'users.tasks.check_user_expired_periodic', 'ops.tasks.clean_celery_periodic_tasks',
         'terminal.tasks.delete_terminal_status_period', 'ops.tasks.check_server_performance_period',
         'settings.tasks.ldap.import_ldap_user', 'users.tasks.check_password_expired',
-        'assets.tasks.nodes_amount.check_node_assets_amount_task', 'notifications.notifications.publish_task',
+        'notifications.notifications.publish_task',
         'perms.tasks.check_asset_permission_will_expired',
-        'ops.tasks.create_or_update_registered_periodic_tasks', 'perms.tasks.check_asset_permission_expired',
+        'ops.tasks.create_or_update_registered_periodic_tasks',
         'settings.tasks.ldap.import_ldap_user_periodic', 'users.tasks.check_password_expired_periodic',
-        'common.utils.verify_code.send_async', 'assets.tasks.nodes_amount.check_node_assets_amount_period_task',
+        'common.utils.verify_code.send_sms_async',
+        'common.utils.verify_code.send_verify_mail_async',
         'users.tasks.check_user_expired', 'orgs.tasks.refresh_org_cache_task',
         'terminal.tasks.upload_session_replay_to_external_storage', 'terminal.tasks.clean_orphan_session',
+        'terminal.tasks.upload_session_replay_file_to_external_storage',
         'audits.tasks.clean_audits_log_period', 'authentication.tasks.clean_django_sessions'
     ]
 
@@ -82,9 +91,16 @@ def before_task_publish(body=None, **kwargs):
 
 @signals.task_prerun.connect
 def on_celery_task_pre_run(task_id='', kwargs=None, **others):
+    count = 0
+    qs = CeleryTaskExecution.objects.filter(id=task_id)
+    while not qs.exists() and count < 5:
+        count += 1
+        time.sleep(1)
+        qs = CeleryTaskExecution.objects.filter(id=task_id)
+
     # 更新状态
-    CeleryTaskExecution.objects.filter(id=task_id) \
-        .update(state='RUNNING', date_start=timezone.now())
+    qs.update(state='RUNNING', date_start=timezone.now())
+
     # 关闭之前的数据库连接
     close_old_connections()
 
@@ -101,11 +117,44 @@ def on_celery_task_pre_run(task_id='', kwargs=None, **others):
 
 @signals.task_postrun.connect
 def on_celery_task_post_run(task_id='', state='', **kwargs):
-    close_old_connections()
-
-    CeleryTaskExecution.objects.filter(id=task_id).update(
+    CeleryTaskExecution.objects.filter(id=task_id).exclude(
+        state='REVOKED'
+    ).update(
         state=state, date_finished=timezone.now(), is_finished=True
     )
+    close_old_connections()
+
+
+@receiver(signals.task_revoked)
+def on_celery_task_revoked(request=None, **kwargs):
+    task_id = getattr(request, 'id', None)
+    if not task_id:
+        return
+
+    date_finished = timezone.now()
+    CeleryTaskExecution.objects.filter(id=task_id).update(
+        state='REVOKED',
+        date_finished=date_finished,
+        is_finished=True,
+    )
+
+    # Automation executions use the Celery task id as their primary key.
+    # Besides the execution itself, close pending secret records and release
+    # account queue locks that normal post_run cleanup can no longer handle.
+    try:
+        from accounts.automations.recovery import (
+            finalize_interrupted_executions_for_task,
+        )
+        finalize_interrupted_executions_for_task(
+            task_id,
+            'Task was forcibly terminated before completion; '
+            'the remote secret state may be unknown.',
+        )
+    except Exception:
+        logger.exception(
+            'Finalize revoked account automation failed: task=%s', task_id
+        )
+    close_old_connections()
 
 
 @signals.after_task_publish.connect
@@ -117,15 +166,24 @@ def task_sent_handler(headers=None, body=None, **kwargs):
         logger.error("Not found task id or name: {}".format(info))
         return
 
-    args = info.get('argsrepr', '()')
-    kwargs = info.get('kwargsrepr', '{}')
-    try:
-        args = list(ast.literal_eval(args))
-        kwargs = ast.literal_eval(kwargs)
-    except (ValueError, SyntaxError):
+    args, kwargs, __ = body
+
+    if task in VERIFY_CODE_TASKS:
+        # 仅清空执行记录参数，保留原始 body 供活动回调使用。
         args = []
         kwargs = {}
 
+    try:
+        args = json.loads(json.dumps(list(args), cls=JSONEncoder))
+        kwargs = json.loads(json.dumps(kwargs, cls=JSONEncoder))
+    except Exception as e:
+        logger.warning('Parse task args or kwargs error (Need handle): {}'.format(e))
+        args = []
+        kwargs = {}
+
+    # 不要保存__current_lang和__current_org_id参数,防止系统任务中点击再次执行报错
+    kwargs.pop('__current_lang', None)
+    kwargs.pop('__current_org_id', None)
     data = {
         'id': i,
         'name': task,
@@ -134,5 +192,33 @@ def task_sent_handler(headers=None, body=None, **kwargs):
         'args': args,
         'kwargs': kwargs
     }
-    CeleryTaskExecution.objects.create(**data)
-    CeleryTask.objects.filter(name=task).update(date_last_publish=timezone.now())
+    request = get_current_request()
+    if request and request.user.is_authenticated:
+        data['creator'] = request.user
+
+    with transaction.atomic():
+        try:
+            task_execution = CeleryTaskExecution.objects.create(**data)
+            task_execution.set_creator_if_need()
+        except Exception as e:
+            logger.error('Create celery task execution error: {}'.format(e))
+        CeleryTask.objects.filter(name=task).update(date_last_publish=timezone.now())
+
+
+@receiver(django_ready)
+def subscribe_stop_job_execution(sender, **kwargs):
+    logger.info("Start subscribe for stop job execution")
+
+    def on_stop(pid):
+        logger.info(f"Stop job execution {pid} start")
+        interface.kill_process(pid)
+
+    job_execution_stop_pub_sub.subscribe(on_stop)
+
+
+class JobExecutionPubSub(LazyObject):
+    def _setup(self):
+        self._wrapped = RedisPubSub('fm.job_execution_stop')
+
+
+job_execution_stop_pub_sub = JobExecutionPubSub()

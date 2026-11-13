@@ -2,9 +2,36 @@ from django.db import models
 from django.db.models.signals import post_save
 from django.utils.translation import gettext_lazy as _
 
+from accounts.const import VaultTypeChoices
 from common.db import fields
 
 __all__ = ['VaultQuerySetMixin', 'VaultManagerMixin', 'VaultModelMixin']
+
+
+VAULT_SAVED_SECRET_MARK = '# Secret-has-been-saved-to-vault #'
+
+
+class VaultSecretField(fields.EncryptTextField):
+    """Keep the OpenBao remote-secret marker readable in the local database."""
+
+    @staticmethod
+    def _should_store_marker_plaintext():
+        from django.conf import settings
+
+        return (
+            settings.VAULT_ENABLED
+            and settings.VAULT_BACKEND == VaultTypeChoices.openbao
+        )
+
+    def from_db_value(self, value, expression, connection, context=None):
+        if value == VAULT_SAVED_SECRET_MARK:
+            return value
+        return super().from_db_value(value, expression, connection, context)
+
+    def get_prep_value(self, value):
+        if value == VAULT_SAVED_SECRET_MARK and self._should_store_marker_plaintext():
+            return value
+        return super().get_prep_value(value)
 
 
 class VaultQuerySetMixin(models.QuerySet):
@@ -37,15 +64,16 @@ class VaultManagerMixin(models.Manager):
             post_save.send(obj.__class__, instance=obj, created=True)
         return objs
 
-    def bulk_update(self, objs, batch_size=None, ignore_conflicts=False):
-        objs = super().bulk_update(objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts)
+    def bulk_update(self, objs, fields, batch_size=None):
+        fields = ["_secret" if field == "secret" else field for field in fields]
+        super().bulk_update(objs, fields, batch_size=batch_size)
         for obj in objs:
             post_save.send(obj.__class__, instance=obj, created=False)
         return objs
 
 
 class VaultModelMixin(models.Model):
-    _secret = fields.EncryptTextField(blank=True, null=True, verbose_name=_('Secret'))
+    _secret = VaultSecretField(blank=True, null=True, verbose_name=_('Secret'))
     is_sync_metadata = True
 
     class Meta:
@@ -55,7 +83,7 @@ class VaultModelMixin(models.Model):
     __secret = None
 
     @property
-    def secret(self):
+    def secret(self) -> str:
         if self.__secret:
             return self.__secret
         from accounts.backends import vault_client
@@ -75,11 +103,28 @@ class VaultModelMixin(models.Model):
         self._secret = value
         self.__secret = value
 
-    _secret_save_to_vault_mark = '# Secret-has-been-saved-to-vault #'
+    _secret_save_to_vault_mark = VAULT_SAVED_SECRET_MARK
 
     def mark_secret_save_to_vault(self):
         self._secret = self._secret_save_to_vault_mark
-        self.save()
+        self.skip_history_when_saving = True
+        # Avoid calling overridden `save()` on concrete models (e.g. AccountTemplate)
+        # which may mutate `secret/_secret` again and cause post_save recursion.
+        super(VaultModelMixin, self).save(update_fields=['_secret'])
+
+    def restore_secret_from_vault(self, secret):
+        """Persist a Vault secret locally without sending it back to Vault."""
+        self._secret = secret
+        self.__secret = secret
+        self.skip_history_when_saving = True
+        self.skip_vault_when_saving = True
+        try:
+            # Bypass concrete model save overrides for the same reason as
+            # mark_secret_save_to_vault(), while retaining field encryption.
+            super(VaultModelMixin, self).save(update_fields=['_secret'])
+        finally:
+            del self.skip_vault_when_saving
+            del self.skip_history_when_saving
 
     @property
     def secret_has_save_to_vault(self):

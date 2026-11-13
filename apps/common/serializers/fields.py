@@ -5,11 +5,10 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import Model
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
-from rest_framework.fields import ChoiceField, empty
+from rest_framework.fields import empty
 
 from common.db.fields import TreeChoices, JSONManyToManyField as ModelJSONManyToManyField
-from common.local import add_encrypted_field_set
-from common.utils import decrypt_password
+from common.utils import decrypt_session_password, is_uuid
 
 __all__ = [
     "ReadableHiddenField",
@@ -19,8 +18,10 @@ __all__ = [
     "BitChoicesField",
     "TreeChoicesField",
     "LabeledMultipleChoiceField",
+    "ListMultipleChoiceField",
     "PhoneField",
-    "JSONManyToManyField"
+    "JSONManyToManyField",
+    "LabelRelatedField",
 ]
 
 
@@ -46,32 +47,38 @@ class EncryptedField(serializers.CharField):
         if write_only is None:
             write_only = True
         kwargs["write_only"] = write_only
-        encrypted_key = kwargs.pop('encrypted_key', None)
         super().__init__(**kwargs)
-        add_encrypted_field_set(encrypted_key or self.label)
 
     def to_internal_value(self, value):
         value = super().to_internal_value(value)
-        return decrypt_password(value)
+        return decrypt_session_password(value)
 
 
-class LabeledChoiceField(ChoiceField):
-    def __init__(self, *args, **kwargs):
-        super(LabeledChoiceField, self).__init__(*args, **kwargs)
-        self.choice_mapper = {
-            key: value for key, value in self.choices.items()
-        }
-
+class LabeledChoiceField(serializers.ChoiceField):
     def to_representation(self, key):
         if key is None:
             return key
-        label = self.choice_mapper.get(key, key)
+        label = self.choices.get(key, key)
         return {"value": key, "label": label}
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
             data = data.get("value")
+
+        if isinstance(data, str) and "(" in data and data.endswith(")"):
+            data = data.strip(")").split('(')[-1]
         return super(LabeledChoiceField, self).to_internal_value(data)
+
+
+class ListMultipleChoiceField(serializers.MultipleChoiceField):
+
+    def to_representation(self, value):
+        return list(value or [])
+
+    def to_internal_value(self, data):
+        if data is None:
+            return []
+        return list(super().to_internal_value(data))
 
 
 class LabeledMultipleChoiceField(serializers.MultipleChoiceField):
@@ -97,6 +104,60 @@ class LabeledMultipleChoiceField(serializers.MultipleChoiceField):
             return [item.get("value") for item in data]
         else:
             return data
+
+
+class LabelRelatedField(serializers.RelatedField):
+    def __init__(self, **kwargs):
+        queryset = kwargs.pop("queryset", None)
+        if queryset is None:
+            from labels.models import LabeledResource
+            queryset = LabeledResource.objects.all()
+
+        kwargs = {**kwargs}
+        read_only = kwargs.get("read_only", False)
+        if not read_only:
+            kwargs["queryset"] = queryset
+        super().__init__(**kwargs)
+
+    def to_file_representation(self, value):
+        if value is None:
+            return value
+        return "{}:{}".format(value.get('name'), value.get('value'))
+
+    def to_representation(self, value):
+        if value is None:
+            return value
+        label = value.label
+        if not label:
+            return None
+        return {'id': label.id, 'name': label.name, 'value': label.value, 'color': label.color}
+
+    def to_internal_value(self, data):
+        from labels.models import LabeledResource, Label
+        if data is None:
+            return data
+        if isinstance(data, dict) and (data.get("id") or data.get("pk")):
+            pk = data.get("id") or data.get("pk")
+            label = Label.objects.get(pk=pk)
+        elif is_uuid(data):
+            label = Label.objects.get(pk=data)
+        else:
+            if isinstance(data, dict):
+                k = data.get("name")
+                v = data.get("value")
+            elif isinstance(data, str) and ":" in data:
+                k, v = [x.strip() for x in data.split(":", 1)]
+            else:
+                raise serializers.ValidationError(_("Invalid data type"))
+            from labels.serializers import LabelSerializer
+
+            validated = LabelSerializer.validate_name_value(k, v)
+            label, __ = Label.objects.get_or_create(
+                name=validated['name'],
+                value=validated['value'],
+                defaults=validated,
+            )
+        return LabeledResource(label=label)
 
 
 class ObjectRelatedField(serializers.RelatedField):
@@ -137,6 +198,122 @@ class ObjectRelatedField(serializers.RelatedField):
             self.fail("does_not_exist", pk_value=pk)
         except (TypeError, ValueError):
             self.fail("incorrect_type", data_type=type(pk).__name__)
+
+    def get_schema(self):
+        """
+        为 drf-spectacular 提供 OpenAPI schema
+        """
+        description = getattr(self, 'help_text', '') or ''
+        title = getattr(self, 'label', '') or ''
+
+        if self.many:
+            # 如果是多对多关系
+            return {
+                'type': 'array',
+                'items': self._get_openapi_item_schema(),
+                'description': description,
+                'title': title,
+            }
+
+        # 单值关系复用完整对象 schema，保留关联对象 id 的必填约束。
+        schema = self._get_openapi_object_schema()
+        schema.update({
+            'description': description,
+            'title': title,
+        })
+        return schema
+
+    def _get_openapi_item_schema(self):
+        """
+        获取数组项的 OpenAPI schema
+        """
+        return self._get_openapi_object_schema()
+
+    def _get_openapi_object_schema(self):
+        """
+        获取对象的 OpenAPI schema
+        """
+        properties = {}
+
+        # 动态分析 attrs 中的属性类型
+        for attr in self.attrs:
+            # 尝试从 queryset 的 model 中获取字段信息
+            field_type = self._infer_field_type(attr)
+            properties[attr] = {
+                'type': field_type,
+                'description': f'{attr} field'
+            }
+
+        return {
+            'type': 'object',
+            'properties': properties,
+            'required': ['id'] if 'id' in self.attrs else []
+        }
+
+    def _infer_field_type(self, attr_name):
+        """
+        智能推断字段类型
+        """
+        try:
+            # 如果有 queryset，尝试从 model 中获取字段信息
+            if hasattr(self, 'queryset') and self.queryset is not None:
+                model = self.queryset.model
+                if hasattr(model, '_meta') and hasattr(model._meta, 'fields'):
+                    field = model._meta.get_field(attr_name)
+                    if field:
+                        return self._map_django_field_type(field)
+        except Exception:
+            pass
+
+        # 如果没有 queryset 或无法获取字段信息，使用启发式规则
+        return self._heuristic_field_type(attr_name)
+
+    def _map_django_field_type(self, field):
+        """
+        将 Django 字段类型映射到 OpenAPI 类型
+        """
+        field_type = field.get_internal_type()
+
+        # 整数类型
+        if field_type in ('AutoField', 'BigAutoField', 'SmallAutoField') or 'Integer' in field_type:
+            return 'integer'
+        # 浮点数类型
+        elif 'Float' in field_type or 'Decimal' in field_type:
+            return 'number'
+        # 布尔类型
+        elif 'Boolean' in field_type:
+            return 'boolean'
+        # 日期时间类型
+        elif 'DateTime' in field_type or 'Date' in field_type or 'Time' in field_type:
+            return 'string'
+        # 文件类型
+        elif 'File' in field_type or 'Image' in field_type:
+            return 'string'
+        # 其他类型默认为字符串
+        else:
+            return 'string'
+
+    def _heuristic_field_type(self, attr_name):
+        """
+        启发式推断字段类型
+        """
+        # 基于属性名的启发式规则
+
+        if attr_name in ['is_active', 'enabled', 'visible'] or attr_name.startswith('is_'):
+            return 'boolean'
+        elif attr_name in ['count', 'number', 'size', 'amount']:
+            return 'integer'
+        elif attr_name in ['price', 'rate', 'percentage']:
+            return 'number'
+        else:
+            # 默认返回字符串类型
+            return 'string'
+
+    def _get_openapi_properties_schema(self):
+        """
+        获取对象属性的 OpenAPI schema
+        """
+        return self._get_openapi_object_schema()['properties']
 
 
 class TreeChoicesField(serializers.MultipleChoiceField):
@@ -196,6 +373,23 @@ class BitChoicesField(TreeChoicesField):
             value |= name_value_map[name]
         return value
 
+    def get_schema(self):
+        """
+        为 drf-spectacular 提供 OpenAPI schema
+        """
+        return {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'value': {'type': 'string'},
+                    'label': {'type': 'string'}
+                }
+            },
+            'description': getattr(self, 'help_text', ''),
+            'title': getattr(self, 'label', ''),
+        }
+
     def run_validation(self, data=empty):
         """
         备注:
@@ -218,28 +412,33 @@ class PhoneField(serializers.CharField):
             code = data.get('code')
             phone = data.get('phone', '')
             if code and phone:
-                data = '{}{}'.format(code, phone)
+                code = code.replace('+', '')
+                data = '+{}{}'.format(code, phone)
             else:
                 data = phone
-        try:
-            phone = phonenumbers.parse(data, 'CN')
-            data = '{}{}'.format(phone.country_code, phone.national_number)
-        except phonenumbers.NumberParseException:
-            data = '+86{}'.format(data)
+        if data:
+            try:
+                phone = phonenumbers.parse(data, 'CN')
+                data = '+{}{}'.format(phone.country_code, phone.national_number)
+            except phonenumbers.NumberParseException:
+                data = '+86{}'.format(data)
 
         return super().to_internal_value(data)
 
     def to_representation(self, value):
-        if value:
-            try:
-                phone = phonenumbers.parse(value, 'CN')
-                value = {'code': '+%s' % phone.country_code, 'phone': phone.national_number}
-            except phonenumbers.NumberParseException:
-                value = {'code': '+86', 'phone': value}
+        try:
+            phone = phonenumbers.parse(value, 'CN')
+            value = {'code': '+%s' % phone.country_code, 'phone': str(phone.national_number)}
+        except phonenumbers.NumberParseException:
+            value = {'code': '+86', 'phone': value}
         return value
 
 
 class JSONManyToManyField(serializers.JSONField):
+    def __init__(self, *args, allow_empty_ids=False, **kwargs):
+        self.allow_empty_ids = allow_empty_ids
+        super().__init__(*args, **kwargs)
+
     def to_representation(self, manager):
         if manager is None:
             return manager
@@ -247,8 +446,13 @@ class JSONManyToManyField(serializers.JSONField):
         if not isinstance(value, dict):
             return {"type": "ids", "ids": []}
         if value.get("type") == "ids":
-            valid_ids = manager.all().values_list("id", flat=True)
-            valid_ids = [str(i) for i in valid_ids]
+            valid_ids = [
+                str(resource_id)
+                for resource_id in manager.all()
+                .order_by()
+                .values_list("id", flat=True)
+                .iterator(chunk_size=2000)
+            ]
             return {"type": "ids", "ids": valid_ids}
         return value
 
@@ -256,7 +460,8 @@ class JSONManyToManyField(serializers.JSONField):
         if not data:
             data = {}
         try:
-            ModelJSONManyToManyField.check_value(data)
+            data = super().to_internal_value(data)
+            ModelJSONManyToManyField.check_value(data, self.allow_empty_ids)
         except ValueError as e:
             raise serializers.ValidationError(e)
         return super().to_internal_value(data)

@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 #
 
-from django.core.exceptions import ValidationError
+from rest_framework.serializers import ValidationError
 from django.db import models
 from django.utils.translation import gettext_lazy as _
-
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from common.db.models import JMSBaseModel
 from common.utils import get_logger, lazyproperty
 from ..models import Organization
@@ -45,7 +46,7 @@ class OrgManager(models.Manager):
         for obj in objs:
             if org.is_root():
                 if not obj.org_id:
-                    raise ValidationError('Please save in a org')
+                    raise ValidationError(_('Please save in a org'))
             else:
                 obj.org_id = org.id
         return super().bulk_create(objs, batch_size, ignore_conflicts)
@@ -70,7 +71,7 @@ class OrgModelMixin(models.Model):
         #     raise ...
         if org.is_root():
             if not self.org_id:
-                raise ValidationError('Please save in a org')
+                raise ValidationError(_('Please save in a org'))
         else:
             self.org_id = org.id
         return super().save(*args, **kwargs)
@@ -80,7 +81,7 @@ class OrgModelMixin(models.Model):
         return Organization.get_instance(self.org_id)
 
     @property
-    def org_name(self):
+    def org_name(self) -> str:
         return self.org.name
 
     @property
@@ -119,4 +120,3 @@ class OrgModelMixin(models.Model):
 class JMSOrgBaseModel(JMSBaseModel, OrgModelMixin):
     class Meta:
         abstract = True
-

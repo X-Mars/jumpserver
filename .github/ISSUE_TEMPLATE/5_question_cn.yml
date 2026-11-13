@@ -1,0 +1,59 @@
+name: '🤔 问题咨询'
+description: '提出一个问题'
+title: '[Question] '
+labels: ['🤔 Question']
+body:
+  - type: input
+    attributes:
+      label: '产品版本'
+      description: 不再支持 v2.28（含）之前的版本。
+    validations:
+      required: true
+
+  - type: checkboxes
+    attributes:
+      label: '版本类型'
+      options:
+        - label: '社区版'
+        - label: '企业版'
+        - label: '企业试用版'
+    validations:
+      required: true
+    
+  - type: checkboxes
+    attributes:
+      label: '安装方式'
+      options:
+        - label: '在线安装 (一键命令安装)'
+        - label: '离线包安装'
+        - label: 'All-in-One'
+        - label: '1Panel'
+        - label: 'Kubernetes'
+        - label: '源码安装'
+
+  - type: textarea
+    attributes:
+      label: '环境信息'
+      description: 请在此详细描述你的环境信息，如操作系统、浏览器和部署架构等。
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: '🤔 问题描述'
+      description: |
+        请提供一个清晰且简洁的问题描述，如果问题比较复杂，也请详细说明。<br/> 
+        针对不清晰的描述信息将不予处理。
+    validations:
+      required: true
+      
+  - type: textarea
+    attributes:
+      label: '期望结果'
+      description: 请提供一个清晰且简洁的描述，说明你期望发生什么。
+
+  - type: textarea
+    attributes:
+      label: '补充信息'
+      description: 在这里添加关于问题的任何其他背景信息。
+

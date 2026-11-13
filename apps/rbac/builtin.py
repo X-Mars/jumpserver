@@ -9,6 +9,10 @@ _view_all_joined_org_perms = (
     ('orgs', 'organization', 'view', 'alljoinedorg'),
 )
 
+chat_ai_user_perms = (
+    ('chat_ai', 'runtimestore', 'use', 'chatai'),
+)
+
 user_perms = (
     ('rbac', 'menupermission', 'view', 'workbench'),
     ('rbac', 'menupermission', 'view', 'webterminal'),
@@ -23,6 +27,8 @@ user_perms = (
     ("ops", "job", "*", "*"),
     ("ops", "jobexecution", "*", "*"),
     ("ops", "celerytaskexecution", "view", "*"),
+    ("users", "user", "match", "user"),
+    *chat_ai_user_perms,
 )
 
 system_user_perms = (
@@ -30,13 +36,28 @@ system_user_perms = (
     ('authentication', 'temptoken', 'add,change,view', 'temptoken'),
     ('authentication', 'accesskey', '*', '*'),
     ('authentication', 'passkey', '*', '*'),
+    ('authentication', 'sshkey', '*', '*'),
     ('tickets', 'ticket', 'view', 'ticket'),
 )
 system_user_perms += (user_perms + _view_all_joined_org_perms)
 
 _auditor_perms = (
     ('rbac', 'menupermission', 'view', 'audit'),
+    ('rbac', 'menupermission', 'view', 'auditreport'),
+    ('rbac', 'menupermission', 'view', 'activityreport'),
+    ('rbac', 'menupermission', 'view', 'securityreport'),
+    ('rbac', 'menupermission', 'view', 'inventoryreport'),
+    ('rbac', 'menupermission', 'view', 'accountreport'),
+    ('rbac', 'menupermission', 'view', 'userloginreport'),
+    ('rbac', 'menupermission', 'view', 'userchangepasswordreport'),
+    ('rbac', 'menupermission', 'view', 'assetstatisticsreport'),
+    ('rbac', 'menupermission', 'view', 'assetactivityreport'),
+    ('rbac', 'menupermission', 'view', 'accountstatisticsreport'),
+    ('rbac', 'menupermission', 'view', 'accountautomationreport'),
+    ('assets', 'asset', 'view', 'asset'),
+    ('users', 'user', 'view', 'user'),
     ('audits', '*', '*', '*'),
+    ('chat_ai', 'auditconversation', 'view', 'auditconversation'),
     ('audits', 'joblog', '*', '*'),
     ('terminal', 'commandstorage', 'view', 'commandstorage'),
     ('terminal', 'sessionreplay', 'view,download', 'sessionreplay'),
@@ -52,6 +73,7 @@ app_exclude_perms = [
     ('users', 'user', 'add,delete', 'user'),
     ('orgs', 'org', 'add,delete,change', 'org'),
     ('rbac', '*', '*', '*'),
+    *chat_ai_user_perms,
 ]
 
 need_check = [
@@ -121,7 +143,7 @@ class BuiltinRole:
         '4', gettext_noop('SystemComponent'), Scope.system, app_exclude_perms, 'exclude'
     )
     system_user = PredefineRole(
-        '3', gettext_noop('User'), Scope.system, system_user_perms
+        '3', gettext_noop('SystemUser'), Scope.system, system_user_perms
     )
     org_admin = PredefineRole(
         '5', gettext_noop('OrgAdmin'), Scope.org, []

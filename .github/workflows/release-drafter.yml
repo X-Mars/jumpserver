@@ -6,6 +6,9 @@ on:
 
 name: Create Release And Upload assets
 
+permissions:
+  contents: write
+
 jobs:
   create-realese:
     name: Create Release
@@ -15,6 +18,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
+        with:
+          submodules: recursive
       - name: Get version
         id: get_version
         run: |
@@ -26,7 +31,7 @@ jobs:
           echo "::set-output name=VERSION::$VERSION"
       - name: Create Release
         id: create_release
-        uses: release-drafter/release-drafter@v5
+        uses: release-drafter/release-drafter@09c613e259eb8d4e7c81c2cb00618eb5fc4575a7 # v5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -50,6 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+        with:
+          submodules: recursive
       - name: Build it and upload
         uses: jumpserver/action-build-upload-assets@master
         env:

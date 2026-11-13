@@ -2,38 +2,36 @@ from __future__ import unicode_literals
 
 import os
 import uuid
+from datetime import timedelta
 
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.core.files.storage import default_storage
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from accounts.models import Account
 from assets.models import Asset
+from common.const.signals import OP_LOG_SKIP_SIGNAL
 from common.utils import get_object_or_none, lazyproperty
 from orgs.mixins.models import OrgModelMixin
 from terminal.backends import get_multi_command_storage
-from terminal.const import SessionType, TerminalType
+from terminal.const import SessionType, TerminalType, LoginFrom
 from users.models import User
 
 
 class Session(OrgModelMixin):
-    class LOGIN_FROM(models.TextChoices):
-        ST = 'ST', 'SSH Terminal'
-        RT = 'RT', 'RDP Terminal'
-        WT = 'WT', 'Web Terminal'
-        DT = 'DT', 'DB Terminal'
-
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
     user = models.CharField(max_length=128, verbose_name=_("User"), db_index=True)
     user_id = models.CharField(blank=True, default='', max_length=36, db_index=True)
     asset = models.CharField(max_length=128, verbose_name=_("Asset"), db_index=True)
     asset_id = models.CharField(blank=True, default='', max_length=36, db_index=True)
     account = models.CharField(max_length=128, verbose_name=_("Account"), db_index=True)
-    account_id = models.CharField(max_length=128, verbose_name=_("Account id"), db_index=True)
+    account_id = models.CharField(max_length=128, verbose_name=_("Account ID"), db_index=True)
     protocol = models.CharField(default='ssh', max_length=16, db_index=True)
-    login_from = models.CharField(max_length=2, choices=LOGIN_FROM.choices, default="ST", verbose_name=_("Login from"))
+    login_from = models.CharField(max_length=2, choices=LoginFrom.choices, default="ST", verbose_name=_("Login from"))
     type = models.CharField(max_length=16, default='normal', db_index=True)
     remote_addr = models.CharField(max_length=128, verbose_name=_("Remote addr"), blank=True, null=True)
     is_success = models.BooleanField(default=True, db_index=True)
@@ -45,11 +43,13 @@ class Session(OrgModelMixin):
     date_end = models.DateTimeField(verbose_name=_("Date end"), null=True)
     comment = models.TextField(blank=True, null=True, verbose_name=_("Comment"))
     cmd_amount = models.IntegerField(default=-1, verbose_name=_("Command amount"))
+    error_reason = models.CharField(max_length=128, blank=True, verbose_name=_("Error reason"))
+    replay_size = models.BigIntegerField(default=0, verbose_name=_("Replay size"))
 
     upload_to = 'replay'
     ACTIVE_CACHE_KEY_PREFIX = 'SESSION_ACTIVE_{}'
     LOCK_CACHE_KEY_PREFIX = 'TOGGLE_LOCKED_SESSION_{}'
-    SUFFIX_MAP = {1: '.gz', 2: '.replay.gz', 3: '.cast.gz', 4: '.replay.mp4'}
+    SUFFIX_MAP = {2: '.replay.gz', 3: '.cast.gz', 4: '.replay.mp4', 5: '.replay.json'}
     DEFAULT_SUFFIXES = ['.replay.gz', '.cast.gz', '.gz', '.replay.mp4']
 
     # Todo: 将来干掉 local_path, 使用 default storage 实现
@@ -73,22 +73,22 @@ class Session(OrgModelMixin):
         """
         local_path: replay/2021-12-08/session_id.cast.gz
         通过后缀名获取本地存储的录像文件路径
-        :param suffix: .cast.gz | '.replay.gz' | '.gz'
+        :param suffix: .cast.gz | '.replay.gz'
         :return:
         """
         rel_path = self.get_relative_path_by_suffix(suffix)
-        if suffix == '.gz':
-            # 兼容 v1 的版本
-            return rel_path
         return os.path.join(self.upload_to, rel_path)
 
     def get_relative_path_by_suffix(self, suffix='.cast.gz'):
         """
         relative_path: 2021-12-08/session_id.cast.gz
         通过后缀名获取外部存储录像文件路径
-        :param suffix: .cast.gz | '.replay.gz' | '.gz'
+        :param suffix: .cast.gz | '.replay.gz' | '.replay.json'
         :return:
         """
+        if suffix == '.replay.json':
+            meta_filename = str(self.id) + suffix
+            return self.get_replay_part_file_relative_path(meta_filename)
         date = self.date_start.strftime('%Y-%m-%d')
         return os.path.join(date, str(self.id) + suffix)
 
@@ -122,6 +122,13 @@ class Session(OrgModelMixin):
     def user_obj(self):
         return User.objects.get(id=self.user_id)
 
+    @property
+    def account_obj(self):
+        try:
+            return get_object_or_none(Account, pk=self.account_id)
+        except ValidationError:
+            return None
+
     def can_replay(self):
         return self.has_replay
 
@@ -129,15 +136,11 @@ class Session(OrgModelMixin):
     def can_join(self):
         if self.is_finished:
             return False
-        if self.login_from == self.LOGIN_FROM.RT:
-            return False
         if self.type != SessionType.normal:
             # 会话监控仅支持 normal，不支持 tunnel 和 command
             return False
-        if self.terminal.type in [TerminalType.lion, TerminalType.koko]:
-            return True
-        else:
-            return False
+        support_types = [TerminalType.lion, TerminalType.koko, TerminalType.razor]
+        return getattr(self.terminal, 'type', None) in support_types
 
     @property
     def can_terminate(self):
@@ -147,7 +150,7 @@ class Session(OrgModelMixin):
             return True
 
     @property
-    def is_locked(self):
+    def is_locked(self) -> bool:
         if self.is_finished:
             return False
         key = self.LOCK_CACHE_KEY_PREFIX.format(self.id)
@@ -167,22 +170,44 @@ class Session(OrgModelMixin):
         cache.delete(key)
 
     @lazyproperty
-    def terminal_display(self):
+    def terminal_display(self) -> str:
         display = self.terminal.name if self.terminal else ''
         return display
 
+    def get_replay_dir_relative_path(self):
+        date = self.date_start.strftime('%Y-%m-%d')
+        return os.path.join(date, str(self.id))
+
+    def get_replay_part_file_relative_path(self, filename):
+        return os.path.join(self.get_replay_dir_relative_path(), filename)
+
+    def get_replay_part_file_local_storage_path(self, filename):
+        return os.path.join(self.upload_to, self.get_replay_part_file_relative_path(filename))
+
     def save_replay_to_storage_with_version(self, f, version=2):
-        suffix = self.SUFFIX_MAP.get(version, '.cast.gz')
-        local_path = self.get_local_storage_path_by_suffix(suffix)
+        if version <= 4:
+            # compatible old API and deprecated in future version
+            suffix = self.SUFFIX_MAP.get(version, '.cast.gz')
+            rel_path = self.get_relative_path_by_suffix(suffix)
+            local_path = self.get_local_storage_path_by_suffix(suffix)
+        else:
+            # 文件名依赖 上传的文件名，不再使用默认的文件名
+            filename = f.name
+            rel_path = self.get_replay_part_file_relative_path(filename)
+            local_path = self.get_replay_part_file_local_storage_path(filename)
         try:
             name = default_storage.save(local_path, f)
+            absolute_saved_path = default_storage.path(name)
+            absolute_local_path = default_storage.path(local_path)
+            if absolute_saved_path != absolute_local_path:
+                os.rename(absolute_saved_path, absolute_local_path)
         except OSError as e:
             return None, e
 
         if settings.SERVER_REPLAY_STORAGE:
-            from terminal.tasks import upload_session_replay_to_external_storage
-            upload_session_replay_to_external_storage.delay(str(self.id))
-        return name, None
+            from terminal.tasks import upload_session_replay_file_to_external_storage
+            upload_session_replay_file_to_external_storage.delay(str(self.id), local_path, rel_path)
+        return local_path, None
 
     @classmethod
     def set_sessions_active(cls, session_ids):
@@ -198,10 +223,11 @@ class Session(OrgModelMixin):
         return bool(cache.get(key))
 
     @property
-    def command_amount(self):
+    def command_amount(self) -> int:
         if self.need_update_cmd_amount:
             cmd_amount = self.compute_command_amount()
             self.cmd_amount = cmd_amount
+            setattr(self, OP_LOG_SKIP_SIGNAL, True)
             self.save()
         elif self.need_compute_cmd_amount:
             cmd_amount = self.compute_command_amount()
@@ -232,6 +258,14 @@ class Session(OrgModelMixin):
         instance = self.get_asset()
         target_ip = instance.get_target_ip() if instance else ''
         return target_ip
+
+    @property
+    def duration(self) -> str:
+        date_end = self.date_end or timezone.now()
+        delta = date_end - self.date_start
+        # 去掉毫秒的显示
+        delta = timedelta(seconds=int(delta.total_seconds()))
+        return str(delta)
 
     @classmethod
     def generate_fake(cls, count=100, is_finished=True):

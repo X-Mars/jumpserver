@@ -1,14 +1,19 @@
 import json
 
+import ldap
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import InMemoryUploadedFile
-from django.db import models
+from django.db import models, connections, transaction
 from django.db.utils import ProgrammingError, OperationalError
 from django.utils.translation import gettext_lazy as _
+from rest_framework.utils.encoders import JSONEncoder
 
-from common.utils import signer, get_logger
+from common.db.utils import Encryptor
+from common.utils import get_logger
+from .signals import setting_changed
+
 
 logger = get_logger(__name__)
 
@@ -50,7 +55,7 @@ class Setting(models.Model):
         try:
             value = self.value
             if self.encrypted:
-                value = signer.unsign(value)
+                value = Encryptor(value).decrypt()
             if not value:
                 return None
             value = json.loads(value)
@@ -61,9 +66,9 @@ class Setting(models.Model):
     @cleaned_value.setter
     def cleaned_value(self, item):
         try:
-            v = json.dumps(item)
+            v = json.dumps(item, cls=JSONEncoder)
             if self.encrypted:
-                v = signer.sign(v)
+                v = Encryptor(v).encrypt()
             self.value = v
         except json.JSONDecodeError as e:
             raise ValueError("Json dump error: {}".format(str(e)))
@@ -79,14 +84,31 @@ class Setting(models.Model):
 
     @classmethod
     def refresh_item(cls, name):
-        item = cls.objects.filter(name=name).first()
+        with transaction.atomic():
+            item = cls.objects.select_for_update().filter(name=name).first()
         if not item:
             return
         item.refresh_setting()
+        setting_changed.send(sender=cls, name=name, item=item)
 
     def refresh_setting(self):
-        setattr(settings, self.name, self.cleaned_value)
+        # This limit is configured in config.yml; an old UI setting must not override it.
+        if self.name == 'APPLICATION_ACCOUNT_SCOPE_LIMIT':
+            return
+        value = self.cleaned_value
+        if self.name == 'SESSION_SAVE_EVERY_REQUEST':
+            settings.SESSION_SAVE_EVERY_REQUEST = False
+            return
+        setattr(settings, self.name, value)
+        self.refresh_ldap_timeout_if_need(value)
         self.refresh_keycloak_to_openid_if_need()
+
+    def refresh_ldap_timeout_if_need(self, value):
+        if self.name not in ('AUTH_LDAP_CONNECT_TIMEOUT', 'AUTH_LDAP_HA_CONNECT_TIMEOUT'):
+            return
+        options = getattr(settings, self.name.replace('CONNECT_TIMEOUT', 'CONNECTION_OPTIONS'))
+        # Update in place: LDAP backends may already hold this dictionary.
+        options.update({ldap.OPT_TIMEOUT: value, ldap.OPT_NETWORK_TIMEOUT: value})
 
     def refresh_keycloak_to_openid_if_need(self):
         watch_config_names = [
@@ -157,9 +179,16 @@ class Setting(models.Model):
         db_table = "settings_setting"
         verbose_name = _("System setting")
         permissions = [
+            ('change_basic', _('Can change basic setting')),
+            ('change_systemtools', _('Can change system tools setting')),
             ('change_email', _('Can change email setting')),
             ('change_auth', _('Can change auth setting')),
+            ('change_ops', _('Can change auth ops')),
+            ('change_ticket', _('Can change auth ticket')),
+            ('change_virtualapp', _('Can change virtual app setting')),
+            ('change_announcement', _('Can change auth announcement')),
             ('change_vault', _('Can change vault setting')),
+            ('change_chatai', _('Can change chat ai setting')),
             ('change_systemmsgsubscription', _('Can change system msg sub setting')),
             ('change_sms', _('Can change sms setting')),
             ('change_security', _('Can change security setting')),
@@ -169,3 +198,21 @@ class Setting(models.Model):
             ('change_terminal', _('Can change terminal setting')),
             ('change_other', _('Can change other setting')),
         ]
+
+
+def get_chat_ai_config():
+    return {
+        'base_url': settings.CHAT_AI_BASE_URL or '',
+        'api_key': settings.CHAT_AI_API_KEY or '',
+        'proxy': settings.CHAT_AI_PROXY or '',
+        'model': settings.CHAT_AI_MODEL or '',
+    }
+
+
+class LeakPasswords(models.Model):
+    id = models.AutoField(primary_key=True, verbose_name=_("ID"))
+    password = models.CharField(max_length=1024, verbose_name=_("Password"))
+
+    class Meta:
+        db_table = 'passwords'
+        managed = False

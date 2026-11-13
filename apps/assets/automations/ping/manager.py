@@ -1,11 +1,14 @@
 from assets.const import AutomationTypes, Connectivity
 from common.utils import get_logger
 from ..base.manager import BasePlaybookManager
+from ..base.report import ConnectivityReportMixin
 
 logger = get_logger(__name__)
 
 
-class PingManager(BasePlaybookManager):
+class PingManager(ConnectivityReportMixin, BasePlaybookManager):
+    ansible_account_prefer = ''
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.host_asset_and_account_mapper = {}
@@ -22,15 +25,35 @@ class PingManager(BasePlaybookManager):
         return host
 
     def on_host_success(self, host, result):
-        asset, account = self.host_asset_and_account_mapper.get(host)
-        asset.set_connectivity(Connectivity.OK)
-        if not account:
+        mapping = self.host_asset_and_account_mapper.get(host)
+        if not mapping:
+            return super().on_host_error(
+                host, 'Asset/account mapping not found', result
+            )
+        asset, account = mapping
+        try:
+            asset.set_connectivity(Connectivity.OK)
+            if account:
+                account.set_connectivity(Connectivity.OK)
+        except Exception as e:
+            super().on_host_error(host, str(e), result)
             return
-        account.set_connectivity(Connectivity.OK)
+        super().on_host_success(host, result)
 
     def on_host_error(self, host, error, result):
-        asset, account = self.host_asset_and_account_mapper.get(host)
-        asset.set_connectivity(Connectivity.ERR)
-        if not account:
+        super().on_host_error(host, error, result)
+        mapping = self.host_asset_and_account_mapper.get(host)
+        if not mapping:
             return
-        account.set_connectivity(Connectivity.ERR)
+        asset, account = mapping
+        try:
+            error_tp = asset.get_err_connectivity(error)
+            asset.set_connectivity(error_tp)
+            if not account:
+                return
+            account.set_connectivity(error_tp)
+        except Exception as e:
+            logger.warning(
+                "Save connectivity failure result failed: host=%s error=%s",
+                host, e,
+            )

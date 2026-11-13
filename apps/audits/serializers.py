@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 #
 from django.utils.translation import gettext_lazy as _
+from django.utils.text import format_lazy
 from rest_framework import serializers
 
 from audits.backends.db import OperateLogStore
 from common.serializers.fields import LabeledChoiceField, ObjectRelatedField
 from common.utils import reverse, i18n_trans
 from common.utils.timezone import as_current_tz
-from ops.serializers.job import JobExecutionSerializer
+from ops.celery import app
+from ops.serializers.job import JobExecutionSerializer, JobSerializer
 from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 from terminal.models import Session
 from users.models import User
@@ -15,20 +17,85 @@ from . import models
 from .const import (
     ActionChoices, OperateChoices,
     MFAChoices, LoginStatusChoices,
-    LoginTypeChoices, ActivityChoices,
+    LoginTypeChoices, ActivityChoices, USER_DEVICE_TYPE_CHOICES,
 )
+
+
+class ServiceAccessLogSerializer(serializers.ModelSerializer):
+    source = serializers.ChoiceField(
+        choices=[('SDK', _('SDK')), ('Agent', _('PAM Agent')),
+                 ('Administrator', _('Administrator')), ('JumpServer', _('JumpServer'))],
+        read_only=True, label=_('Source'),
+    )
+    result = serializers.ChoiceField(
+        choices=[('success', _('Success')), ('failed', _('Failed'))],
+        read_only=True, label=_('Result'),
+    )
+
+    class Meta:
+        model = models.IntegrationApplicationLog
+        fields_mini = ['id']
+        fields_small = fields_mini + ['remote_addr', 'service', 'service_id', 'asset', 'account', 'datetime']
+        fields = fields_small + [
+            'asset_id', 'account_id', 'credential_id', 'credential_key', 'instance_id',
+            'source', 'result', 'revision', 'summary',
+        ]
+        read_only_fields = fields
+        extra_kwargs = {
+            'id': {'label': _('ID')},
+            'service': {'label': _('Application')},
+            'service_id': {'label': _('Application ID')},
+            'asset_id': {'label': _('Asset ID')},
+            'account_id': {'label': format_lazy('{} ID', _('Account'))},
+            'credential_id': {'label': _('Credential ID')},
+            'instance_id': {'label': _('Instance ID')},
+            'credential_key': {'label': _('Credential key')},
+            'revision': {'label': _('Revision')},
+            'summary': {'label': _('Detail')},
+            'remote_addr': {'label': _('Remote Address')},
+            'asset': {'label': _('Asset')}, 'account': {'label': _('Account')},
+            'datetime': {'label': _('Datetime')},
+        }
 
 
 class JobLogSerializer(JobExecutionSerializer):
     class Meta:
         model = models.JobLog
         read_only_fields = [
-            "id", "material", "time_cost", 'date_start',
+            "id", "material", 'job_type', "time_cost", 'date_start',
             'date_finished', 'date_created',
-            'is_finished', 'is_success', 'created_by',
-            'task_id'
+            'is_finished', 'is_success',
+            'task_id', 'creator_name'
         ]
         fields = read_only_fields + []
+        extra_kwargs = {
+            "creator_name": {"label": _("Creator")},
+        }
+
+
+class JobsAuditSerializer(JobSerializer):
+    summary = serializers.ReadOnlyField(label=_("Summary"))
+    crontab = serializers.ReadOnlyField(label=_("Execution cycle"))
+    is_periodic_display = serializers.BooleanField(
+        read_only=True, source='is_periodic', label=_("Periodic execution")
+    )
+
+    class Meta(JobSerializer.Meta):
+        read_only_fields = [
+            "id", 'name', 'args', 'type', 'crontab', 'interval', 'date_last_run', 'summary', 'created_by',
+            'is_periodic_display'
+        ]
+        fields = read_only_fields + ['is_periodic']
+
+    def validate(self, attrs):
+        allowed_fields = {'is_periodic'}
+        submitted_fields = set(attrs.keys())
+        invalid_fields = submitted_fields - allowed_fields
+        if invalid_fields:
+            raise serializers.ValidationError(
+                _('Updating %(fields)s fields is not allowed') % {'fields': ', '.join(invalid_fields)}
+            )
+        return attrs
 
 
 class FTPLogSerializer(serializers.ModelSerializer):
@@ -40,15 +107,16 @@ class FTPLogSerializer(serializers.ModelSerializer):
         fields_small = fields_mini + [
             "user", "remote_addr", "asset", "account",
             "org_id", "operate", "filename", "date_start",
-            "is_success", "has_file",
+            "is_success", "has_file", "session"
         ]
         fields = fields_small
 
 
 class UserLoginLogSerializer(serializers.ModelSerializer):
     mfa = LabeledChoiceField(choices=MFAChoices.choices, label=_("MFA"))
-    type = LabeledChoiceField(choices=LoginTypeChoices.choices, label=_("Type"))
+    type = LabeledChoiceField(choices=LoginTypeChoices.choices, label=_("Login type"))
     status = LabeledChoiceField(choices=LoginStatusChoices.choices, label=_("Status"))
+    city = serializers.ReadOnlyField(source='city_display', label=_("Login city"))
 
     class Meta:
         model = models.UserLoginLog
@@ -64,7 +132,7 @@ class UserLoginLogSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             "user_agent": {"label": _("User agent")},
             "reason_display": {"label": _("Reason display")},
-            "backend_display": {"label": _("Authentication backend")},
+            "backend_display": {"label": _("Auth backend display")},
         }
 
 
@@ -74,10 +142,7 @@ class OperateLogActionDetailSerializer(serializers.ModelSerializer):
         fields = ('diff',)
 
     def to_representation(self, instance):
-        data = super().to_representation(instance)
-        diff = OperateLogStore.convert_diff_friendly(data['diff'])
-        data['diff'] = diff
-        return data
+        return {'diff': OperateLogStore.convert_diff_friendly(instance)}
 
 
 class OperateLogSerializer(BulkOrgResourceModelSerializer):
@@ -96,12 +161,46 @@ class OperateLogSerializer(BulkOrgResourceModelSerializer):
         fields = fields_small
 
     @staticmethod
-    def get_resource_type(instance):
-        return _(instance.resource_type)
+    def get_resource_type(instance) -> str:
+        return instance.resource_type_display
 
     @staticmethod
-    def get_resource(instance):
+    def get_resource(instance) -> str:
+        # Stored logs contain either the message ID or its English translation.
+        if instance.resource_type in ('Celery Task Execution', 'Celery task execution'):
+            task_name, separator, execution_id = instance.resource.rpartition(': ')
+            if separator and execution_id:
+                task = app.tasks.get(task_name)
+                verbose_name = getattr(task, 'verbose_name', None)
+                if verbose_name:
+                    return f'{verbose_name}: {execution_id}'
         return i18n_trans(instance.resource)
+
+
+class DiffFieldSerializer(serializers.JSONField):
+    def to_file_representation(self, value):
+        row = getattr(self, '_row') or {}
+        attrs = {'diff': value, 'resource_type': row.get('resource_type')}
+        instance = type('OperateLog', (), attrs)
+        return OperateLogStore.convert_diff_friendly(instance)
+
+
+class OperateLogFullSerializer(OperateLogSerializer):
+    diff = DiffFieldSerializer(label=_("Diff"))
+
+    class Meta(OperateLogSerializer.Meta):
+        fields = OperateLogSerializer.Meta.fields + ['diff']
+
+
+class OperateLogSyslogSerializer(OperateLogSerializer):
+    diff = serializers.SerializerMethodField(label=_("Diff"))
+
+    class Meta(OperateLogSerializer.Meta):
+        fields = OperateLogSerializer.Meta.fields + ['diff']
+
+    @staticmethod
+    def get_diff(instance):
+        return OperateLogStore.convert_diff_friendly(instance)
 
 
 class PasswordChangeLogSerializer(serializers.ModelSerializer):
@@ -124,20 +223,20 @@ class ActivityUnionLogSerializer(serializers.Serializer):
     r_type = serializers.CharField(read_only=True)
 
     @staticmethod
-    def get_timestamp(obj):
+    def get_timestamp(obj) -> str:
         return as_current_tz(obj['datetime']).strftime('%Y-%m-%d %H:%M:%S')
 
     @staticmethod
-    def get_content(obj):
+    def get_content(obj) -> str:
         if not obj['r_detail']:
             action = obj['r_action'].replace('_', ' ').capitalize()
-            ctn = _('User %s %s this resource') % (obj['r_user'], _(action))
+            ctn = _('%s %s this resource') % (obj['r_user'], _(action).lower())
         else:
             ctn = i18n_trans(obj['r_detail'])
         return ctn
 
     @staticmethod
-    def get_detail_url(obj):
+    def get_detail_url(obj) -> str:
         detail_url = ''
         detail_id, obj_type = obj['r_detail_id'], obj['r_type']
         if not detail_id:
@@ -165,26 +264,38 @@ class ActivityUnionLogSerializer(serializers.Serializer):
 class FileSerializer(serializers.Serializer):
     file = serializers.FileField(allow_empty_file=True)
 
+    class Meta:
+        ref_name = 'AuditFileSerializer'
+
 
 class UserSessionSerializer(serializers.ModelSerializer):
-    type = LabeledChoiceField(choices=LoginTypeChoices.choices, label=_("Type"))
+    type = LabeledChoiceField(choices=USER_DEVICE_TYPE_CHOICES, label=_("Type"))
+    is_locked = serializers.BooleanField(read_only=True, default=False, label=_("Locked"))
     user = ObjectRelatedField(required=False, queryset=User.objects, label=_('User'))
+    date_expired = serializers.DateTimeField(format="%Y/%m/%d %H:%M:%S", label=_('Date expired'))
     is_current_user_session = serializers.SerializerMethodField()
+    session_policy = serializers.JSONField(read_only=True, default=None, label=_('Session policy'))
+    city = serializers.ReadOnlyField(source='city_display', label=_("Login city"))
 
     class Meta:
         model = models.UserSession
         fields_mini = ['id']
         fields_small = fields_mini + [
             'type', 'ip', 'city', 'user_agent', 'user', 'is_current_user_session',
-            'backend', 'backend_display', 'date_created', 'date_expired'
+            'backend', 'backend_display', 'is_active', 'is_locked', 'date_created', 'date_expired', 'session_policy'
         ]
         fields = fields_small
         extra_kwargs = {
-            "backend_display": {"label": _("Authentication backend")},
+            "backend_display": {"label": _("Auth backend display")},
         }
 
-    def get_is_current_user_session(self, obj):
+    def get_is_current_user_session(self, obj) -> bool:
         request = self.context.get('request')
         if not request:
             return False
+        if isinstance(obj, dict):
+            if obj['type'] == 'C':
+                session = getattr(request, 'client_login_session', None)
+                return session is not None and session.pk == obj['id']
+            return request.session.session_key == obj['key']
         return request.session.session_key == obj.key

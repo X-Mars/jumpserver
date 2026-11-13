@@ -1,65 +1,20 @@
-from rest_framework.response import Response
-from rest_framework import status
-from django.utils import translation
-from django.utils.translation import gettext_noop
-
+from accounts.const import AuditEvent
+from accounts.credential_client.audit import ApplicationAuditContext
+from accounts.credential_client.manager import CredentialClientManager
+from accounts.models import CredentialClientInstance
 from audits.const import ActionChoices
-from common.views.mixins import RecordViewLogMixin
-from common.utils import i18n_fmt
+from audits.handler import create_or_update_operate_log
+from django.db.models import Model
+from django.utils import translation
+from rest_framework import status
+from rest_framework.response import Response
+
+from common.utils import get_request_ip
 
 
-class AccountRecordViewLogMixin(RecordViewLogMixin):
+class AccountRecordViewLogMixin(object):
     get_object: callable
-    get_queryset: callable
-
-    @staticmethod
-    def _filter_params(params):
-        new_params = {}
-        need_pop_params = ('format', 'order')
-        for key, value in params.items():
-            if key in need_pop_params:
-                continue
-            if isinstance(value, list):
-                value = list(filter(None, value))
-            if value:
-                new_params[key] = value
-        return new_params
-
-    def get_resource_display(self, request):
-        query_params = dict(request.query_params)
-        params = self._filter_params(query_params)
-
-        spm_filter = params.pop("spm", None)
-
-        if not params and not spm_filter:
-            display_message = gettext_noop("Export all")
-        elif spm_filter:
-            display_message = gettext_noop("Export only selected items")
-        else:
-            query = ",".join(
-                ["%s=%s" % (key, value) for key, value in params.items()]
-            )
-            display_message = i18n_fmt(gettext_noop("Export filtered: %s"), query)
-        return display_message
-
-    @property
-    def detail_msg(self):
-        return i18n_fmt(
-            gettext_noop('User %s view/export secret'), self.request.user
-        )
-
-    def list(self, request, *args, **kwargs):
-        list_func = getattr(super(), 'list')
-        if not callable(list_func):
-            return Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
-        response = list_func(request, *args, **kwargs)
-        with translation.override('en'):
-            resource_display = self.get_resource_display(request)
-            ids = [q.id for q in self.get_queryset()]
-            self.record_logs(
-                ids, ActionChoices.view, self.detail_msg, resource_display=resource_display
-            )
-        return response
+    model: Model
 
     def retrieve(self, request, *args, **kwargs):
         retrieve_func = getattr(super(), 'retrieve')
@@ -67,9 +22,79 @@ class AccountRecordViewLogMixin(RecordViewLogMixin):
             return Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
         response = retrieve_func(request, *args, **kwargs)
         with translation.override('en'):
-            resource = self.get_object()
-            self.record_logs(
-                [resource.id], ActionChoices.view, self.detail_msg, resource=resource
+            create_or_update_operate_log(
+                ActionChoices.view, self.model._meta.verbose_name,
+                force=True, resource=self.get_object(),
             )
         return response
 
+
+class ApplicationAuditMixin:
+    client_audit_events = {}
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        event = self.client_audit_events.get(self.action)
+        if event:
+            self.start_client_audit(event, track_fetch=event == AuditEvent.CREDENTIAL_FETCHED)
+
+    def start_audit(self, event, **values):
+        context = ApplicationAuditContext(event=event, values=values)
+        self.request._request.application_audit = context
+        return context
+
+    def get_client_manager(self, data):
+        context = getattr(self.request._request, 'application_audit', None)
+        if context is not None:
+            context.set_request_data(data)
+        return CredentialClientManager(
+            self.request.user, instance_id=data.get('instance_id', ''),
+            audit_context=context,
+            client_type=('agent' if self.request.headers.get('X-Source') == 'jms-pam-agent' else 'sdk'),
+            enroll_rotation=getattr(self, 'action', None) not in {
+                'application', 'client', 'policies', 'policy', 'accounts', 'report_status',
+            } and not (getattr(self, 'action', None) == 'credential' and data.get('account_id')),
+        )
+
+    def start_client_audit(self, event, track_fetch=False):
+        user = self.request.user
+        params = self.request.query_params
+        if isinstance(user, CredentialClientInstance):
+            context = self.start_audit(event, client=user)
+            application = user.application
+            client_type = user.type
+            instance_id = user.instance_id
+        else:
+            context = self.start_audit(event, application=user)
+            application = user
+            client_type = 'agent' if self.request.headers.get('X-Source') == 'jms-pam-agent' else 'sdk'
+            instance_id = params.get('instance_id', '')
+
+        if track_fetch:
+            # An SDK instance created by a failed first fetch is rolled back; its PK is not stable.
+            context.fetch_identity = [
+                str(application.org_id), str(application.id), client_type,
+                instance_id, params.get('key', ''),
+                params.get('account_id', ''), get_request_ip(self.request),
+            ]
+        return context
+
+    def handle_exception(self, exc):
+        context = getattr(self.request._request, 'application_audit', None)
+        if context is not None and hasattr(exc, 'get_codes'):
+            codes = exc.get_codes()
+            while isinstance(codes, (dict, list)) and codes:
+                if isinstance(codes, dict):
+                    codes = next(iter(codes.values()))
+                else:
+                    codes = codes[0]
+            if isinstance(codes, str):
+                context.error_code = codes[:128]
+        return super().handle_exception(exc)
+
+    def get_object(self):
+        instance = super().get_object()
+        if self.request.method != 'GET':
+            from accounts.credential_client.audit_signals import get_audit_context
+            self.start_audit(AuditEvent.CONFIGURATION_UPDATED, **get_audit_context(instance))
+        return instance

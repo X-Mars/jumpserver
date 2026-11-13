@@ -4,10 +4,11 @@
 from smtplib import SMTPSenderRefused
 
 from django.conf import settings
-from django.core.mail import send_mail, get_connection
+from django.core.mail import send_mail
 from django.utils.translation import gettext_lazy as _
 from rest_framework.views import Response, APIView
 
+from common.tasks import get_email_connection as get_connection
 from common.utils import get_logger
 from .. import serializers
 
@@ -43,7 +44,7 @@ class MailTestingAPI(APIView):
         #         setattr(settings, k, v)
         try:
             subject = settings.EMAIL_SUBJECT_PREFIX or '' + "Test"
-            message = "Test smtp setting"
+            message = _("Test smtp setting")
             email_from = email_from or email_host_user
             email_recipient = email_recipient or email_from
             connection = get_connection(

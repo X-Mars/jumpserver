@@ -4,30 +4,43 @@ from rest_framework import serializers
 
 from accounts.const import SecretType
 from accounts.models import BaseAccount
-from accounts.utils import validate_password_for_ansible, validate_ssh_key
+from accounts.utils import (
+    validate_account_username, validate_password_for_ansible, validate_ssh_key
+)
+from common.serializers import ResourceLabelsMixin
 from common.serializers.fields import EncryptedField, LabeledChoiceField
 from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 
-__all__ = ['AuthValidateMixin', 'BaseAccountSerializer']
+__all__ = ["AuthValidateMixin", "BaseAccountSerializer"]
 
 
 class AuthValidateMixin(serializers.Serializer):
     secret_type = LabeledChoiceField(
-        choices=SecretType.choices, label=_('Secret type'), default='password'
+        choices=SecretType.choices, label=_("Secret type"), default="password"
     )
     secret = EncryptedField(
-        label=_('Secret'), required=False, max_length=40960, allow_blank=True,
-        allow_null=True, write_only=True,
+        label=_("Secret"),
+        required=False,
+        max_length=40960,
+        allow_blank=True,
+        allow_null=True,
+        write_only=True,
     )
     passphrase = serializers.CharField(
-        allow_blank=True, allow_null=True, required=False, max_length=512,
-        write_only=True, label=_('Key password')
+        allow_blank=True,
+        allow_null=True,
+        required=False,
+        max_length=512,
+        write_only=True,
+        label=_("Passphrase"),
     )
 
     @staticmethod
     def handle_secret(secret, secret_type, passphrase=None):
+        if secret_type == SecretType.SSH_CERTIFICATE:
+            return ""
         if not secret:
-            return ''
+            return ""
         if secret_type == SecretType.PASSWORD:
             validate_password_for_ansible(secret)
             return secret
@@ -38,18 +51,47 @@ class AuthValidateMixin(serializers.Serializer):
         else:
             return secret
 
-    def clean_auth_fields(self, validated_data):
-        secret_type = validated_data.get('secret_type')
-        passphrase = validated_data.get('passphrase')
-        secret = validated_data.pop('secret', None)
-        validated_data['secret'] = self.handle_secret(
-            secret, secret_type, passphrase
+    def validate_dynamic_credential(self, attrs):
+        instance = getattr(self, 'instance', None)
+        secret_type = attrs.get(
+            'secret_type', getattr(instance, 'secret_type', None)
         )
-        for field in ('secret',):
+        if secret_type != SecretType.SSH_CERTIFICATE:
+            return attrs
+        if 'su_from' in self.fields:
+            attrs['su_from'] = None
+        if 'su_from_username' in attrs:
+            attrs['su_from_username'] = ''
+        if attrs.get('push_now') or attrs.get('auto_push'):
+            raise serializers.ValidationError({
+                'secret_type': _(
+                    'SSH certificate accounts cannot push or rotate credentials'
+                )
+            })
+        if 'secret_reset' in self.fields:
+            attrs['secret_reset'] = False
+        return attrs
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        return self.validate_dynamic_credential(attrs)
+
+    def clean_auth_fields(self, validated_data):
+        secret_type = validated_data.get("secret_type")
+        if secret_type == SecretType.SSH_CERTIFICATE:
+            # Explicitly remove credentials left by a previous static auth
+            # type when an existing account is switched to certificate auth.
+            validated_data["secret"] = ""
+            validated_data.pop("passphrase", None)
+            return
+        passphrase = validated_data.get("passphrase")
+        secret = validated_data.pop("secret", None)
+        validated_data["secret"] = self.handle_secret(secret, secret_type, passphrase)
+        for field in ("secret",):
             value = validated_data.get(field)
             if not value:
                 validated_data.pop(field, None)
-        validated_data.pop('passphrase', None)
+        validated_data.pop("passphrase", None)
 
     def create(self, validated_data):
         self.clean_auth_fields(validated_data)
@@ -60,24 +102,33 @@ class AuthValidateMixin(serializers.Serializer):
         return super().update(instance, validated_data)
 
 
-class BaseAccountSerializer(AuthValidateMixin, BulkOrgResourceModelSerializer):
+class BaseAccountSerializer(
+    AuthValidateMixin, ResourceLabelsMixin, BulkOrgResourceModelSerializer
+):
+    spec_info = serializers.DictField(label=_('Spec info'), read_only=True)
+
+    @staticmethod
+    def validate_username(value):
+        return validate_account_username(value)
 
     class Meta:
         model = BaseAccount
-        fields_mini = ['id', 'name', 'username']
+        fields_mini = ["id", "name", "username"]
         fields_small = fields_mini + [
-            'secret_type', 'secret', 'passphrase',
-            'privileged', 'is_active', 'spec_info',
+            "secret_type", "secret", "passphrase",
+            "privileged", "is_active",
         ]
-        fields_other = ['created_by', 'date_created', 'date_updated', 'comment']
-        fields = fields_small + fields_other
+        fields_other = ["created_by", "date_created", "date_updated", "comment"]
+        fields = fields_small + fields_other + ["labels"]
         read_only_fields = [
-            'spec_info', 'date_verified', 'created_by', 'date_created',
+            "spec_info", "created_by", "date_created",
         ]
         extra_kwargs = {
-            'spec_info': {'label': _('Spec info')},
-            'username': {'help_text': _(
-                "Tip: If no username is required for authentication, fill in `null`, "
-                "If AD account, like `username@domain`"
-            )},
+            "spec_info": {"label": _("Spec info")},
+            "username": {
+                "help_text": _(
+                    "* If no username is required for authentication, enter null.  "
+                    "For AD accounts, use the format username@domain."
+                )
+            },
         }

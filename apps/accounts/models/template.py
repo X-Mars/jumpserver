@@ -2,14 +2,18 @@ from django.db import models
 from django.db.models import Count, Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from rest_framework.exceptions import ValidationError
 
+from accounts.const import SecretStrategy, Source
+
+from labels.mixins import LabeledMixin
 from .account import Account
 from .base import BaseAccount, SecretWithRandomMixin
 
 __all__ = ['AccountTemplate', ]
 
 
-class AccountTemplate(BaseAccount, SecretWithRandomMixin):
+class AccountTemplate(LabeledMixin, BaseAccount, SecretWithRandomMixin):
     su_from = models.ForeignKey(
         'self', related_name='su_to', null=True,
         on_delete=models.SET_NULL, verbose_name=_("Su from")
@@ -28,7 +32,6 @@ class AccountTemplate(BaseAccount, SecretWithRandomMixin):
         )
         permissions = [
             ('view_accounttemplatesecret', _('Can view asset account template secret')),
-            ('change_accounttemplatesecret', _('Can change asset account template secret')),
         ]
 
     def __str__(self):
@@ -43,14 +46,9 @@ class AccountTemplate(BaseAccount, SecretWithRandomMixin):
     def get_su_from_account(self, asset):
         su_from = self.su_from
         if su_from and asset.platform.su_enabled:
-            account = asset.accounts.filter(
-                username=su_from.username,
-                secret_type=su_from.secret_type
-            ).first()
-            return account
+            return asset.find_account(su_from.username, su_from.secret_type)
 
-    @staticmethod
-    def bulk_update_accounts(accounts, data):
+    def bulk_update_accounts(self, accounts):
         history_model = Account.history.model
         account_ids = accounts.values_list('id', flat=True)
         history_accounts = history_model.objects.filter(id__in=account_ids)
@@ -63,8 +61,7 @@ class AccountTemplate(BaseAccount, SecretWithRandomMixin):
         for account in accounts:
             account_id = str(account.id)
             account.version = account_id_count_map.get(account_id) + 1
-            for k, v in data.items():
-                setattr(account, k, v)
+            account.secret = self.get_secret()
         Account.objects.bulk_update(accounts, ['version', 'secret'])
 
     @staticmethod
@@ -86,7 +83,26 @@ class AccountTemplate(BaseAccount, SecretWithRandomMixin):
 
     def bulk_sync_account_secret(self, accounts, user_id):
         """ 批量同步账号密码 """
-        if not accounts:
-            return
-        self.bulk_update_accounts(accounts, {'secret': self.secret})
+        self.bulk_update_accounts(accounts)
         self.bulk_create_history_accounts(accounts, user_id)
+
+    def save(self, *args, **kwargs):
+        previous = None
+        if not self._state.adding:
+            previous = type(self).objects.filter(pk=self.pk).first()
+        if previous and previous.secret_type != self.secret_type:
+            if Account.objects.filter(
+                org_id=self.org_id, source=Source.TEMPLATE,
+                source_id=str(self.pk), follow_template=True,
+            ).exists():
+                raise ValidationError({'secret_type': _('Disable account template following before changing the secret type.')})
+        generation_fields = ('secret_strategy', 'secret_type', 'password_rules')
+        generate = self.secret_strategy != SecretStrategy.custom and (
+            previous is None or any(getattr(previous, f) != getattr(self, f) for f in generation_fields)
+        )
+        if generate:
+            self.__dict__.pop('secret_generator', None)
+            self.secret = self.get_secret()
+            if kwargs.get('update_fields') is not None:
+                kwargs['update_fields'] = list(set(kwargs['update_fields']) | {'_secret'})
+        super().save(*args, **kwargs)

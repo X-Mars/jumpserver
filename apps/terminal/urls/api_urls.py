@@ -12,7 +12,6 @@ app_name = 'terminal'
 router = BulkRouter()
 router.register(r'sessions', api.SessionViewSet, 'session')
 router.register(r'terminals/((?P<terminal>[^/.]{36})/)?status', api.StatusViewSet, 'terminal-status')
-router.register(r'terminals/((?P<terminal>[^/.]{36})/)?sessions', api.SessionViewSet, 'terminal-sessions')
 router.register(r'terminals', api.TerminalViewSet, 'terminal')
 router.register(r'tasks', api.TaskViewSet, 'tasks')
 router.register(r'commands', api.CommandViewSet, 'command')
@@ -29,7 +28,12 @@ router.register(r'applet-hosts/((?P<host>[^/.]+)/)?applets', api.AppletHostApple
 router.register(r'applet-hosts', api.AppletHostViewSet, 'applet-host')
 router.register(r'applet-publications', api.AppletPublicationViewSet, 'applet-publication')
 router.register(r'applet-host-deployments', api.AppletHostDeploymentViewSet, 'applet-host-deployment')
-router.register(r'db-listen-ports', api.DBListenPortViewSet, 'db-listen-ports')
+router.register(r'virtual-apps', api.VirtualAppViewSet, 'virtual-app')
+router.register(r'app-providers', api.AppProviderViewSet, 'app-provider')
+router.register(r'app-provider-deployments', api.AppProviderDeploymentViewSet, 'app-provider-deployment')
+router.register(r'app-providers/((?P<provider>[^/.]+)/)?accounts', api.AppProviderAccountViewSet, 'app-provider-account')
+router.register(r'app-providers/((?P<provider>[^/.]+)/)?apps', api.AppProviderAppViewSet, 'app-provider-app')
+router.register(r'virtual-app-publications', api.VirtualAppPublicationViewSet, 'virtual-app-publication')
 
 urlpatterns = [
     path('my-sessions/', api.MySessionAPIView.as_view(), name='my-session'),
@@ -39,6 +43,9 @@ urlpatterns = [
     path('sessions/<uuid:pk>/replay/',
          api.SessionReplayViewSet.as_view({'get': 'retrieve', 'post': 'create'}),
          name='session-replay'),
+    path('sessions/<uuid:pk>/replay-index/',
+         api.SessionReplayViewSet.as_view({'get': 'index'}),
+         name='session-replay-index'),
     path('tasks/kill-session/', api.KillSessionAPI.as_view(), name='kill-session'),
     path('tasks/kill-session-for-ticket/', api.KillSessionForTicketAPI.as_view(), name='kill-session-for-ticket'),
     path('terminals/config/', api.TerminalConfig.as_view(), name='terminal-config'),
@@ -50,6 +57,8 @@ urlpatterns = [
     # components
     path('components/metrics/', api.ComponentsMetricsAPIView.as_view(), name='components-metrics'),
     path('components/connect-methods/', api.ConnectMethodListApi.as_view(), name='connect-methods'),
+    path('loki/logs/', api.LokiLogAPI.as_view(), name='loki-logs'),
+    path('encrypted-config/', api.EncryptedTerminalConfig.as_view(), name='encrypted-terminal-config'),
 ]
 
 urlpatterns += router.urls

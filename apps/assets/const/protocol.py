@@ -22,11 +22,13 @@ class Protocol(ChoicesMixin, models.TextChoices):
     oracle = 'oracle', 'Oracle'
     postgresql = 'postgresql', 'PostgreSQL'
     sqlserver = 'sqlserver', 'SQLServer'
+    db2 = 'db2', 'DB2'
+    dameng = 'dameng', 'Dameng'
     clickhouse = 'clickhouse', 'ClickHouse'
     redis = 'redis', 'Redis'
     mongodb = 'mongodb', 'MongoDB'
 
-    k8s = 'k8s', 'K8S'
+    k8s = 'k8s', 'K8s'
     http = 'http', 'HTTP(s)'
 
     chatgpt = 'chatgpt', 'ChatGPT'
@@ -36,11 +38,25 @@ class Protocol(ChoicesMixin, models.TextChoices):
         return {
             cls.ssh: {
                 'port': 22,
-                'secret_types': ['password', 'ssh_key'],
+                'secret_types': ['password', 'ssh_key', 'ssh_certificate'],
+                'setting': {
+                    'old_ssh_version': {
+                        'type': 'bool',
+                        'default': False,
+                        'label': _('Old SSH version'),
+                        'help_text': _('Old SSH version like openssh 5.x or 6.x')
+                    },
+                    'nc': {
+                        'type': 'bool',
+                        'default': False,
+                        'label': 'Netcat (nc)',
+                        'help_text': _('Netcat help text')
+                    }
+                }
             },
             cls.sftp: {
                 'port': 22,
-                'secret_types': ['password', 'ssh_key'],
+                'secret_types': ['password', 'ssh_key', 'ssh_certificate'],
                 'setting': {
                     'sftp_home': {
                         'type': 'str',
@@ -70,7 +86,18 @@ class Protocol(ChoicesMixin, models.TextChoices):
                         'choices': [('any', _('Any')), ('rdp', 'RDP'), ('tls', 'TLS'), ('nla', 'NLA')],
                         'default': 'any',
                         'label': _('Security'),
-                        'help_text': _("Security layer to use for the connection")
+                        'help_text': _("Security layer to use for the connection:<br>"
+                                       "Any<br>"
+                                       "Automatically select the security mode based on the security protocols "
+                                       "supported by both the client and the server<br>"
+                                       "RDP<br>"
+                                       "Legacy RDP encryption. This mode is generally only used for older Windows "
+                                       "servers or in cases where a standard Windows login screen is desired<br>"
+                                       "TLS<br>"
+                                       "RDP authentication and encryption implemented via TLS.<br>"
+                                       "NLA<br>"
+                                       "This mode uses TLS encryption and requires the username and password "
+                                       "to be given in advance")
                     },
                     'ad_domain': {
                         'type': 'str',
@@ -112,10 +139,21 @@ class Protocol(ChoicesMixin, models.TextChoices):
                 'port': 5985,
                 'secret_types': ['password'],
                 'setting': {
+                    'file_transfer_root': {
+                        'type': 'str',
+                        'default': 'home',
+                        'label': _('WinRM file transfer root'),
+                        'help_text': _('Absolute Windows directory; home uses the connected account home directory.'),
+                    },
                     'use_ssl': {
                         'type': 'bool',
                         'default': False,
                         'label': _('Use SSL')
+                    },
+                    'allow_invalid_cert': {
+                        'type': 'bool',
+                        'default': False,
+                        'label': _('Allow invalid certificate'),
                     },
                 }
             },
@@ -153,6 +191,15 @@ class Protocol(ChoicesMixin, models.TextChoices):
                         'label': _('SYSDBA'),
                         'help_text': _('Connect as SYSDBA')
                     },
+                    'change_secret_with_old_password': {
+                        'type': 'bool',
+                        'default': False,
+                        'label': _('Use old password when changing password'),
+                        'help_text': _(
+                            'Use the currently managed password in the Oracle '
+                            'REPLACE clause when changing passwords'
+                        )
+                    },
                 }
             },
             cls.sqlserver: {
@@ -167,8 +214,26 @@ class Protocol(ChoicesMixin, models.TextChoices):
                         'default': '>=2014',
                         'label': _('Version'),
                         'help_text': _('SQL Server version, Different versions have different connection drivers')
+                    },
+                    'encrypt': {
+                        'type': 'bool',
+                        'default': True,
+                        'label': _('Encrypt'),
+                        'help_text': _('Whether to use TLS encryption.')
                     }
                 }
+            },
+            cls.db2: {
+                'port': 50000,
+                'required': True,
+                'secret_types': ['password'],
+                'xpack': True,
+            },
+            cls.dameng: {
+                'port': 5236,
+                'required': True,
+                'secret_types': ['password'],
+                'xpack': True,
             },
             cls.clickhouse: {
                 'port': 9000,
@@ -180,6 +245,20 @@ class Protocol(ChoicesMixin, models.TextChoices):
                 'port': 27017,
                 'required': True,
                 'secret_types': ['password'],
+                'setting': {
+                    'auth_source': {
+                        'type': 'str',
+                        'default': 'admin',
+                        'label': _('Auth source'),
+                        'help_text': _('The database to authenticate against')
+                    },
+                    'connection_options': {
+                        'type': 'str',
+                        'default': '',
+                        'label': _('Connect options'),
+                        'help_text': _('The connection specific options eg. retryWrites=false&retryReads=false')
+                    }
+                }
             },
             cls.redis: {
                 'port': 6379,
@@ -190,6 +269,12 @@ class Protocol(ChoicesMixin, models.TextChoices):
                         'type': 'bool',
                         'default': False,
                         'label': _('Auth username')
+                    },
+                    'enable_cluster_mode': {
+                        'type': 'bool',
+                        'default': False,
+                        'label': _('Enable cluster mode'),
+                        'help_text': _('Enable if this Redis instance is part of a cluster')
                     },
                 }
             },
@@ -203,11 +288,19 @@ class Protocol(ChoicesMixin, models.TextChoices):
                 'port_from_addr': True,
                 'required': True,
                 'secret_types': ['token'],
+                'setting': {
+                    'namespace': {
+                        'type': 'str',
+                        'required': False,
+                        'default': '',
+                        'label': _('Namespace')
+                    }
+                }
             },
             cls.http: {
                 'port': 80,
                 'port_from_addr': True,
-                'secret_types': ['password'],
+                'secret_types': ['password', 'access_key'],
                 'setting': {
                     'safe_mode': {
                         'type': 'bool',
@@ -239,6 +332,23 @@ class Protocol(ChoicesMixin, models.TextChoices):
                         'default': 'type=submit',
                         'label': _('Submit selector')
                     },
+                    'interactive_selector': {
+                        'type': 'str',
+                        'required': False,
+                        'default': '',
+                        'label': _('Interactive selector'),
+                        'help_text': _('Optional interactive verification area, e.g. css=#mfa-dialog. Exclude credentials and password visibility controls.')
+                    },
+                    'success_selector': {
+                        'type': 'str',
+                        'required': False,
+                        'default': '',
+                        'label': _('Success selector'),
+                        'help_text': _(
+                            'Selector for an element that appears only after a successful login, e.g. css=#dashboard. '
+                            'Required for basic autofill.'
+                        )
+                    },
                     'script': {
                         'type': 'text',
                         'default': [],
@@ -259,22 +369,17 @@ class Protocol(ChoicesMixin, models.TextChoices):
                 'setting': {
                     'api_mode': {
                         'type': 'choice',
-                        'default': 'gpt-3.5-turbo',
+                        'default': 'gpt-4o-mini',
                         'label': _('API mode'),
                         'choices': [
-                            ('gpt-3.5-turbo', 'GPT-3.5 Turbo'),
-                            ('gpt-3.5-turbo-16k', 'GPT-3.5 Turbo 16K'),
+                            ('gpt-4o-mini', 'GPT-4o-mini'),
+                            ('gpt-4o', 'GPT-4o'),
+                            ('gpt-4-turbo', 'GPT-4 Turbo'),
                         ]
                     }
                 }
             }
         }
-        if settings.XPACK_ENABLED:
-            choices = protocols[cls.chatgpt]['setting']['api_mode']['choices']
-            choices.extend([
-                ('gpt-4', 'GPT-4'),
-                ('gpt-4-32k', 'GPT-4 32K'),
-            ])
         return protocols
 
     @classmethod
@@ -289,10 +394,34 @@ class Protocol(ChoicesMixin, models.TextChoices):
 
     @classmethod
     @cached_method(ttl=600)
+    def protocols(cls):
+        protocols = []
+        xpack_enabled = settings.XPACK_ENABLED
+        for protocol, config in cls.settings().items():
+            if not xpack_enabled and config.get('xpack', False):
+                continue
+            protocols.append({'label': protocol.label, 'value': protocol.value})
+
+        from assets.models.platform import PlatformProtocol
+        custom_protocols = (
+            PlatformProtocol.objects
+            .filter(platform__category='custom')
+            .values_list('name', flat=True)
+            .distinct()
+        )
+        for protocol in custom_protocols:
+            if protocol not in protocols:
+                if not protocol:
+                    continue
+                label = protocol[0].upper() + protocol[1:]
+                protocols.append({'label': label, 'value': protocol})
+        return protocols
+
+    @classmethod
+    @cached_method(ttl=600)
     def xpack_protocols(cls):
         return [
-            protocol
-            for protocol, config in cls.settings().items()
+            protocol for protocol, config in cls.settings().items()
             if config.get('xpack', False)
         ]
 

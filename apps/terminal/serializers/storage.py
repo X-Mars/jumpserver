@@ -2,6 +2,7 @@
 #
 from urllib.parse import urlparse
 
+from django.core.validators import MaxValueValidator, MinValueValidator, validate_ipv46_address
 from django.db.models import TextChoices
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
@@ -29,7 +30,7 @@ class ReplayStorageTypeBaseSerializer(serializers.Serializer):
     )
     ACCESS_KEY = serializers.CharField(
         max_length=1024, required=False, allow_blank=True,
-        label=_('Access key id'), allow_null=True,
+        label=_('Access key ID'), allow_null=True,
     )
     SECRET_KEY = EncryptedField(
         max_length=1024, required=False, allow_blank=True,
@@ -118,6 +119,40 @@ class ReplayStorageTypeAzureSerializer(serializers.Serializer):
     )
 
 
+class SftpSecretType(TextChoices):
+    PASSWORD = 'password', _('Password')
+    SSH_KEY = 'ssh_key', _('SSH key')
+
+
+class ReplayStorageTypeSFTPSerializer(serializers.Serializer):
+    SFTP_HOST = serializers.CharField(
+        required=True, max_length=1024, label=_('HOST'), validators=[validate_ipv46_address]
+    )
+    SFTP_PORT = serializers.IntegerField(
+        required=False, default=22, validators=[MaxValueValidator(65535), MinValueValidator(0)],
+        label=_('Port')
+    )
+    SFTP_USERNAME = serializers.CharField(
+        required=True, max_length=1024, label=_('Username')
+    )
+    STP_SECRET_TYPE = serializers.ChoiceField(choices=SftpSecretType.choices,
+                                              default=SftpSecretType.PASSWORD,
+                                              label=_('Secret type'))
+    SFTP_PASSWORD = EncryptedField(
+        allow_blank=True, allow_null=True, required=False, max_length=1024, label=_('Password')
+    )
+    STP_PRIVATE_KEY = serializers.CharField(
+        allow_blank=True, allow_null=True, required=False, max_length=4096,
+        write_only=True, label=_('Private key')
+    )
+    STP_PASSPHRASE = EncryptedField(
+        allow_blank=True, allow_null=True, required=False, max_length=1024, label=_('Passphrase')
+    )
+    SFTP_ROOT_PATH = serializers.CharField(
+        required=True, max_length=1024, label=_('SFTP Root')
+    )
+
+
 # mapping
 replay_storage_type_serializer_classes_mapping = {
     const.ReplayStorageType.s3.value: ReplayStorageTypeS3Serializer,
@@ -126,7 +161,8 @@ replay_storage_type_serializer_classes_mapping = {
     const.ReplayStorageType.oss.value: ReplayStorageTypeOSSSerializer,
     const.ReplayStorageType.azure.value: ReplayStorageTypeAzureSerializer,
     const.ReplayStorageType.obs.value: ReplayStorageTypeOBSSerializer,
-    const.ReplayStorageType.cos.value: ReplayStorageTypeCOSSerializer
+    const.ReplayStorageType.cos.value: ReplayStorageTypeCOSSerializer,
+    const.ReplayStorageType.sftp.value: ReplayStorageTypeSFTPSerializer
 }
 
 
@@ -152,20 +188,19 @@ def command_storage_es_host_format_validator(host):
 
 
 class CommandStorageTypeESSerializer(serializers.Serializer):
-    hosts_help_text = '''
-        Tip: If there are multiple hosts, use a comma (,) to separate them. <br>
-        (eg: http://www.jumpserver.a.com:9100, http://www.jumpserver.b.com:9100)
-    '''
     HOSTS = serializers.ListField(
         child=serializers.CharField(validators=[command_storage_es_host_format_validator]),
-        label=_('Hosts'), help_text=_(hosts_help_text), allow_null=True
+        label=_('Hosts'), help_text=_(
+            'If there are multiple hosts, use a comma (,) to separate them. <br>'
+            '(For example: http://www.jumpserver.a.com:9100, http://www.jumpserver.b.com:9100)'),
+        allow_null=True
     )
     INDEX_BY_DATE = serializers.BooleanField(
         default=False, label=_('Index by date'),
         help_text=_('Whether to create an index by date')
     )
     INDEX = serializers.CharField(
-        max_length=1024, default='jumpserver', label=_('Index'), allow_null=True
+        max_length=1024, default='pam', label=_('Index'), allow_null=True
     )
     DOC_TYPE = ReadableHiddenField(default='_doc', label=_('Doc type'), allow_null=True)
     IGNORE_VERIFY_CERTS = serializers.BooleanField(
@@ -216,6 +251,16 @@ class BaseStorageSerializer(serializers.ModelSerializer):
             serializer = serializer_class
         return serializer
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        need_translate_comments = {
+            'Store locally': _('Store locally'),
+            'Do not save': _('Do not save')
+        }
+        comment = instance.comment
+        data['comment'] = need_translate_comments.get(comment, comment)
+        return data
+
     def save(self, **kwargs):
         instance = super().save(**kwargs)
         if self.validated_data.get('is_default', False):
@@ -223,7 +268,21 @@ class BaseStorageSerializer(serializers.ModelSerializer):
         return instance
 
 
-# CommandStorageSerializer
+meta_is_default = {
+    'help_text': _(
+        'set as the default storage, will make new Component use the current '
+        'storage by default, without affecting existing Component'
+    )
+}
+
+
+# Command storage serializers
+class CommandStorageTreeMetricsSerializer(serializers.Serializer):
+    node_ids = serializers.ListField(
+        child=serializers.UUIDField(), allow_empty=False, max_length=200
+    )
+
+
 class CommandStorageSerializer(BaseStorageSerializer):
     type = LabeledChoiceField(choices=const.CommandStorageType.choices, label=_('Type'))
     storage_type_serializer_classes_mapping = command_storage_type_serializer_classes_mapping
@@ -231,7 +290,8 @@ class CommandStorageSerializer(BaseStorageSerializer):
     class Meta(BaseStorageSerializer.Meta):
         model = CommandStorage
         extra_kwargs = {
-            'name': {'validators': [UniqueValidator(queryset=CommandStorage.objects.all())]}
+            'name': {'validators': [UniqueValidator(queryset=CommandStorage.objects.all())]},
+            'is_default': meta_is_default
         }
 
 
@@ -243,5 +303,13 @@ class ReplayStorageSerializer(BaseStorageSerializer):
     class Meta(BaseStorageSerializer.Meta):
         model = ReplayStorage
         extra_kwargs = {
-            'name': {'validators': [UniqueValidator(queryset=ReplayStorage.objects.all())]}
+            'name': {'validators': [UniqueValidator(queryset=ReplayStorage.objects.all())]},
+            'is_default': meta_is_default
         }
+
+    def validate_is_default(self, value):
+        if self.initial_data.get('type') == const.ReplayStorageType.sftp.value:
+            # sftp不能设置为默认存储
+            return False
+        else:
+            return value

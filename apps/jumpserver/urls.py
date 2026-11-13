@@ -2,6 +2,7 @@
 from __future__ import unicode_literals
 
 import os
+import uuid
 
 import private_storage.urls
 from django.conf import settings
@@ -11,7 +12,7 @@ from django.views.i18n import JavaScriptCatalog
 
 from . import views, api
 
-api_v1 = [
+resource_api = [
     path('index/', api.IndexApi.as_view()),
     path('users/', include('users.urls.api_urls', namespace='api-users')),
     path('assets/', include('assets.urls.api_urls', namespace='api-assets')),
@@ -28,16 +29,24 @@ api_v1 = [
     path('acls/', include('acls.urls.api_urls', namespace='api-acls')),
     path('notifications/', include('notifications.urls.api_urls', namespace='api-notifications')),
     path('rbac/', include('rbac.urls.api_urls', namespace='api-rbac')),
+    path('labels/', include('labels.urls', namespace='api-label')),
+    path('reports/', include('reports.urls.api_urls', namespace='api-reports')),
+    path('chat-ai/', include('chat_ai.api.urls', namespace='api-chat-ai')),
+]
+
+api_v1 = resource_api + [
     path('prometheus/metrics/', api.PrometheusMetricsApi.as_view()),
+    path('search/', api.GlobalSearchView.as_view()),
 ]
 
 app_view_patterns = [
     path('auth/', include('authentication.urls.view_urls'), name='auth'),
     path('ops/', include('ops.urls.view_urls'), name='ops'),
+    path('reports/', include('reports.urls.view_urls'), name='reports'),
     path('tickets/', include('tickets.urls.view_urls'), name='tickets'),
     path('common/', include('common.urls.view_urls'), name='common'),
-    re_path(r'flower/(?P<path>.*)', views.celery_flower_view, name='flower-view'),
     path('download/', views.ResourceDownload.as_view(), name='download'),
+    path('redirect/confirm/', views.RedirectConfirm.as_view(), name='redirect-confirm'),
     path('i18n/<str:lang>/', views.I18NView.as_view(), name='i18n-switch'),
 ]
 
@@ -51,10 +60,16 @@ urlpatterns = [
     path('api/v1/', include(api_v1)),
     path('api/health/', api.HealthCheckView.as_view(), name="health"),
     path('api/v1/health/', api.HealthCheckView.as_view(), name="health_v1"),
+    path('api/v1/hostname/', api.HostnameView.as_view(), name="hostname"),
     # External apps url
     path('core/auth/captcha/', include('captcha.urls')),
     path('core/', include(app_view_patterns)),
 ]
+
+if settings.XPACK_ENABLED:
+    urlpatterns.append(
+        path('', include('xpack.urls.view_urls'))
+    )
 
 # 静态文件处理路由
 urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
@@ -73,12 +88,20 @@ urlpatterns += [
     path('core/jsi18n/', JavaScriptCatalog.as_view(), name='javascript-catalog'),
 ]
 
+DOC_TTL = 60 * 60
+DOC_VERSION = uuid.uuid4().hex
+cache_kwargs = {
+    'cache_timeout': DOC_TTL,
+    'cache_kwargs': {
+        'key_prefix': 'swagger-cache-' + DOC_VERSION,
+    },
+}
 # docs 路由
 urlpatterns += [
-    re_path('^api/swagger(?P<format>\.json|\.yaml)$',
-            views.get_swagger_view().without_ui(cache_timeout=1), name='schema-json'),
-    re_path('api/docs/?', views.get_swagger_view().with_ui('swagger', cache_timeout=1), name="docs"),
-    re_path('api/redoc/?', views.get_swagger_view().with_ui('redoc', cache_timeout=1), name='redoc'),
+    path('api/swagger.json', views.get_swagger_view(ui='json', **cache_kwargs), name='schema-json'),
+    path('api/swagger.yaml', views.get_swagger_view(ui='yaml', **cache_kwargs), name='schema'),
+    re_path('api/docs/?', views.get_swagger_view(ui='swagger', **cache_kwargs), name="docs"),
+    re_path('api/redoc/?', views.get_swagger_view(ui='redoc', **cache_kwargs), name='redoc'),
 ]
 
 if os.environ.get('DEBUG_TOOLBAR', False):

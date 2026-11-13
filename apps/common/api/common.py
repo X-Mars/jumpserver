@@ -5,18 +5,22 @@ import uuid
 
 from django.core.cache import cache
 from django.views.decorators.csrf import csrf_exempt
-
-from rest_framework.views import APIView
-from rest_framework.response import Response
 from rest_framework import generics, serializers
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
+from common.const import (
+    COUNTRY_CALLING_CODES,
+    KEY_CACHE_RESOURCE_IDS,
+    RESOURCE_IDS_CACHE_TIMEOUT,
+)
 from common.permissions import IsValidUser
-from common.views.http import HttpResponseTemporaryRedirect
 from common.utils import get_logger
-from common.const import KEY_CACHE_RESOURCE_IDS
+from common.views.http import HttpResponseTemporaryRedirect
 
 __all__ = [
-    'LogTailApi', 'ResourcesIDCacheApi'
+    'LogTailApi', 'ResourcesIDCacheApi', 'CountryListApi'
 ]
 
 logger = get_logger(__file__)
@@ -92,8 +96,15 @@ class ResourcesIDCacheApi(APIView):
         resources = request.data.get('resources')
         if resources is not None:
             cache_key = KEY_CACHE_RESOURCE_IDS.format(spm)
-            cache.set(cache_key, resources, 300)
+            cache.set(cache_key, resources, RESOURCE_IDS_CACHE_TIMEOUT)
         return Response({'spm': spm})
+
+
+class CountryListApi(APIView):
+    permission_classes = (IsValidUser,)
+
+    def get(self, request, *args, **kwargs):
+        return Response(COUNTRY_CALLING_CODES)
 
 
 @csrf_exempt

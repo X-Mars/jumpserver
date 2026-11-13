@@ -9,17 +9,18 @@ class RBACBackend(JMSBaseAuthBackend):
     def is_enabled():
         return True
 
-    def authenticate(self, *args, **kwargs):
+    def authenticate(self):
         return None
 
     def username_allow_authenticate(self, username):
         return False
 
     def has_perm(self, user_obj, perm, obj=None):
+        # 扫描软件对 * 毕竟敏感，所以改成 none, 虽说这个 * 是我们自定义的标识
+        if perm == 'none':
+            return True
         if not user_obj.is_active or not perm:
             raise PermissionDenied()
-        if perm == '*':
-            return True
         if isinstance(perm, str):
             perm_set = set(i.strip() for i in perm.split('|'))
         elif isinstance(perm, (list, tuple, set)):

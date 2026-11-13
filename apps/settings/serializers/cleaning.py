@@ -1,38 +1,65 @@
+from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 __all__ = ['CleaningSerializer']
 
+MIN_VALUE= settings.LOG_KEEP_MIN_DAYS
 
 class CleaningSerializer(serializers.Serializer):
     PREFIX_TITLE = _('Period clean')
 
     LOGIN_LOG_KEEP_DAYS = serializers.IntegerField(
-        min_value=1, max_value=9999,
-        label=_("Login log keep days (day)"),
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Login log retention days"),
     )
     TASK_LOG_KEEP_DAYS = serializers.IntegerField(
-        min_value=1, max_value=9999,
-        label=_("Task log keep days (day)"),
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Task log retention days"),
     )
     OPERATE_LOG_KEEP_DAYS = serializers.IntegerField(
-        min_value=1, max_value=9999,
-        label=_("Operate log keep days (day)"),
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Operate log retention days"),
+    )
+    PASSWORD_CHANGE_LOG_KEEP_DAYS = serializers.IntegerField(
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Password change log retention days"),
     )
     FTP_LOG_KEEP_DAYS = serializers.IntegerField(
-        min_value=1, max_value=9999,
-        label=_("FTP log keep days (day)"),
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("FTP log retention days"),
     )
     CLOUD_SYNC_TASK_EXECUTION_KEEP_DAYS = serializers.IntegerField(
-        min_value=1, max_value=9999,
-        label=_("Cloud sync record keep days (day)"),
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Cloud sync task history retention days"),
+    )
+    JOB_EXECUTION_KEEP_DAYS = serializers.IntegerField(
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("job execution retention days"),
+    )
+    ACTIVITY_LOG_KEEP_DAYS = serializers.IntegerField(
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Activity log retention days"),
     )
     TERMINAL_SESSION_KEEP_DURATION = serializers.IntegerField(
-        min_value=1, max_value=99999, required=True, label=_('Session keep duration (day)'),
+        min_value=MIN_VALUE, max_value=99999, required=True, label=_('Session log retention days'),
         help_text=_(
             'Session, record, command will be delete if more than duration, only in database, OSS will not be affected.')
     )
-    ACTIVITY_LOG_KEEP_DAYS = serializers.IntegerField(
-        min_value=1, max_value=9999,
-        label=_("Activity log keep days (day)"),
+
+    ACCOUNT_CHANGE_SECRET_RECORD_KEEP_DAYS = serializers.IntegerField(
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Change secret and push record retention days"),
+    )
+    APPLICATION_RECORD_KEEP_DAYS = serializers.IntegerField(
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Application record retention days"),
+        help_text=_(
+            'Completed policy cycles are retained from their end time. Active cycles, cycles requiring '
+            'attention, and their dependent audit and confirmation records are preserved.'
+        ),
+    )
+    AUDIT_REPORT_SEND_RECORD_KEEP_DAYS = serializers.IntegerField(
+        min_value=MIN_VALUE, max_value=9999,
+        label=_("Audit report send record retention days"),
     )

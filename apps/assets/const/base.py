@@ -1,8 +1,9 @@
+from copy import deepcopy
+
+from django.conf import settings
 from django.db import models
 from django.db.models import TextChoices
 from django.utils.translation import gettext_lazy as _
-
-from jumpserver.utils import has_valid_xpack_license
 
 
 class Type:
@@ -38,7 +39,7 @@ class FillType(models.TextChoices):
 class BaseType(TextChoices):
     """
     约束应该考虑代是对平台对限制，避免多余对选项，如: mysql 开启 ssh,
-    或者开启了也没有作用, 比如 k8s 开启了 domain，目前还不支持
+    或者开启了也没有作用, 比如 k8s 开启了 gateway 目前还不支持
     """
 
     @classmethod
@@ -63,16 +64,28 @@ class BaseType(TextChoices):
         return constrains
 
     @classmethod
+    def get_default_constrains(cls, tp=''):
+        base = deepcopy(cls._get_base_constrains())
+        protocols = deepcopy(cls._get_protocol_constrains())
+        automation = deepcopy(cls._get_automation_constrains())
+
+        tp_base = base.get('*', {})
+        tp_auto = automation.get('*', {})
+        tp_protocols = {**protocols.get('*', {}), **{'port_from_addr': False}}
+        tp_protocols = cls._parse_protocols(tp_protocols, tp)
+        return {**tp_base, 'protocols': tp_protocols, 'automation': tp_auto}
+
+    @classmethod
     def _parse_protocols(cls, protocol, tp):
         from .protocol import Protocol
-        settings = Protocol.settings()
+        _settings = Protocol.settings()
         choices = protocol.get('choices', [])
         if choices == '__self__':
             choices = [tp]
 
         protocols = []
         for name in choices:
-            protocol = {'name': name, **settings.get(name, {})}
+            protocol = {'name': name, **_settings.get(name, {})}
             setting = protocol.pop('setting', {})
             setting_values = {k: v.get('default', None) for k, v in setting.items()}
             protocol['setting'] = setting_values
@@ -113,9 +126,7 @@ class BaseType(TextChoices):
 
     @classmethod
     def get_choices(cls):
-        if not has_valid_xpack_license():
-            return [
-                (tp.value, tp.label)
-                for tp in cls.get_community_types()
-            ]
-        return cls.choices
+        choices = cls.choices
+        if not settings.XPACK_LICENSE_IS_VALID and hasattr(cls, 'get_community_types'):
+            choices = [(tp.value, tp.label) for tp in cls.get_community_types()]
+        return choices

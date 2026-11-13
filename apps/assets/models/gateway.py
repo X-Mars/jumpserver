@@ -16,7 +16,7 @@ __all__ = ['Gateway']
 class GatewayManager(OrgManager):
     def get_queryset(self):
         queryset = super().get_queryset()
-        queryset = queryset.filter(platform__name=GATEWAY_NAME)
+        queryset = queryset.filter(platform__name__startswith=GATEWAY_NAME)
         return queryset
 
     def bulk_create(self, objs, batch_size=None, ignore_conflicts=False):
@@ -32,10 +32,6 @@ class Gateway(Host):
     class Meta:
         proxy = True
         verbose_name = _("Gateway")
-
-    def save(self, *args, **kwargs):
-        self.platform = self.default_platform()
-        return super().save(*args, **kwargs)
 
     @classmethod
     def default_platform(cls):
@@ -73,3 +69,7 @@ class Gateway(Host):
     def private_key_path(self):
         account = self.select_account
         return account.private_key_path if account else None
+
+    def get_private_key_path(self, path):
+        account = self.select_account
+        return account.get_private_key_path(path) if account else None

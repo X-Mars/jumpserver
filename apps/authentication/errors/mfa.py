@@ -1,5 +1,5 @@
-from django.utils.translation import gettext_lazy as _
 
+from django.utils.translation import gettext_lazy as _
 from common.exceptions import JMSException
 
 
@@ -10,7 +10,7 @@ class SSOAuthClosed(JMSException):
 
 class WeComCodeInvalid(JMSException):
     default_code = 'wecom_code_invalid'
-    default_detail = 'Code invalid, can not get user info'
+    default_detail = _('Code invalid, can not get user info')
 
 
 class WeComBindAlready(JMSException):
@@ -33,6 +33,24 @@ class FeiShuNotBound(JMSException):
     default_detail = _('FeiShu is not bound')
 
 
+class LarkNotBound(JMSException):
+    default_code = 'lark_not_bound'
+    default_detail = _('Lark is not bound')
+
+
+class SlackNotBound(JMSException):
+    default_code = 'slack_not_bound'
+    default_detail = _('Slack is not bound')
+
+
 class PasswordInvalid(JMSException):
     default_code = 'passwd_invalid'
     default_detail = _('Your password is invalid')
+
+
+class IntervalTooShort(JMSException):
+    default_code = 'interval_too_short'
+    default_detail = _('Please wait for %s seconds before retry')
+
+    def __init__(self, interval, *args, **kwargs):
+        super().__init__(detail=self.default_detail % interval, *args, **kwargs)

@@ -1,89 +1,129 @@
-from django.db.models import Subquery, OuterRef,  Value, F, Q
+from django.db.models import Exists, OuterRef, Q
+from django.utils.translation import gettext_lazy as _
 from django_filters import rest_framework as filters
-from django.db.models.functions import Concat
 
 from common.drf.filters import BaseFilterSet
-
+from orgs.models import Organization
+from orgs.utils import tmp_to_root_org
+from tickets.const import TicketOrigin
 from tickets.models import (
-    Ticket, TicketStep, ApplyAssetTicket,
-    ApplyLoginTicket, ApplyLoginAssetTicket, ApplyCommandTicket
+    Ticket, ApprovalTask,
 )
+from assets.models import Asset
 
 
 class TicketFilter(BaseFilterSet):
-    assignees__id = filters.UUIDFilter(method='filter_assignees_id')
-    relevant_app = filters.CharFilter(method='filter_relevant_app')
-    relevant_asset = filters.CharFilter(method='filter_relevant_asset')
-    relevant_system_user = filters.CharFilter(method='filter_relevant_system_user')
-    relevant_command = filters.CharFilter(method='filter_relevant_command')
+    applicant = filters.UUIDFilter(
+        field_name='applicant_id', label=_('Applicant ID')
+    )
+    beneficiary = filters.UUIDFilter(
+        field_name='beneficiaries__user_id', label=_('Beneficiary ID')
+    )
+    assignees__id = filters.UUIDFilter(
+        method='filter_assignees_id', label=_('Assignee ID')
+    )
+    processed_by = filters.UUIDFilter(method='filter_processed_by', label=_('Assignee ID'))
+    cc_users__id = filters.UUIDFilter(
+        field_name='cc_users__id', label=_('CC users'), distinct=True,
+    )
+    relevant_asset = filters.CharFilter(
+        method='filter_relevant_asset',
+        label=_('Relevant asset name or address')
+    )
+    relevant_command = filters.CharFilter(
+        method='filter_relevant_command', label=_('Relevant command')
+    )
+    applicant_username_name = filters.CharFilter(
+        method='filter_applicant_username_name',
+        label=_('Applicant name or username')
+    )
+    state = filters.CharFilter(
+        method='filter_state', label=_('Approval result')
+    )
+    status = filters.CharFilter(
+        field_name='status', label=_('Ticket status')
+    )
+    origin = filters.ChoiceFilter(
+        field_name='origin', choices=TicketOrigin.choices,
+        label=_('Ticket origin'),
+    )
+    org_name = filters.CharFilter(
+        method='filter_org_name', label=_('Organization name')
+    )
 
     class Meta:
         model = Ticket
         fields = (
-            'id', 'title', 'type', 'status', 'state', 'applicant', 'assignees__id'
+            'id', 'title', 'serial_num', 'type', 'state', 'status', 'origin',
+            'applicant', 'beneficiary', 'applicant_username_name', 'assignees__id', 'processed_by',
+            'cc_users__id',
+            'relevant_asset', 'relevant_command', 'org_name', 'org_id',
         )
+        fields_operator = {
+            'assignees__id': ('exact',),
+            'cc_users__id': ('exact',),
+            'org_id': ('exact', 'in'),
+            'state': ('exact',),
+            'status': ('exact',),
+            'origin': ('exact',),
+            'relevant_asset': ('icontains',),
+            'relevant_command': ('icontains',),
+            'applicant_username_name': ('icontains',),
+            'org_name': ('icontains',),
+        }
 
-    def filter_assignees_id(self, queryset, name, value):
-        step_qs = TicketStep.objects.filter(
-            level=OuterRef("approval_step")
+    @staticmethod
+    def filter_org_name(queryset, name, value):
+        matched_org_ids = Organization.objects.filter(
+            name__icontains=value
         ).values_list('id', flat=True)
+
+        matched_org_ids = [str(_id) for _id in matched_org_ids]
+        if not matched_org_ids:
+            return queryset.none()
+
+        return queryset.filter(org_id__in=matched_org_ids)
+
+    @staticmethod
+    def filter_assignees_id(queryset, name, value):
+        current_assignee_tickets = ApprovalTask.objects.filter(
+            node_instance__instance__ticket_id=OuterRef('pk'),
+            state='pending', node_instance__instance__state='running',
+            assignee_id=value,
+        )
+        return queryset.filter(Exists(current_assignee_tickets))
+
+    @staticmethod
+    def filter_processed_by(queryset, name, value):
+        tasks = ApprovalTask.objects.filter(
+            node_instance__instance__ticket_id=OuterRef('pk'), assignee_id=value,
+            state__in=['approved', 'rejected', 'transferred'],
+        )
+        return queryset.filter(Exists(tasks))
+
+    @staticmethod
+    def filter_relevant_asset(queryset, name, value):
+        with tmp_to_root_org():
+            assets = Asset.objects.filter(Q(name__icontains=value) | Q(address__icontains=value))
+            ids = [str(pk) for pk in assets.values_list('pk', flat=True)]
+        query = Q(request_data__apply_run_asset__icontains=value) | Q(rel_snapshot__icontains=value)
+        for asset_id in ids:
+            query |= Q(request_data__icontains=asset_id)
+        return queryset.filter(query)
+
+    @staticmethod
+    def filter_relevant_command(queryset, name, value):
+        return queryset.filter(request_data__apply_run_command__icontains=value)
+
+    @staticmethod
+    def filter_applicant_username_name(queryset, name, value):
         return queryset.filter(
-            ticket_steps__id__in=Subquery(step_qs),
-            ticket_steps__ticket_assignees__assignee__id=value
+            Q(applicant__name__icontains=value) |
+            Q(applicant__username__icontains=value)
         )
 
-    def filter_relevant_asset(self, queryset, name, value):
-        asset_ids = ApplyAssetTicket.objects.annotate(
-            asset_str=Concat(
-                F('apply_assets__name'), Value('('),
-                F('apply_assets__address'), Value(')')
-            )
-        ).filter(
-            asset_str__icontains=value
-        ).values_list('id', flat=True)
-
-        login_asset_ids = ApplyLoginAssetTicket.objects.annotate(
-            asset_str=Concat(
-                F('apply_login_asset__name'), Value('('),
-                F('apply_login_asset__address'), Value(')')
-            )
-        ).filter(
-            asset_str__icontains=value
-        ).values_list('id', flat=True)
-
-        command_ids = ApplyCommandTicket.objects.filter(
-            apply_run_asset__icontains=value
-        ).values_list('id', flat=True)
-
-        ticket_ids = list(set(list(asset_ids) + list(login_asset_ids) + list(command_ids)))
-        return queryset.filter(id__in=ticket_ids)
-
-    def filter_relevant_command(self, queryset, name, value):
-        command_ids = ApplyCommandTicket.objects.filter(
-            apply_run_command__icontains=value
-        ).values_list('id', flat=True)
-        return queryset.filter(id__in=list(command_ids))
-
-
-class ApplyAssetTicketFilter(BaseFilterSet):
-    class Meta:
-        model = ApplyAssetTicket
-        fields = ('id',)
-
-
-class ApplyLoginTicketFilter(BaseFilterSet):
-    class Meta:
-        model = ApplyLoginTicket
-        fields = ('id',)
-
-
-class ApplyLoginAssetTicketFilter(BaseFilterSet):
-    class Meta:
-        model = ApplyLoginAssetTicket
-        fields = ('id',)
-
-
-class ApplyCommandTicketFilter(BaseFilterSet):
-    class Meta:
-        model = ApplyCommandTicket
-        fields = ('id',)
+    @staticmethod
+    def filter_state(queryset, name, value):
+        if value == 'all':
+            return queryset
+        return queryset.filter(state=value)

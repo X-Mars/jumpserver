@@ -12,7 +12,7 @@ class Category(ChoicesMixin, models.TextChoices):
     DATABASE = 'database', _("Database")
     CLOUD = 'cloud', _("Cloud service")
     WEB = 'web', _("Web")
-    GPT = 'gpt', "GPT"
+    DS = 'ds', _("Directory service")
     CUSTOM = 'custom', _("Custom type")
 
     @classmethod
@@ -20,3 +20,7 @@ class Category(ChoicesMixin, models.TextChoices):
         _category = getattr(cls, category.upper(), None)
         choices = [(_category.value, _category.label)] if _category else cls.choices
         return choices
+
+    @classmethod
+    def as_dict(cls):
+        return {choice.value: choice.label for choice in cls}

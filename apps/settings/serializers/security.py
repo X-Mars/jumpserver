@@ -2,16 +2,30 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from acls.serializers.rules import ip_group_help_text, ip_group_child_validator
+from authentication.const import MFAType
+from common.serializers.fields import ListMultipleChoiceField
 
 __all__ = [
     'SecurityPasswordRuleSerializer', 'SecuritySessionSerializer',
     'SecurityAuthSerializer', 'SecuritySettingSerializer',
     'SecurityLoginLimitSerializer', 'SecurityBasicSerializer',
-    'SecurityBlockIPSerializer'
+    'SecurityBlockIPSerializer', 'SecurityUnlockIPSerializer',
+    'SecurityUnlockIPResultSerializer', 'LeakPasswordPSerializer'
 ]
+
+from settings.models import LeakPasswords
 
 
 class SecurityPasswordRuleSerializer(serializers.Serializer):
+    SECURITY_PASSWORD_EXPIRATION_TIME_ADMIN = serializers.IntegerField(
+        min_value=1, max_value=99999, required=True,
+        label=_('Admin password expiration (day)'),
+        help_text=_(
+            'If the admin does not update the password during the time, '
+            'the admin password will expire failure;The password expiration reminder mail will be '
+            'automatic sent to the admin by system within 5 days (daily) before the password expires'
+        )
+    )
     SECURITY_PASSWORD_EXPIRATION_TIME = serializers.IntegerField(
         min_value=1, max_value=99999, required=True,
         label=_('User password expiration (day)'),
@@ -21,9 +35,14 @@ class SecurityPasswordRuleSerializer(serializers.Serializer):
             'automatic sent to the user by system within 5 days (daily) before the password expires'
         )
     )
+    SECURITY_EXPIRED_TOKEN_RECORD_KEEP_DAYS = serializers.IntegerField(
+        min_value=1, max_value=99999, required=True,
+        label=_('User expired tokens record keep days'),
+        help_text=_("Retention period (in days) for expired user tokens before automatic cleanup.")
+    )
     OLD_PASSWORD_HISTORY_LIMIT_COUNT = serializers.IntegerField(
         min_value=0, max_value=99999, required=True,
-        label=_('Number of repeated historical passwords'),
+        label=_('Recent password count'),
         help_text=_(
             'Tip: When the user resets the password, it cannot be '
             'the previous n historical passwords of the user'
@@ -31,23 +50,23 @@ class SecurityPasswordRuleSerializer(serializers.Serializer):
     )
     SECURITY_PASSWORD_MIN_LENGTH = serializers.IntegerField(
         min_value=6, max_value=30, required=True,
-        label=_('Password minimum length')
+        label=_("Minimum length (User)")
     )
     SECURITY_ADMIN_USER_PASSWORD_MIN_LENGTH = serializers.IntegerField(
         min_value=6, max_value=30, required=True,
-        label=_('Admin user password minimum length')
+        label=_('Minimum length (Admin)')
     )
     SECURITY_PASSWORD_UPPER_CASE = serializers.BooleanField(
-        required=False, label=_('Must contain capital')
+        required=False, label=_('Uppercase')
     )
     SECURITY_PASSWORD_LOWER_CASE = serializers.BooleanField(
-        required=False, label=_('Must contain lowercase')
+        required=False, label=_('Lowercase')
     )
     SECURITY_PASSWORD_NUMBER = serializers.BooleanField(
-        required=False, label=_('Must contain numeric')
+        required=False, label=_('Digits')
     )
     SECURITY_PASSWORD_SPECIAL_CHAR = serializers.BooleanField(
-        required=False, label=_('Must contain special')
+        required=False, label=_('Special characters')
     )
 
 
@@ -60,30 +79,30 @@ login_ip_limit_time_help_text = _(
 class SecurityLoginLimitSerializer(serializers.Serializer):
     SECURITY_LOGIN_LIMIT_COUNT = serializers.IntegerField(
         min_value=3, max_value=99999,
-        label=_('Limit the number of user login failures')
+        label=_('Login failures count')
     )
     SECURITY_LOGIN_LIMIT_TIME = serializers.IntegerField(
         min_value=5, max_value=99999, required=True,
-        label=_('Block user login interval (minute)'),
+        label=_('Login failure period (minute)'),
         help_text=login_ip_limit_time_help_text
     )
 
     SECURITY_LOGIN_IP_LIMIT_COUNT = serializers.IntegerField(
         min_value=3, max_value=99999,
-        label=_('Limit the number of IP login failures')
+        label=_('Login failures count')
     )
     SECURITY_LOGIN_IP_LIMIT_TIME = serializers.IntegerField(
         min_value=5, max_value=99999, required=True,
-        label=_('Block IP login interval (minute)'),
+        label=_('Login failure period (minute)'),
         help_text=login_ip_limit_time_help_text
     )
     SECURITY_LOGIN_IP_WHITE_LIST = serializers.ListField(
-        default=[], label=_('Login IP White List'), allow_empty=True,
+        default=[], label=_('Login IP whitelist'), allow_empty=True,
         child=serializers.CharField(max_length=1024, validators=[ip_group_child_validator]),
         help_text=ip_group_help_text
     )
     SECURITY_LOGIN_IP_BLACK_LIST = serializers.ListField(
-        default=[], label=_('Login IP Black List'), allow_empty=True,
+        default=[], label=_('Login IP blacklist'), allow_empty=True,
         child=serializers.CharField(max_length=1024, validators=[ip_group_child_validator]),
         help_text=ip_group_help_text
     )
@@ -117,18 +136,27 @@ class SecurityAuthSerializer(serializers.Serializer):
             [1, _('All users')],
             [2, _('Only admin users')],
         ),
-        required=False, label=_("Global MFA auth")
+        required=False, label=_("Global MFA")
+    )
+    SECURITY_MFA_METHODS = ListMultipleChoiceField(
+        choices=MFAType.choices, required=False,
+        label=_("Allowed MFA methods"),
+        help_text=_("Select one or more MFA methods that users can bind and use")
     )
     SECURITY_MFA_AUTH_ENABLED_FOR_THIRD_PARTY = serializers.BooleanField(
         required=False, default=True,
-        label=_('Third-party login users perform MFA authentication'),
-        help_text=_('The third-party login modes include OIDC, CAS, and SAML2'),
+        label=_('Third-party login MFA'),
+    )
+    SECURITY_MFA_BY_EMAIL = serializers.BooleanField(
+        required=False, default=False,
+        label=_('MFA via Email'),
+        help_text=_('Email as a method for multi-factor authentication')
     )
     OTP_ISSUER_NAME = serializers.CharField(
         required=False, max_length=16, label=_('OTP issuer name'),
     )
     OTP_VALID_WINDOW = serializers.IntegerField(
-        min_value=1, max_value=10,
+        min_value=0, max_value=10,
         label=_("OTP valid window")
     )
     SECURITY_MFA_VERIFY_TTL = serializers.IntegerField(
@@ -150,16 +178,16 @@ class SecurityAuthSerializer(serializers.Serializer):
     )
     SECURITY_LOGIN_CHALLENGE_ENABLED = serializers.BooleanField(
         required=False, default=False,
-        label=_("Enable Login dynamic code"),
+        label=_("Login dynamic code"),
         help_text=_("The password and additional code are sent to a third party "
                     "authentication system for verification")
     )
     SECURITY_LOGIN_CAPTCHA_ENABLED = serializers.BooleanField(
-        required=False, default=False, label=_("Enable Login captcha"),
-        help_text=_("Enable captcha to prevent robot authentication")
+        required=False, default=False, label=_("Login CAPTCHA"),
+        help_text=_("Enable CAPTCHA to prevent robot authentication")
     )
     SECURITY_CHECK_DIFFERENT_CITY_LOGIN = serializers.BooleanField(
-        required=False, label=_('Remote Login Protection'),
+        required=False, label=_('Suspicious Login Verification'),
         help_text=_(
             'The system determines whether the login IP address belongs to a common login city. '
             'If the account is logged in from a common login city, the system sends a remote login reminder'
@@ -167,13 +195,18 @@ class SecurityAuthSerializer(serializers.Serializer):
     )
     SECURITY_UNCOMMON_USERS_TTL = serializers.IntegerField(
         min_value=30, max_value=99999, required=False,
-        label=_('Unused user timeout (day)'),
-        help_text=_("Detect infrequent users daily and disable them if they exceed the predetermined time limit.")
+        label=_('Auto Disable Threshold (day)'),
+        help_text=_("Detect infrequent users daily and disable them if they exceed the predetermined time limit")
     )
 
     def validate(self, attrs):
         if attrs.get('SECURITY_MFA_AUTH') != 1:
             attrs['SECURITY_MFA_IN_LOGIN_PAGE'] = False
+        methods = attrs.get('SECURITY_MFA_METHODS')
+        if methods is not None and len(methods) == 0:
+            raise serializers.ValidationError({
+                'SECURITY_MFA_METHODS': _('Select at least one MFA method')
+            })
         return attrs
 
     def to_representation(self, instance):
@@ -187,18 +220,107 @@ class SecurityAuthSerializer(serializers.Serializer):
 
 
 class SecuritySessionSerializer(serializers.Serializer):
+    SESSION_COOKIE_AGE = serializers.IntegerField(
+        min_value=300, max_value=31536000, required=False, label=_('Web session lifetime (second)'),
+        help_text=_(
+            'When renewal is disabled, the login expires after this duration, even if the session is saved or identity is verified again. '
+            'When renewal is enabled, each renewal grants this duration again. '
+            'Changes apply to new logins without restarting Core.'
+        ),
+    )
+    SESSION_RENEW_ON_REQUEST = serializers.BooleanField(
+        required=False, label=_('Renew session on request'),
+        help_text=_(
+            'Requests can extend the session at most once per minute. Background business requests also count; '
+            'profile, online-status and lock-status polling do not. '
+            'Disabled: the expiry time stays fixed. Changes apply to new logins without restarting Core.'
+        ),
+    )
+    SECURITY_CLIENT_REAUTH_ON_EXIT = serializers.BooleanField(
+        required=False, label=_('Log in again after exiting the client'),
+        help_text=_(
+            'Require a new login after exiting and restarting. Minimizing or hiding the client does not count '
+            'as exiting.'
+        ),
+    )
+    SECURITY_CLIENT_MAX_SESSION_TIME = serializers.IntegerField(
+        min_value=0, max_value=99999, required=False,
+        label=_('Maximum client login lifetime (minute)'),
+        help_text=_(
+            '0 means unlimited. Counted from login. Sign in again when it expires; activity does not extend '
+            'it. A login already overdue after a change gets up to 10 more minutes.'
+        ),
+    )
+    SECURITY_CLIENT_IDLE_LOCK_TIME = serializers.IntegerField(
+        min_value=0, max_value=99999, required=False,
+        label=_('Client idle screen lock (minute)'),
+        help_text=_(
+            '0 disables automatic locking. Locks after the idle timeout. Switching accounts does not reset '
+            'the previous account’s idle time. Enter the lock password to unlock. '
+            'External application windows are not protected.'
+        ),
+    )
+    SECURITY_WEB_IDLE_LOCK_TIME = serializers.IntegerField(
+        min_value=0, max_value=99999, required=False,
+        label=_('Web idle screen lock (minute)'),
+        help_text=_(
+            '0 disables idle locking. Locks the console and Web terminal after the specified idle time. '
+            'Enter the lock password to unlock. With idle locking enabled, closing all pages also locks this login '
+            'after 10 seconds. Close-page sign-out takes priority. Refreshing or reopening within 10 seconds cancels this. '
+            'Administrator settings are defaults and limits. Users may choose stricter settings; otherwise they follow '
+            'the administrator.'
+        ),
+    )
     SECURITY_WATERMARK_ENABLED = serializers.BooleanField(
-        required=True, label=_('Enable watermark'),
-        help_text=_('Enabled, the web session and replay contains watermark information')
+        required=True, label=_('Watermark'),
+    )
+    SECURITY_WATERMARK_SESSION_CONTENT = serializers.CharField(
+        required=False, label=_('Session content'),
+    )
+    SECURITY_WATERMARK_CONSOLE_CONTENT = serializers.CharField(
+        required=False, label=_("Console content")
+    )
+    SECURITY_WATERMARK_COLOR = serializers.CharField(
+        max_length=32, default="", label=_("Font color")
+    )
+    SECURITY_WATERMARK_FONT_SIZE = serializers.IntegerField(
+        required=False, label=_('Font size'), min_value=1, max_value=100,
+    )
+    SECURITY_WATERMARK_HEIGHT = serializers.IntegerField(
+        required=False, label=_('Height'), default=200
+    )
+    SECURITY_WATERMARK_WIDTH = serializers.IntegerField(
+        required=False, label=_('Width'), default=200
+    )
+    SECURITY_WATERMARK_ROTATE = serializers.IntegerField(
+        required=False, label=_('Rotate'), default=45
     )
     SECURITY_MAX_IDLE_TIME = serializers.IntegerField(
         min_value=1, max_value=99999, required=False,
-        label=_('Connection max idle time (minute)'),
+        label=_('Max idle time (minute)'),
         help_text=_('If idle time more than it, disconnect connection.')
+    )
+    SESSION_EXPIRE_AT_BROWSER_CLOSE = serializers.BooleanField(
+        required=False, default=False, label=_('Log in again when the browser closes'),
+        help_text=_(
+            'End this login 10 seconds after all console and Web terminal pages for it close. '
+            'Refreshing or reopening a page within 10 seconds cancels sign-out. '
+            'A browser crash may prevent the close report; use Sign out to reliably end the login. '
+            'Changes apply to new logins.'
+        )
+    )
+    VIEW_ASSET_ONLINE_SESSION_INFO = serializers.BooleanField(
+        required=False,
+        default=True,
+        label=_('Allow users to view asset session information'),
+        help_text=_(
+            'When a user connects to an asset, the account selection popup displays the number of active sessions for '
+            'the current asset (RDP protocol only).'
+        )
     )
     SECURITY_MAX_SESSION_TIME = serializers.IntegerField(
         min_value=1, max_value=99999, required=False,
-        label=_('Session max connection time (hour)'),
+        label=_('Max online time (hour)'),
         help_text=_('If session connection time more than it, disconnect connection.')
     )
     SECURITY_LUNA_REMEMBER_AUTH = serializers.BooleanField(
@@ -213,6 +335,10 @@ class SecuritySessionSerializer(serializers.Serializer):
 class SecurityBasicSerializer(serializers.Serializer):
     SECURITY_INSECURE_COMMAND = serializers.BooleanField(
         required=False, label=_('Insecure command alert')
+    )
+    SECURITY_ACCOUNT_USERNAME_FORBIDDEN_CHARS = serializers.CharField(
+        required=False, allow_blank=True, label=_('Account username forbidden characters'),
+        max_length=128
     )
     SECURITY_INSECURE_COMMAND_EMAIL_RECEIVER = serializers.CharField(
         max_length=8192, required=False, allow_blank=True, label=_('Email recipient'),
@@ -231,3 +357,51 @@ class SecuritySettingSerializer(
 class SecurityBlockIPSerializer(serializers.Serializer):
     id = serializers.UUIDField(required=False)
     ip = serializers.CharField(max_length=1024, required=False, allow_blank=True)
+
+
+class LoginIPAddressField(serializers.IPAddressField):
+    """Validate IPs without changing the spelling used by login cache keys."""
+
+    def to_internal_value(self, data):
+        super().to_internal_value(data)
+        return data.strip()
+
+
+class SecurityUnlockIPSerializer(serializers.Serializer):
+    ip = LoginIPAddressField(
+        required=False, help_text=_('Provide either ip or a non-empty ips list.'),
+    )
+    ips = serializers.ListField(
+        child=LoginIPAddressField(), required=False, allow_empty=False,
+        help_text=_('Provide either ip or a non-empty ips list.'),
+    )
+
+    def validate(self, attrs):
+        if 'ip' not in attrs and 'ips' not in attrs:
+            raise serializers.ValidationError({
+                'ip': [_('Provide either ip or a non-empty ips list.')],
+            })
+        if 'ip' in attrs and 'ips' in attrs:
+            raise serializers.ValidationError(_('Provide only one of ip or ips.'))
+        return attrs
+
+
+class SecurityUnlockIPResultSerializer(serializers.Serializer):
+    ips = serializers.ListField(child=serializers.IPAddressField())
+
+
+class LeakPasswordPSerializer(serializers.ModelSerializer):
+
+    def create(self, validated_data):
+        return LeakPasswords.objects.using('sqlite').create(**validated_data)
+
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save(using='sqlite')
+        return instance
+
+    class Meta:
+        read_only_fields = ['id']
+        fields = read_only_fields + ['password']
+        model = LeakPasswords

@@ -5,6 +5,7 @@ from django.utils.translation import gettext_lazy as _
 class SecretType(TextChoices):
     PASSWORD = 'password', _('Password')
     SSH_KEY = 'ssh_key', _('SSH key')
+    SSH_CERTIFICATE = 'ssh_certificate', _('SSH certificate')
     ACCESS_KEY = 'access_key', _('Access key')
     TOKEN = 'token', _('Token')
     API_KEY = 'api_key', _("API key")
@@ -15,6 +16,7 @@ class AliasAccount(TextChoices):
     INPUT = '@INPUT', _('Manual input')
     USER = '@USER', _('Dynamic user')
     ANON = '@ANON', _('Anonymous account')
+    SPEC = '@SPEC', _('Specified account')
 
     @classmethod
     def virtual_choices(cls):
@@ -23,7 +25,7 @@ class AliasAccount(TextChoices):
 
 class Source(TextChoices):
     LOCAL = 'local', _('Local')
-    COLLECTED = 'collected', _('Collected')
+    DISCOVERY = 'collected', _('Discovery')
     TEMPLATE = 'template', _('Template')
 
 

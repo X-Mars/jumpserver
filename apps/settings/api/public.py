@@ -2,10 +2,11 @@ from django.conf import settings
 from rest_framework import generics
 from rest_framework.permissions import AllowAny
 
-from common.permissions import IsValidUserOrConnectionToken
+from authentication.mfa.policy import get_mfa_method_status
+from authentication.permissions import IsValidUserOrConnectionToken
+from common.const.choices import Language
 from common.utils import get_logger, lazyproperty
 from common.utils.timezone import local_now
-from jumpserver.utils import has_valid_xpack_license, get_xpack_license_info
 from .. import serializers
 from ..utils import get_interface_setting_or_default
 
@@ -25,7 +26,16 @@ class OpenPublicSettingApi(generics.RetrieveAPIView):
     def get_object(self):
         return {
             "XPACK_ENABLED": settings.XPACK_ENABLED,
-            "INTERFACE": self.interface_setting
+            "INTERFACE": self.interface_setting,
+            "LANGUAGES":  [
+                {
+                    'name': title,
+                    'code': code,
+                    'other_codes': Language.get_other_codes(code),
+                }
+                for code, title in Language.choices_supported()
+            ],
+            "VENDOR": settings.VENDOR,
         }
 
 
@@ -34,10 +44,16 @@ class PublicSettingApi(OpenPublicSettingApi):
     serializer_class = serializers.PrivateSettingSerializer
 
     def get_object(self):
+        if self.request.user.is_org_admin:
+            SECURITY_PASSWORD_EXPIRATION_TIME = settings.SECURITY_PASSWORD_EXPIRATION_TIME_ADMIN
+        else:
+            SECURITY_PASSWORD_EXPIRATION_TIME = settings.SECURITY_PASSWORD_EXPIRATION_TIME
+
         values = super().get_object()
         values.update({
-            "XPACK_LICENSE_IS_VALID": has_valid_xpack_license(),
-            "XPACK_LICENSE_INFO": get_xpack_license_info(),
+            "MFA_METHODS_STATUS": get_mfa_method_status(),
+            "XPACK_LICENSE_IS_VALID": settings.XPACK_LICENSE_IS_VALID,
+            "XPACK_LICENSE_INFO": settings.XPACK_LICENSE_INFO,
             "PASSWORD_RULE": {
                 'SECURITY_PASSWORD_MIN_LENGTH': settings.SECURITY_PASSWORD_MIN_LENGTH,
                 'SECURITY_ADMIN_USER_PASSWORD_MIN_LENGTH': settings.SECURITY_ADMIN_USER_PASSWORD_MIN_LENGTH,
@@ -46,6 +62,7 @@ class PublicSettingApi(OpenPublicSettingApi):
                 'SECURITY_PASSWORD_NUMBER': settings.SECURITY_PASSWORD_NUMBER,
                 'SECURITY_PASSWORD_SPECIAL_CHAR': settings.SECURITY_PASSWORD_SPECIAL_CHAR,
             },
+            "SECURITY_PASSWORD_EXPIRATION_TIME": SECURITY_PASSWORD_EXPIRATION_TIME,
         })
 
         serializer = self.serializer_class()

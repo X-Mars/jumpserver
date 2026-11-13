@@ -7,19 +7,24 @@ name: Add issues workflow labels
 jobs:
   add-label-if-is-author:
     runs-on: ubuntu-latest
-    if: (github.event.issue.user.id == github.event.comment.user.id) && !github.event.issue.pull_request && (github.event.issue.state == 'open')
-    steps:
-      - name: Add require handle label
-        uses: actions-cool/issues-helper@v2
-        with:
-          actions: 'add-labels'
-          labels: '状态:待处理'
+    permissions:
+      issues: write
+      pull-requests: write
 
-      - name: Remove require reply label
-        uses: actions-cool/issues-helper@v2
-        with:
-          actions: 'remove-labels'
-          labels: '状态:待反馈'
+    if: >
+      (github.event.issue.user.id == github.event.comment.user.id) &&
+      !github.event.issue.pull_request &&
+      (github.event.issue.state == 'open')
+
+    steps:
+      - name: Update labels
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "🔔 Pending processing" \
+            --remove-label "⏳ Pending feedback"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   add-label-if-is-member:
     runs-on: ubuntu-latest
@@ -50,16 +55,11 @@ jobs:
       - run: "echo comment user: '${{ github.event.comment.user.login }}'"
       - run: "echo contains? : '${{ contains(steps.member_names.outputs.data, github.event.comment.user.login) }}'"
 
-      - name: Add require replay label
+      - name: Update labels
         if: contains(steps.member_names.outputs.data, github.event.comment.user.login)
-        uses: actions-cool/issues-helper@v2
-        with:
-          actions: 'add-labels'
-          labels: '状态:待反馈'
-
-      - name: Remove require handle label
-        if: contains(steps.member_names.outputs.data, github.event.comment.user.login)
-        uses: actions-cool/issues-helper@v2
-        with:
-          actions: 'remove-labels'
-          labels: '状态:待处理'
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" \
+            --add-label "⏳ Pending feedback" \
+            --remove-label "🔔 Pending processing"
+        env:
+          GH_TOKEN: ${{ github.token }}

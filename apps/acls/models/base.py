@@ -5,7 +5,7 @@ from django.utils.translation import gettext_lazy as _
 from common.db.fields import JSONManyToManyField
 from common.db.models import JMSBaseModel
 from common.utils import contains_ip
-from common.utils.time_period import contains_time_period
+from common.utils.timezone import contains_time_period
 from orgs.mixins.models import OrgModelMixin, OrgManager
 from ..const import ActionChoices
 
@@ -64,7 +64,7 @@ class BaseACL(JMSBaseModel):
             return
 
         for acl in acl_qs:
-            if acl.is_action(ActionChoices.review) and not acl.reviewers.exists():
+            if acl.is_action(ActionChoices.review) and not getattr(acl, 'workflow_id', None) and not acl.reviewers.exists():
                 continue
             ip_group = acl.rules.get('ip_group')
             time_periods = acl.rules.get('time_period')

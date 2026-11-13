@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 #
 import uuid
+from itertools import chain
 
 from django.apps import apps
-from django.db.models.signals import post_save, pre_save, m2m_changed, pre_delete
+from django.db.models.signals import (
+    pre_delete, pre_save, m2m_changed, post_delete, post_save
+)
 from django.dispatch import receiver
 from django.utils import translation
 
@@ -12,7 +15,7 @@ from audits.handler import (
     create_or_update_operate_log, get_instance_dict_from_cache
 )
 from audits.utils import model_to_dict_for_operate_log as model_to_dict
-from common.const.signals import POST_ADD, POST_REMOVE, POST_CLEAR, SKIP_SIGNAL
+from common.const.signals import POST_ADD, POST_REMOVE, POST_CLEAR, OP_LOG_SKIP_SIGNAL
 from common.signals import django_ready
 from jumpserver.utils import current_request
 from ..const import MODELS_NEED_RECORD, ActionChoices
@@ -24,40 +27,74 @@ M2M_ACTION = {
 }
 
 
+def _get_m2m_field_verbose_name(instance, model, sender):
+    opts = instance._meta
+    for f in chain(opts.many_to_many, opts.related_objects):
+        related_model = getattr(f, 'related_model', None)
+        if related_model != model:
+            continue
+
+        through = None
+        remote_field = getattr(f, 'remote_field', None)
+        if remote_field is not None:
+            through = getattr(remote_field, 'through', None)
+        if through is None:
+            through = getattr(f, 'through', None)
+
+        if through is not sender:
+            continue
+
+        verbose_name = getattr(f, 'verbose_name', None) or model._meta.verbose_name
+        return str(verbose_name)
+    return str(model._meta.verbose_name)
+
+
 @receiver(m2m_changed)
 def on_m2m_changed(sender, action, instance, reverse, model, pk_set, **kwargs):
     if action not in M2M_ACTION:
         return
     if not instance:
         return
+    if getattr(instance, OP_LOG_SKIP_SIGNAL, False):
+        return
 
     with translation.override('en'):
         resource_type = instance._meta.verbose_name
-        current_instance = model_to_dict(instance, include_model_fields=False)
+        current_instance = model_to_dict(
+            instance, include_model_fields=False, include_related_fields=[model]
+        )
 
-        instance_id = current_instance.get('id')
+        instance_id_data = current_instance.get('id', {})
+        if isinstance(instance_id_data, dict):
+            instance_id = instance_id_data.get('value')
+        else:
+            instance_id = instance_id_data
         log_id, before_instance = get_instance_dict_from_cache(instance_id)
 
-        field_name = str(model._meta.verbose_name)
+        field_name = _get_m2m_field_verbose_name(instance, model, sender)
+        pk_set = pk_set or {}
         objs = model.objects.filter(pk__in=pk_set)
         objs_display = [str(o) for o in objs]
         action = M2M_ACTION[action]
-        changed_field = current_instance.get(field_name, [])
+        changed_field = current_instance.get(field_name, {})
+        if not changed_field and field_name != str(model._meta.verbose_name):
+            changed_field = current_instance.get(str(model._meta.verbose_name), {})
+        changed_value = changed_field.get('value', [])
 
         after, before, before_value = None, None, None
         if action == ActionChoices.create:
-            before_value = list(set(changed_field) - set(objs_display))
+            before_value = list(set(changed_value) - set(objs_display))
         elif action == ActionChoices.delete:
-            before_value = list(
-                set(changed_field).symmetric_difference(set(objs_display))
-            )
+            before_value = list(set(changed_value).symmetric_difference(set(objs_display)))
 
         if changed_field:
             after = {field_name: changed_field}
         if before_value:
-            before = {field_name: before_value}
+            before_change_field = changed_field.copy()
+            before_change_field['value'] = before_value
+            before = {field_name: before_change_field}
 
-        if sorted(str(before)) == sorted(str(after)):
+        if before == after:
             return
 
         create_or_update_operate_log(
@@ -69,29 +106,29 @@ def on_m2m_changed(sender, action, instance, reverse, model, pk_set, **kwargs):
 def signal_of_operate_log_whether_continue(
         sender, instance, created, update_fields=None
 ):
+    # Django Session payloads contain credentials and must never enter operate logs.
+    # Model names alone cannot distinguish them from terminal.Session.
+    if sender._meta.app_label == 'sessions':
+        return False
     condition = True
     if not instance:
         condition = False
-    if instance and getattr(instance, SKIP_SIGNAL, False):
+    if instance and getattr(instance, OP_LOG_SKIP_SIGNAL, False):
         condition = False
-    # 不记录组件的操作日志
     user = current_request.user if current_request else None
     if not user or getattr(user, 'is_service_account', False):
         condition = False
-    # 终端模型的 create 事件由系统产生，不记录
     if instance._meta.object_name == 'Terminal' and created:
         condition = False
-    # last_login 改变是最后登录日期, 每次登录都会改变
     if instance._meta.object_name == 'User' and \
             update_fields and 'last_login' in update_fields:
         condition = False
-    # 不在记录白名单中，跳过
     if sender._meta.object_name not in MODELS_NEED_RECORD:
         condition = False
     return condition
 
 
-@receiver(pre_save)
+@receiver([pre_save, pre_delete])
 def on_object_pre_create_or_update(
         sender, instance=None, raw=False, using=None, update_fields=None, **kwargs
 ):
@@ -100,8 +137,8 @@ def on_object_pre_create_or_update(
     )
     if not ok:
         return
+
     with translation.override('en'):
-        # users.PrivateToken Model 没有 id 有 pk字段
         instance_id = getattr(instance, 'id', getattr(instance, 'pk', None))
         instance_before_data = {'id': instance_id}
         raw_instance = type(instance).objects.filter(pk=instance_id).first()
@@ -142,7 +179,7 @@ def on_object_created_or_update(
         )
 
 
-@receiver(pre_delete)
+@receiver(post_delete)
 def on_object_delete(sender, instance=None, **kwargs):
     ok = signal_of_operate_log_whether_continue(sender, instance, False)
     if not ok:
@@ -150,9 +187,15 @@ def on_object_delete(sender, instance=None, **kwargs):
 
     with translation.override('en'):
         resource_type = sender._meta.verbose_name
+        action = getattr(sender, '_OPERATE_LOG_ACTION', {})
+        action = action.get('delete', ActionChoices.delete)
+        instance_id = getattr(instance, 'id', getattr(instance, 'pk', None))
+        log_id, before = get_instance_dict_from_cache(instance_id)
+        if not log_id:
+            log_id, before = None, model_to_dict(instance)
         create_or_update_operate_log(
-            ActionChoices.delete, resource_type,
-            resource=instance, before=model_to_dict(instance)
+            action, resource_type, log_id=log_id,
+            resource=instance, before=before,
         )
 
 
@@ -163,25 +206,36 @@ def on_django_start_set_operate_log_monitor_models(sender, **kwargs):
         'django_celery_beat', 'contenttypes', 'sessions', 'auth',
     }
     exclude_models = {
-        'UserPasswordHistory', 'ContentType',
+        'UserPasswordHistory', 'ContentType', 'Asset',
         'MessageContent', 'SiteMessage',
         'PlatformAutomation', 'PlatformProtocol', 'Protocol',
         'HistoricalAccount', 'GatheredUser', 'ApprovalRule',
         'BaseAutomation', 'CeleryTask', 'Command', 'JobLog',
-        'ConnectionToken', 'SessionJoinRecord',
+        'ConnectionToken', 'SessionJoinRecord', 'SessionSharing',
+        'PersonalAssetCredential',
         'HistoricalJob', 'Status', 'TicketStep', 'Ticket',
-        'UserAssetGrantedTreeNodeRelation', 'TicketAssignee',
-        'SuperTicket', 'SuperConnectionToken', 'PermNode',
+        'TicketAssignee',
+        'SuperTicket', 'SuperConnectionToken', 'AdminConnectionToken', 'PermNode',
         'PermedAsset', 'PermedAccount', 'MenuPermission',
-        'Permission', 'TicketSession', 'ApplyLoginTicket',
-        'ApplyCommandTicket', 'ApplyLoginAssetTicket',
-        'FavoriteAsset',
+        'Permission', 'TicketSession',
+        'FavoriteAsset', 'FavoriteFolder', 'ChangeSecretRecord', 'AppProvider',
+        'Variable', 'LeakPasswords',
+        # Audit records and delivery bookkeeping are not administrator resource changes.
+        'ApplicationAudit', 'ApplicationEventDelivery', 'ApplicationEventAttempt',
+        # Webhook targets and headers are encrypted application secrets.
+        'ApplicationWebhook',
+        # Current client credential state is derived operational bookkeeping.
+        'CredentialClientStatus',
+        # OAuth authorization codes are short-lived protocol artifacts.
+        'Grant',
     }
+    include_models = {'UserSession'}
     for i, app in enumerate(apps.get_models(), 1):
         app_name = app._meta.app_label
         model_name = app._meta.object_name
         if app_name in exclude_apps or \
                 model_name in exclude_models or \
                 model_name.endswith('Execution'):
-            continue
+            if model_name not in include_models:
+                continue
         MODELS_NEED_RECORD.add(model_name)

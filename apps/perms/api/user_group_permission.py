@@ -19,6 +19,7 @@ __all__ = [
 
 
 class UserGroupGrantedAssetsApi(ListAPIView):
+    queryset = Asset.objects.none()
     serializer_class = serializers.AssetPermedSerializer
     only_fields = serializers.AssetPermedSerializer.Meta.only_fields
     filterset_fields = ['name', 'address', 'id', 'comment']
@@ -54,6 +55,7 @@ class UserGroupGrantedAssetsApi(ListAPIView):
 
 
 class UserGroupGrantedNodeAssetsApi(ListAPIView):
+    queryset = Asset.objects.none()
     serializer_class = serializers.AssetPermedSerializer
     only_fields = serializers.AssetPermedSerializer.Meta.only_fields
     filterset_fields = ['name', 'address', 'id', 'comment']
@@ -123,7 +125,7 @@ class UserGroupGrantedNodesApi(ListAPIView):
             Q(granted_by_permissions__user_groups__id=user_group_id) |
             Q(assets__granted_by_permissions__user_groups__id=user_group_id)
         )
-        return nodes
+        return nodes.with_realtime_assets_amount()
 
 
 class UserGroupGrantedNodeChildrenAsTreeApi(SerializeToTreeNodeMixin, ListAPIView):

@@ -1,26 +1,62 @@
 import os
+import shlex
+import shutil
 import uuid
 
-import ansible_runner
 from django.conf import settings
+from django.utils._os import safe_join
 
-from .callback import DefaultCallback
+from common.utils import is_macos
+from common.utils.yml import sanitize_ansible_inventory_json, sanitize_ansible_playbook
+
 from ..utils import get_ansible_log_verbosity
+from .callback import DefaultCallback
+from .docker import (
+    docker_extravars,
+    prepare_isolated_ansible_runtime,
+    stage_inventory_for_docker,
+)
+from .exception import CommandInBlackListException
+from .interface import interface
+from .execution import use_ansible_ssh_executor
+from .utils import escape_jinja2_syntax, neutralize_jinja2_syntax
+
+__all__ = [
+    'AdHocRunner', 'PlaybookRunner', 'SuperPlaybookRunner', 'UploadFileRunner',
+    'escape_jinja2_syntax', 'neutralize_jinja2_syntax', 'quote_ansible_module_arg',
+]
+
+# Block user-supplied Ansible plugins and configuration, not remote task files.
+UNSAFE_PLAYBOOK_PATTERNS = (
+    'ansible.cfg', '.ansible.cfg',
+    'action_plugins', 'library', 'module_utils', 'plugins', 'modules', 'ansible_collections',
+    'callback_plugins', 'filter_plugins', 'lookup_plugins', 'vars_plugins',
+    'test_plugins', 'connection_plugins', 'inventory_plugins', 'cache_plugins',
+    'strategy_plugins', 'become_plugins', 'terminal_plugins', 'cliconf_plugins',
+    'netconf_plugins', 'httpapi_plugins', 'shell_plugins', 'doc_fragments',
+)
 
 
-class CommandInBlackListException(Exception):
-    pass
+def quote_ansible_module_arg(value):
+    """Keep user text inside one double-quoted Ansible module arg."""
+    if not isinstance(value, str):
+        return value
+    return value.replace('\\', '\\\\').replace('"', '\\"')
 
 
 class AdHocRunner:
     cmd_modules_choices = ('shell', 'raw', 'command', 'script', 'win_shell')
+    need_local_connection_modules_choices = ("mysql", "postgresql", "sqlserver", "huawei")
 
-    def __init__(self, inventory, module, module_args='', pattern='*', project_dir='/tmp/', extra_vars={},
+    def __init__(self, inventory, job_module, module, module_args='', pattern='*', project_dir='/tmp/', extra_vars=None,
                  dry_run=False, timeout=-1):
+        if extra_vars is None:
+            extra_vars = {}
         self.id = uuid.uuid4()
         self.inventory = inventory
         self.pattern = pattern
         self.module = module
+        self.job_module = job_module
         self.module_args = module_args
         self.project_dir = project_dir
         self.cb = DefaultCallback()
@@ -28,39 +64,57 @@ class AdHocRunner:
         self.extra_vars = extra_vars
         self.dry_run = dry_run
         self.timeout = timeout
+        self.envs = {}
 
     def check_module(self):
         if self.module not in self.cmd_modules_choices:
             return
-        if self.module_args and self.module_args.split()[0] in settings.SECURITY_COMMAND_BLACKLIST:
+        command = self.module_args
+        if command and set(command.split()).intersection(set(settings.SECURITY_COMMAND_BLACKLIST)):
             raise CommandInBlackListException(
-                "Command is rejected by black list: {}".format(self.module_args.split()[0]))
+                "Command is rejected by black list: {}".format(self.module_args))
+
+    def set_local_connection(self):
+        if self.job_module in self.need_local_connection_modules_choices:
+            self.envs.update({"ANSIBLE_SUPER_MODE": "1"})
 
     def run(self, verbosity=0, **kwargs):
         self.check_module()
+        self.set_local_connection()
         verbosity = get_ansible_log_verbosity(verbosity)
 
         if not os.path.exists(self.project_dir):
-            os.mkdir(self.project_dir, 0o755)
+            os.makedirs(self.project_dir, 0o755, exist_ok=True)
+        private_env = safe_join(self.project_dir, 'env')
+        if os.path.exists(private_env):
+            shutil.rmtree(private_env)
 
-        ansible_runner.run(
-            timeout=self.timeout if self.timeout > 0 else None,
-            extravars=self.extra_vars,
-            host_pattern=self.pattern,
-            private_data_dir=self.project_dir,
-            inventory=self.inventory,
-            module=self.module,
-            module_args=self.module_args,
-            verbosity=verbosity,
-            event_handler=self.cb.event_handler,
-            status_handler=self.cb.status_handler,
-            **kwargs
-        )
+        self.envs.update(prepare_isolated_ansible_runtime(self.project_dir))
+
+        run_kwargs = {
+            'timeout': self.timeout if self.timeout > 0 else None,
+            'extravars': docker_extravars(self.extra_vars),
+            'envvars': self.envs,
+            'host_pattern': self.pattern,
+            'private_data_dir': self.project_dir,
+            'inventory': stage_inventory_for_docker(self.project_dir, self.inventory),
+            'module': self.module,
+            'module_args': self.module_args,
+            'verbosity': verbosity,
+            'event_handler': self.cb.event_handler,
+            'status_handler': self.cb.status_handler,
+            **kwargs,
+        }
+        interface.run(**run_kwargs)
         return self.cb
 
 
 class PlaybookRunner:
-    def __init__(self, inventory, playbook, project_dir='/tmp/', callback=None):
+    def __init__(
+            self, inventory, playbook, project_dir='/tmp/', callback=None, extra_vars=None,
+            safety_mode=None, inventory_safety=None,
+    ):
+
         self.id = uuid.uuid4()
         self.inventory = inventory
         self.playbook = playbook
@@ -68,26 +122,169 @@ class PlaybookRunner:
         if not callback:
             callback = DefaultCallback()
         self.cb = callback
+        self.isolate = True
+        self.envs = {}
+        if extra_vars is None:
+            extra_vars = {}
+        self.extra_vars = extra_vars
+        self.safety_mode = safety_mode
+        self.inventory_safety = inventory_safety
+
+    def copy_playbook(self):
+        entry = os.path.basename(self.playbook)
+        playbook_dir = os.path.dirname(self.playbook)
+        project_playbook_dir = os.path.join(self.project_dir, "project")
+        # Platform automation already opts into Ansible's trusted execution mode.
+        trusted = bool(self.envs.get('ANSIBLE_SUPER_MODE'))
+        ignore = None if trusted else shutil.ignore_patterns(*UNSAFE_PLAYBOOK_PATTERNS)
+        if os.path.realpath(playbook_dir) != os.path.realpath(project_playbook_dir):
+            # Rebuild from scratch so stale files from a previous run cannot survive.
+            if os.path.exists(project_playbook_dir):
+                shutil.rmtree(project_playbook_dir)
+            shutil.copytree(
+                playbook_dir, project_playbook_dir,
+                ignore=ignore,
+                symlinks=not trusted,
+            )
+        if not trusted:
+            # Also sanitize playbooks already staged in the task's project directory.
+            for root, dirs, files in os.walk(project_playbook_dir):
+                ignored = ignore(root, dirs + files)
+                for name in list(dirs) + files:
+                    path = os.path.join(root, name)
+                    if os.path.islink(path):
+                        os.unlink(path)
+                    elif name in ignored:
+                        if name in dirs:
+                            shutil.rmtree(path)
+                        else:
+                            os.unlink(path)
+                    else:
+                        continue
+                    if name in dirs:
+                        dirs.remove(name)
+        self.playbook = entry
+
+    def prepare_safe_inputs(self):
+        # Security anchor:
+        # For system-generated Ansible inputs that may contain user-controlled values,
+        # callers should explicitly enable safety_mode / inventory_safety so the runner
+        # sanitizes the task-private playbook / inventory before Ansible runs.
+        # This is intended for system-generated inputs whose values should be treated as
+        # literal data, not for arbitrary user-authored playbooks or execution logic.
+        if self.safety_mode == "playbook_unsafe":
+            project_playbook = os.path.join(self.project_dir, "project", self.playbook)
+            sanitize_ansible_playbook(project_playbook, project_playbook)
+            os.chmod(project_playbook, 0o600)
+
+        if self.inventory_safety == "json_escape":
+            sanitize_ansible_inventory_json(self.inventory, self.inventory)
+            os.chmod(self.inventory, 0o600)
+    @property
+    def playbook_project_dir(self):
+        return os.path.join(self.project_dir, 'project')
 
     def run(self, verbosity=0, **kwargs):
-        verbosity = get_ansible_log_verbosity(verbosity)
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, mode=0o755)
+        self.copy_playbook()
+        self.prepare_safe_inputs()
 
-        ansible_runner.run(
-            private_data_dir=self.project_dir,
-            inventory=self.inventory,
-            playbook=self.playbook,
-            verbosity=verbosity,
-            event_handler=self.cb.event_handler,
-            status_handler=self.cb.status_handler,
-            host_cwd=self.project_dir,
-            **kwargs
-        )
+        verbosity = get_ansible_log_verbosity(verbosity)
+        private_env = safe_join(self.project_dir, 'env')
+        if os.path.exists(private_env):
+            shutil.rmtree(private_env)
+
+        self.envs.update(prepare_isolated_ansible_runtime(self.project_dir))
+        inventory = stage_inventory_for_docker(self.project_dir, self.inventory)
+
+        kwargs = dict(kwargs)
+        if self.isolate and not is_macos() and not use_ansible_ssh_executor():
+            kwargs['process_isolation'] = True
+            kwargs['process_isolation_executable'] = 'bwrap'
+
+        try:
+            interface.run(
+                private_data_dir=self.project_dir,
+                inventory=inventory,
+                playbook=self.playbook,
+                verbosity=verbosity,
+                event_handler=self.cb.event_handler,
+                status_handler=self.cb.status_handler,
+                host_cwd=self.playbook_project_dir,
+                envvars=self.envs,
+                extravars=docker_extravars(self.extra_vars),
+                **kwargs
+            )
+        finally:
+            close_callback = getattr(self.cb, 'close', None)
+            if close_callback:
+                close_callback()
         return self.cb
 
 
-class CommandRunner(AdHocRunner):
-    def __init__(self, inventory, command, pattern='*', project_dir='/tmp/'):
-        super().__init__(inventory, 'shell', command, pattern, project_dir)
+class SuperPlaybookRunner(PlaybookRunner):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.envs = {"ANSIBLE_SUPER_MODE": "1"}
+        self.isolate = False
+
+    def run(self, *args, **kwargs):
+        # Automation tasks report their own user-oriented progress. Suppress
+        # Ansible's raw PLAY/TASK/RECAP stream unless an administrator has
+        # explicitly enabled Ansible debugging.
+        kwargs.setdefault('quiet', not settings.DEBUG_ANSIBLE)
+        return super().run(*args, **kwargs)
+
+
+class UploadFileRunner:
+    UPLOAD_STAGING_DIR = 'upload'
+
+    def __init__(self, inventory, project_dir, job_id, dest_path, callback=None):
+        self.id = uuid.uuid4()
+        self.inventory = inventory
+        self.project_dir = project_dir
+        self.cb = DefaultCallback()
+        self.envs = {}
+        upload_file_dir = safe_join(settings.SHARE_DIR, 'job_upload_file')
+        self.share_src_dir = safe_join(upload_file_dir, str(job_id))
+        self.dest_path = safe_join("/tmp", neutralize_jinja2_syntax(dest_path or ''))
+
+    def stage_upload_files(self):
+        """Keep upload sources inside the task directory sent to the executor."""
+        if not os.path.isdir(self.share_src_dir):
+            raise FileNotFoundError(f'Upload source directory not found: {self.share_src_dir}')
+        staged_dir = os.path.join(self.project_dir, self.UPLOAD_STAGING_DIR)
+        if os.path.exists(staged_dir):
+            shutil.rmtree(staged_dir)
+        shutil.copytree(self.share_src_dir, staged_dir)
+        return staged_dir
 
     def run(self, verbosity=0, **kwargs):
-        return super().run(verbosity, **kwargs)
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, mode=0o755, exist_ok=True)
+
+        self.envs.update(prepare_isolated_ansible_runtime(self.project_dir))
+        src_path = self.stage_upload_files()
+
+        verbosity = get_ansible_log_verbosity(verbosity)
+        run_kwargs = {
+            'private_data_dir': self.project_dir,
+            'host_pattern': "*",
+            'inventory': stage_inventory_for_docker(self.project_dir, self.inventory),
+            'module': 'copy',
+            'module_args': 'src={} dest={}'.format(
+                shlex.quote(src_path + '/'), shlex.quote(self.dest_path + '/')
+            ),
+            'verbosity': verbosity,
+            'event_handler': self.cb.event_handler,
+            'status_handler': self.cb.status_handler,
+            'envvars': self.envs,
+            **kwargs,
+        }
+        interface.run(**run_kwargs)
+        try:
+            shutil.rmtree(self.share_src_dir)
+        except OSError as e:
+            print(f"del upload tmp dir {self.share_src_dir} failed! {e}")
+        return self.cb

@@ -6,14 +6,16 @@ import logging
 from collections import defaultdict
 
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, Count
 from django.forms import model_to_dict
 from django.utils.translation import gettext_lazy as _
 
 from assets import const
 from common.db.fields import EncryptMixin
 from common.utils import lazyproperty
+from labels.mixins import LabeledMixin
 from orgs.mixins.models import OrgManager, JMSOrgBaseModel
+from rbac.models import ContentType
 from ..base import AbsConnectivity
 from ..platform import Platform
 
@@ -25,16 +27,67 @@ def default_node():
     return []
 
 
+SUPPORTED_ICON_SKINS = {
+    'windows',
+    'windows_ad',
+    'switch',
+    'k8s',
+    'mysql',
+    'redis',
+    'mariadb',
+    'postgresql',
+    'mongodb',
+    'unix',
+    'WebCloud',
+    'private',
+    'sqlserver',
+    'db2',
+    'dameng',
+    'oceanbase',
+    'website',
+    'chatgpt',
+    'clickhouse',
+    'shell',
+    'oracle',
+    'database',
+    'cloud',
+    'chrome',
+    'public',
+    'router',
+    'other',
+    'firewall',
+    'general',
+    'file',
+    'linux',
+    'macos',
+}
+
 class AssetManager(OrgManager):
     pass
 
 
 class AssetQuerySet(models.QuerySet):
+    def bulk_create(self, objs, batch_size=None, ignore_conflicts=False, **kwargs):
+        from assets.utils.cidr import assign_assets_to_zones
+
+        objs = list(objs)
+        assign_assets_to_zones(objs)
+        return super().bulk_create(
+            objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts, **kwargs
+        )
+
     def active(self):
         return self.filter(is_active=True)
 
     def valid(self):
         return self.active()
+
+    def gateways(self, is_gateway=1):
+        kwargs = {'platform__name__startswith': 'Gateway'}
+        if is_gateway:
+            return self.filter(**kwargs)
+        else:
+            return self.exclude(**kwargs)
 
     def has_protocol(self, name):
         return self.filter(protocols__contains=name)
@@ -103,7 +156,7 @@ class Protocol(models.Model):
         return protocols[0] if len(protocols) > 0 else {}
 
     @property
-    def setting(self):
+    def setting(self) -> dict:
         if self._setting is not None:
             return self._setting
         return self.asset_platform_protocol.get('setting', {})
@@ -113,7 +166,7 @@ class Protocol(models.Model):
         self._setting = value
 
     @property
-    def public(self):
+    def public(self) -> bool:
         return self.asset_platform_protocol.get('public', True)
 
 
@@ -131,8 +184,16 @@ class JSONFilterMixin:
             value = [value]
         if name == 'nodes':
             nodes = Node.objects.filter(id__in=value)
-            children = Node.get_nodes_all_children(nodes, with_self=True).values_list('id', flat=True)
-            return Q(nodes__in=children)
+            if match == 'm2m_all':
+                assets = Asset.objects.all()
+                for n in nodes:
+                    children_pattern = Node.get_node_all_children_key_pattern(n.key)
+                    assets = assets.filter(nodes__key__regex=children_pattern)
+                q = Q(id__in=assets.values_list('id', flat=True))
+                return q
+            else:
+                children = Node.get_nodes_all_children(nodes, with_self=True).values_list('id', flat=True)
+                return Q(nodes__in=children)
         elif name == 'category':
             return Q(platform__category__in=value)
         elif name == 'type':
@@ -142,19 +203,34 @@ class JSONFilterMixin:
         return None
 
 
-class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseModel):
+class Asset(NodesRelationMixin, LabeledMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseModel):
     Category = const.Category
     Type = const.AllTypes
 
     name = models.CharField(max_length=128, verbose_name=_('Name'))
     address = models.CharField(max_length=767, verbose_name=_('Address'), db_index=True)
-    platform = models.ForeignKey(Platform, on_delete=models.PROTECT, verbose_name=_("Platform"), related_name='assets')
-    domain = models.ForeignKey("assets.Domain", null=True, blank=True, related_name='assets',
-                               verbose_name=_("Domain"), on_delete=models.SET_NULL)
-    nodes = models.ManyToManyField('assets.Node', default=default_node, related_name='assets',
-                                   verbose_name=_("Nodes"))
-    is_active = models.BooleanField(default=True, verbose_name=_('Is active'))
-    labels = models.ManyToManyField('assets.Label', blank=True, related_name='assets', verbose_name=_("Labels"))
+    platform = models.ForeignKey(
+        Platform, on_delete=models.PROTECT, verbose_name=_("Platform"), related_name='assets'
+    )
+    owner = models.ForeignKey(
+        'users.User', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='owned_assets', verbose_name=_('Asset owner'),
+    )
+    zone = models.ForeignKey(
+        "assets.Zone", null=True, blank=True, related_name='assets',
+        verbose_name=_("Zone"), on_delete=models.SET_NULL
+    )
+    nodes = models.ManyToManyField(
+        'assets.Node', default=default_node, related_name='assets', verbose_name=_("Nodes")
+    )
+    directory_services = models.ManyToManyField(
+        'assets.DirectoryService', related_name='assets',
+        verbose_name=_("Directory service")
+    )
+    is_active = models.BooleanField(default=True, verbose_name=_('Active'))
+    date_last_login = models.DateTimeField(
+        null=True, blank=True, db_index=True, verbose_name=_('Last login time')
+    )
     gathered_info = models.JSONField(verbose_name=_('Gathered info'), default=dict, blank=True)  # 资产的一些信息，如 硬件信息
     custom_info = models.JSONField(verbose_name=_('Custom info'), default=dict)
 
@@ -162,6 +238,13 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
 
     def __str__(self):
         return '{0.name}({0.address})'.format(self)
+
+    def get_labels(self):
+        from labels.models import Label, LabeledResource
+        res_type = ContentType.objects.get_for_model(self.__class__.label_model())
+        label_ids = LabeledResource.objects.filter(res_type=res_type, res_id=self.id) \
+            .values_list('label_id', flat=True)
+        return Label.objects.filter(id__in=label_ids)
 
     @staticmethod
     def get_spec_values(instance, fields):
@@ -174,7 +257,11 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
         return info
 
     @lazyproperty
-    def spec_info(self):
+    def is_directory_service(self):
+        return self.category == const.Category.DS and hasattr(self, 'ds')
+
+    @lazyproperty
+    def spec_info(self) -> dict:
         instance = getattr(self, self.category, None)
         if not instance:
             return {}
@@ -204,11 +291,11 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
         return info
 
     @lazyproperty
-    def auto_config(self):
+    def auto_config(self) -> dict:
         platform = self.platform
         auto_config = {
             'su_enabled': platform.su_enabled,
-            'domain_enabled': platform.domain_enabled,
+            'gateway_enabled': platform.gateway_enabled,
             'ansible_enabled': False
         }
         automation = getattr(self.platform, 'automation', None)
@@ -216,6 +303,39 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
             return auto_config
         auto_config.update(model_to_dict(automation))
         return auto_config
+
+    @property
+    def all_accounts(self):
+        if not self.joined_dir_svcs:
+            queryset = self.accounts.all()
+        else:
+            queryset = self.accounts.model.objects.filter(asset__in=[self.id, *self.joined_dir_svcs])
+        return queryset
+
+    @property
+    def dc_accounts(self):
+        queryset = self.accounts.model.objects.filter(asset__in=[*self.joined_dir_svcs])
+        return queryset
+
+    def find_account(self, username, secret_type=None):
+        """ 按用户名查找可用账号，同名时优先资产自身账号，其次是加入的目录服务账号 """
+        lookup = {'username': username}
+        if secret_type:
+            lookup['secret_type'] = secret_type
+        account = self.accounts.filter(**lookup).first()
+        if account is None:
+            account = self.dc_accounts.filter(**lookup).first()
+        return account
+
+    @lazyproperty
+    def all_valid_accounts(self):
+        queryset = (self.all_accounts.filter(is_active=True)
+                    .prefetch_related('asset', 'asset__platform'))
+        return queryset
+
+    @lazyproperty
+    def accounts_amount(self):
+        return self.all_accounts.count()
 
     def get_target_ip(self):
         return self.address
@@ -226,6 +346,41 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
     def get_protocol_port(self, protocol):
         protocol = self.protocols.all().filter(name=protocol).first()
         return protocol.port if protocol else 0
+
+    def is_dir_svc(self):
+        return self.category == const.Category.DS
+
+    @property
+    def joined_dir_svcs(self):
+        return self.directory_services.all()
+
+    @classmethod
+    def compute_all_accounts_amount(cls, assets):
+        from .ds import DirectoryService
+        asset_ids = [asset.id for asset in assets]
+        asset_id_dc_ids_mapper = defaultdict(list)
+        dc_ids = set()
+
+        asset_dc_relations = (
+            Asset.directory_services.through.objects
+            .filter(asset_id__in=asset_ids)
+            .values_list('asset_id', 'directoryservice_id')
+        )
+        for asset_id, ds_id in asset_dc_relations:
+            dc_ids.add(ds_id)
+            asset_id_dc_ids_mapper[asset_id].append(ds_id)
+
+        directory_services = (
+            DirectoryService.objects.filter(id__in=dc_ids)
+            .annotate(accounts_amount=Count('accounts'))
+        )
+        ds_accounts_amount_mapper = {ds.id: ds.accounts_amount for ds in directory_services}
+        for asset in assets:
+            asset_dc_ids = asset_id_dc_ids_mapper.get(asset.id, [])
+            for dc_id in asset_dc_ids:
+                ds_accounts = ds_accounts_amount_mapper.get(dc_id, 0)
+                asset.accounts_amount += ds_accounts
+        return assets
 
     @property
     def is_valid(self):
@@ -249,11 +404,11 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
         return names
 
     @lazyproperty
-    def type(self):
+    def type(self) -> str:
         return self.platform.type
 
     @lazyproperty
-    def category(self):
+    def category(self) -> str:
         return self.platform.category
 
     def is_category(self, category):
@@ -268,11 +423,11 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
 
     @lazyproperty
     def gateway(self):
-        if not self.domain_id:
+        if not self.zone_id:
             return
-        if not self.platform.domain_enabled:
+        if not self.platform.gateway_enabled:
             return
-        return self.domain.select_gateway()
+        return self.zone.select_gateway()
 
     def as_node(self):
         from assets.models import Node
@@ -284,14 +439,20 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
         fake_node.is_node = False
         return fake_node
 
+    def get_icon_skin(self):
+        if self.category == 'device':
+            return 'switch'
+        if self.platform.name.lower() == 'macos':
+            return 'macos'
+        platform_type = self.platform.type.lower()
+        if platform_type in SUPPORTED_ICON_SKINS:
+            return platform_type
+        return 'file'
+
     def as_tree_node(self, parent_node):
         from common.tree import TreeNode
-        icon_skin = 'file'
-        platform_type = self.platform.type.lower()
-        if platform_type == 'windows':
-            icon_skin = 'windows'
-        elif platform_type == 'linux':
-            icon_skin = 'linux'
+        
+        icon_skin = self.get_icon_skin()
         data = {
             'id': str(self.id),
             'name': self.name,
@@ -314,8 +475,7 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
         return tree_node
 
     @staticmethod
-    def get_secret_type_assets(asset_ids, secret_type):
-        assets = Asset.objects.filter(id__in=asset_ids)
+    def get_secret_type_assets(assets, secret_type):
         asset_protocol = assets.prefetch_related('protocols').values_list('id', 'protocols__name')
         protocol_secret_types_map = const.Protocol.protocol_secret_types()
         asset_secret_types_mapp = defaultdict(set)
@@ -332,7 +492,7 @@ class Asset(NodesRelationMixin, AbsConnectivity, JSONFilterMixin, JMSOrgBaseMode
     class Meta:
         unique_together = [('org_id', 'name')]
         verbose_name = _("Asset")
-        ordering = ["name", ]
+        ordering = []
         permissions = [
             ('refresh_assethardwareinfo', _('Can refresh asset hardware info')),
             ('test_assetconnectivity', _('Can test asset connectivity')),

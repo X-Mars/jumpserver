@@ -35,6 +35,7 @@ class OperateLogStore(ES, metaclass=Singleton):
             }
         }
         exact_fields = {}
+        fuzzy_fields = {}
         match_fields = {
             'id', 'user', 'action', 'resource_type',
             'resource', 'remote_addr', 'org_id'
@@ -44,7 +45,7 @@ class OperateLogStore(ES, metaclass=Singleton):
         }
         if not config.get('INDEX'):
             config['INDEX'] = 'jumpserver_operate_log'
-        super().__init__(config, properties, keyword_fields, exact_fields, match_fields)
+        super().__init__(config, properties, keyword_fields, exact_fields, fuzzy_fields, match_fields)
         self.pre_use_check()
 
     @staticmethod
@@ -64,7 +65,9 @@ class OperateLogStore(ES, metaclass=Singleton):
         before = kwargs.get('before') or {}
         after = kwargs.get('after') or {}
 
-        op_log = self.get({'id': log_id})
+        # Most audit events are new records. Skip a remote lookup when there is
+        # no caller-supplied ID and index the event directly.
+        op_log = self.get({'id': log_id}) if log_id else None
         if op_log is not None:
             data = {'doc': {}}
             raw_after = op_log.get('after') or {}

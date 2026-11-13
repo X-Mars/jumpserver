@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 import fido2.features
 from django.conf import settings
 from django.utils import timezone
-from django.utils.translation import gettext as _
+from django.utils.translation import gettext, gettext as _
 from fido2.server import Fido2Server
 from fido2.utils import websafe_decode, websafe_encode
 from fido2.webauthn import PublicKeyCredentialRpEntity, AttestedCredentialData, PublicKeyCredentialUserEntity
@@ -105,11 +105,14 @@ def register_begin(request):
 
 def register_complete(request):
     if not request.session.get("fido2_state"):
-        raise ValidationError("No state found")
+        raise ValidationError(gettext("No state found"))
     data = request.data
     server = get_server(request)
     state = request.session.pop("fido2_state")
-    auth_data = server.register_complete(state, response=data)
+    try:
+        auth_data = server.register_complete(state, response=data)
+    except ValueError as e:
+        raise ValidationError({'error': str(e)})
     encoded = websafe_encode(auth_data.credential_data)
     platform = get_current_platform(request)
     name = data.pop("key_name", '') or platform
@@ -123,21 +126,28 @@ def register_complete(request):
     return passkey
 
 
-def auth_begin(request):
+def auth_begin(request, discoverable=False):
+    """
+    开始 Passkey 认证。
+
+    discoverable=True 时不填充 allowCredentials，走可发现凭证流程。
+    登录未认证时本身就是空列表；MFA 二次确认也需要空列表，
+    否则 Windows Password Manager 无法完成断言。
+    """
     server = get_server(request)
     credentials = []
 
-    username = None
-    if request.user.is_authenticated:
-        username = request.user.username
-    if username:
-        credentials = get_user_credentials(username)
+    if not discoverable and request.user.is_authenticated:
+        credentials = get_user_credentials(request.user.username)
     auth_data, state = server.authenticate_begin(credentials)
     request.session['fido2_state'] = state
     return auth_data
 
 
 def auth_complete(request):
+    state = request.session.pop('fido2_state', None)
+    if not state:
+        raise ValueError(_('No state found'))
     server = get_server(request)
     data = request.data.get("passkeys")
     data = json.loads(data)
@@ -148,7 +158,6 @@ def auth_complete(request):
         raise ValueError(_("This key is not registered"))
 
     credentials = [AttestedCredentialData(websafe_decode(key.token))]
-    state = request.session.get('fido2_state')
     server.authenticate_complete(state, credentials=credentials, response=data)
 
     request.session["passkey"] = '{}_{}'.format(key.id, key.name)

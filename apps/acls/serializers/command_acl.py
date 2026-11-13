@@ -1,3 +1,4 @@
+from .workflow import WorkflowACLSerializerMixin
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
@@ -8,14 +9,23 @@ from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 from orgs.utils import tmp_to_root_org
 from terminal.models import Session
 from .base import BaseUserAssetAccountACLSerializer as BaseSerializer
+from ..const import ActionChoices
 
-__all__ = ["CommandFilterACLSerializer", "CommandGroupSerializer", "CommandReviewSerializer"]
+__all__ = [
+    "CommandFilterACLSerializer", "CommandFilterACLListSerializer",
+    "CommandGroupSerializer", "CommandReviewSerializer",
+]
 
 
 class CommandGroupSerializer(BulkOrgResourceModelSerializer):
     type = LabeledChoiceField(
         choices=CommandGroup.TypeChoices.choices, default=CommandGroup.TypeChoices.command,
-        label=_('Type')
+        label=_('Type'),
+        help_text=_(
+            'Use "command" for literal command names. Each line matches that '
+            'command as a standalone word anywhere in the input, so "rm" also '
+            'matches "rm -rf" and "sudo rm". Use "regex" only for custom patterns.'
+        ),
     )
 
     class Meta:
@@ -23,16 +33,37 @@ class CommandGroupSerializer(BulkOrgResourceModelSerializer):
         fields = ['id', 'name', 'type', 'content', 'ignore_case', 'comment']
 
 
-class CommandFilterACLSerializer(BaseSerializer, BulkOrgResourceModelSerializer):
+class CommandFilterACLSerializer(WorkflowACLSerializerMixin, BaseSerializer, BulkOrgResourceModelSerializer):
     command_groups = ObjectRelatedField(
         queryset=CommandGroup.objects, many=True, required=False, label=_('Command group')
+    )
+    command_groups_amount = serializers.IntegerField(
+        read_only=True, label=_('Command group')
     )
 
     class Meta(BaseSerializer.Meta):
         model = CommandFilterACL
-        fields = BaseSerializer.Meta.fields + ['command_groups']
-        # 默认都支持所有的 actions
-        action_choices_exclude = []
+        relation_count_fields = {
+            'command_groups_amount': 'command_groups',
+        }
+        amount_fields = list(relation_count_fields)
+        fields = BaseSerializer.Meta.fields + ['command_groups', 'workflow', 'workflow_name'] + amount_fields
+        action_choices_exclude = [
+            ActionChoices.notice,
+            ActionChoices.face_verify,
+            ActionChoices.face_online,
+            ActionChoices.change_secret
+        ]
+
+
+class CommandFilterACLListSerializer(CommandFilterACLSerializer):
+    class Meta(CommandFilterACLSerializer.Meta):
+        fields = [
+            field for field in CommandFilterACLSerializer.Meta.fields
+            if field not in [
+                'command_groups', 'assets', 'accounts', 'reviewers', 'users'
+            ]
+        ]
 
 
 class CommandReviewSerializer(serializers.Serializer):

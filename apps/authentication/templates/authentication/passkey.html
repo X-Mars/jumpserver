@@ -1,14 +1,16 @@
 {% load static %}
 {% load i18n %}
+{% get_current_language as LANGUAGE_CODE %}
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ LANGUAGE_CODE }}">
 <head>
     <meta charset="UTF-8">
-    <title>Login passkey</title>
-    <script src="{% static "js/jquery-3.6.1.min.js" %}?_=9"></script>
+    <title>{% trans 'Login passkey' %}</title>
+    <script src="{% static 'js/jquery-3.6.1.min.js' %}?v=10"></script>
 </head>
 <body>
-<form action='{% url 'api-auth:passkey-auth' %}' method="post" id="loginForm">
+<form action="{% url 'api-auth:passkey-auth' %}" method="post" id="loginForm">
+    {% csrf_token %}
     <input type="hidden" name="passkeys" id="passkeys"/>
 </form>
 </body>
@@ -90,7 +92,7 @@
         }
     }
 
-    const publicKeyCredentialToJSON = (pubKeyCred) => {
+    const publicKeyCredentialToJSON = pubKeyCred => {
         if (pubKeyCred instanceof Array) {
             const arr = []
             for (const i of pubKeyCred) {
@@ -99,25 +101,35 @@
             return arr
         }
 
-        if (pubKeyCred instanceof ArrayBuffer) {
+        if (pubKeyCred instanceof ArrayBuffer || pubKeyCred instanceof Uint8Array) {
             return encode(pubKeyCred)
         }
 
         if (pubKeyCred instanceof Object) {
             const obj = {}
+
             for (const key in pubKeyCred) {
                 obj[key] = publicKeyCredentialToJSON(pubKeyCred[key])
             }
+
             return obj
         }
+
         return pubKeyCred
     }
 
     function GetAssertReq(getAssert) {
         getAssert.publicKey.challenge = decode(getAssert.publicKey.challenge)
 
-        for (const allowCred of getAssert.publicKey.allowCredentials) {
+        // allowCredentials 可能为空（可发现凭证）；空数组时删除字段，兼容 Windows Password Manager
+        const allowCredentials = getAssert.publicKey.allowCredentials || []
+        for (const allowCred of allowCredentials) {
             allowCred.id = decode(allowCred.id)
+        }
+        if (allowCredentials.length) {
+            getAssert.publicKey.allowCredentials = allowCredentials
+        } else {
+            delete getAssert.publicKey.allowCredentials
         }
         return getAssert
     }

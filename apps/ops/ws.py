@@ -2,19 +2,30 @@ import asyncio
 import os
 
 import aiofiles
+from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
+from django.utils.translation import gettext
 
 from common.db.utils import close_old_connections
 from common.utils import get_logger
+from orgs.mixins.ws import OrgMixin
+from orgs.utils import tmp_to_org
+from rbac.builtin import BuiltinRole
 from .ansible.utils import get_ansible_task_log_path
 from .celery.utils import get_celery_task_log_path
 from .const import CELERY_LOG_MAGIC_MARK
+from .models import CeleryTaskExecution
 
 logger = get_logger(__name__)
 
 
-class TaskLogWebsocket(AsyncJsonWebsocketConsumer):
+class TaskLogWebsocket(AsyncJsonWebsocketConsumer, OrgMixin):
     disconnected = False
+    log_task = None
+    user_tasks = (
+        'ops.tasks.run_ops_job',
+        'ops.tasks.run_ops_job_execution',
+    )
 
     log_types = {
         'celery': get_celery_task_log_path,
@@ -25,6 +36,8 @@ class TaskLogWebsocket(AsyncJsonWebsocketConsumer):
         user = self.scope["user"]
         if user.is_authenticated:
             await self.accept()
+            self.cookie = self.get_cookie()
+            self.org = self.get_current_org()
         else:
             await self.close()
 
@@ -33,21 +46,118 @@ class TaskLogWebsocket(AsyncJsonWebsocketConsumer):
         if func:
             return func(task_id)
 
+    @sync_to_async
+    def get_task(self, task_id):
+        task = CeleryTaskExecution.objects.filter(id=task_id).first()
+        # task.creator 是 foreign key, 会异步去查询的，在下面的 if task.creator 会报错, 所以这里先取出来
+        if task and task.creator != ' ':
+            return task
+        else:
+            return None
+
+    @sync_to_async
+    def get_current_user_role_ids(self, user):
+        with tmp_to_org(self.org):
+            org_roles = user.org_roles.all()
+        system_roles = user.system_roles.all()
+        roles = system_roles | org_roles
+        user_role_ids = set(map(str, roles.values_list('id', flat=True)))
+        return user_role_ids
+
     async def receive_json(self, content, **kwargs):
         task_id = content.get('task')
-        task_typ = content.get('type', 'celery')
-        log_path = self.get_log_path(task_id, task_typ)
-        await self.async_handle_task(task_id, log_path)
+        task = await self.get_task(task_id)
+        if not task:
+            await self.send_json({'message': gettext('Task not found'), 'task': task_id})
+            return
 
-    async def async_handle_task(self, task_id, log_path):
+        admin_auditor_role_ids = {
+            BuiltinRole.system_admin.id,
+            BuiltinRole.system_auditor.id,
+            BuiltinRole.org_admin.id,
+            BuiltinRole.org_auditor.id
+        }
+        user = self.scope['user']
+        user_role_ids = await self.get_current_user_role_ids(user)
+        has_admin_auditor_role = bool(admin_auditor_role_ids & user_role_ids)
+        has_perms = await self.has_perms(user, ['audits.view_joblog'])
+        user_can_view = task.creator == user or (task.name in self.user_tasks and has_perms)
+        # (有管理员或审计员角色) 或者 (任务是用户自己创建的 或者 有查看任务日志权限), 其他情况没有权限
+        if not (has_admin_auditor_role or user_can_view):
+            await self.send_json({'message': gettext('No permission'), 'task': task_id})
+            return
+
+        task_type = content.get('type', 'celery')
+        log_path = self.get_log_path(task_id, task_type)
+        await self.cancel_log_task()
+        self.log_task = asyncio.create_task(
+            self.async_handle_task(task_id, log_path, task_type)
+        )
+        self.log_task.add_done_callback(self.on_log_task_done)
+
+    @staticmethod
+    def on_log_task_done(task):
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            logger.error('Task log streaming failed', exc_info=error)
+
+    async def cancel_log_task(self):
+        if self.log_task is None:
+            return
+        self.log_task.cancel()
+        await asyncio.gather(self.log_task, return_exceptions=True)
+        self.log_task = None
+
+    async def async_handle_task(
+            self, task_id, log_path, log_type='celery'
+    ):
         logger.info("Task id: {}".format(task_id))
+        status_check_interval = 10  # Check the task state every five seconds.
+        status_check_countdown = 0
+        last_task_state = None
         while not self.disconnected:
-            if not os.path.exists(log_path):
-                await self.send_json({'message': '.', 'task': task_id})
-                await asyncio.sleep(0.5)
-            else:
+            if os.path.exists(log_path):
                 await self.send_task_log(task_id, log_path)
                 break
+
+            if status_check_countdown <= 0:
+                task = await self.get_task(task_id)
+                if not task:
+                    await self.send_json({
+                        'event': 'unavailable', 'reason': 'task_not_found',
+                        'message': '', 'task': task_id,
+                    })
+                    break
+
+                if task.state != last_task_state:
+                    await self.send_json({
+                        'event': 'status', 'state': task.state,
+                        'is_finished': task.is_finished,
+                        'date_published': task.date_published.isoformat(),
+                        'date_start': (
+                            task.date_start.isoformat()
+                            if task.date_start else None
+                        ),
+                        'date_finished': (
+                            task.date_finished.isoformat()
+                            if task.date_finished else None
+                        ),
+                        'task': task_id,
+                    })
+                    last_task_state = task.state
+
+                if task.is_finished:
+                    await self.send_json({
+                        'event': 'unavailable', 'reason': 'finished_without_log',
+                        'state': task.state, 'message': '', 'task': task_id,
+                    })
+                    break
+                status_check_countdown = status_check_interval
+
+            status_check_countdown -= 1
+            await asyncio.sleep(0.5)
 
     async def send_task_log(self, task_id, log_path):
         await self.send_json({'message': '\r\n'})
@@ -69,8 +179,9 @@ class TaskLogWebsocket(AsyncJsonWebsocketConsumer):
                             break
                     await asyncio.sleep(0.2)
         except OSError as e:
-            logger.warn('Task log path open failed: {}'.format(e))
+            logger.warning('Task log path open failed: {}'.format(e))
 
     async def disconnect(self, close_code):
         self.disconnected = True
+        await self.cancel_log_task()
         close_old_connections()

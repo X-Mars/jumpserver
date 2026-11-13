@@ -17,7 +17,7 @@ from django.db.models import F, ExpressionWrapper, CASCADE
 from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
 
-from ..const.signals import SKIP_SIGNAL
+from ..const.signals import OP_LOG_SKIP_SIGNAL
 
 
 class ChoicesMixin:
@@ -49,6 +49,7 @@ class JMSBaseModel(BaseCreateUpdateModel):
         return str(self.id)
 
 
+# Mysql PostgreSQL incompatible (ce6e5038a6134fad83aba220e6204cf9 ce6e5038-a613-4fad-83ab-a220e6204cf9)
 def output_as_string(field_name):
     return ExpressionWrapper(F(field_name), output_field=models.CharField())
 
@@ -82,7 +83,7 @@ def CASCADE_SIGNAL_SKIP(collector, field, sub_objs, using):
     # 级联删除时，操作日志标记不保存，以免用户混淆
     try:
         for obj in sub_objs:
-            setattr(obj, SKIP_SIGNAL, True)
+            setattr(obj, OP_LOG_SKIP_SIGNAL, True)
     except:
         pass
 

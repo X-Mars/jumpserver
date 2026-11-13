@@ -4,10 +4,11 @@ from django.db import models
 from django.db.models.signals import post_save
 from django.utils.translation import gettext_lazy as _
 
+from orgs.mixins.models import OrgManager
 from terminal.backends.command.models import AbstractSessionCommand
 
 
-class CommandManager(models.Manager):
+class CommandManager(OrgManager):
     def bulk_create(self, objs, **kwargs):
         resp = super().bulk_create(objs, **kwargs)
         for i in objs:
@@ -40,7 +41,7 @@ class Command(AbstractSessionCommand):
                 'timestamp': int(d.timestamp()),
                 'org_id': str(org.id)
             })
-            for i in range(count)
+            for __ in range(count)
         ]
         cls.objects.bulk_create(commands)
         print(f'Create {len(commands)} commands of org ({org})')
@@ -60,7 +61,20 @@ class Command(AbstractSessionCommand):
             commands.append(command)
         return commands
 
+    @staticmethod
+    def get_all_type_queryset_tuple():
+        from terminal.models import CommandStorage
+        storage_qs = CommandStorage.objects.exclude(name='null')
+        return (
+            (storage.type, storage.get_command_queryset())
+            for storage in storage_qs
+            if storage.is_valid()
+        )
+
     class Meta:
         db_table = "terminal_command"
         ordering = ('-timestamp',)
         verbose_name = _('Command record')
+        indexes = [
+            models.Index(fields=['timestamp', 'org_id'], name='idx_timestamp_org'),
+        ]

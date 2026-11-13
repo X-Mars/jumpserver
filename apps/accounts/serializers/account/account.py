@@ -1,22 +1,25 @@
 import uuid
 from copy import deepcopy
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError
 from django.db import transaction
 from django.db.models import Q
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext, gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.generics import get_object_or_404
 from rest_framework.validators import UniqueTogetherValidator
 
 from accounts.const import SecretType, Source, AccountInvalidPolicy
-from accounts.models import Account, AccountTemplate
-from accounts.tasks import push_accounts_to_assets_task
+from accounts.exceptions import TemplateFollowingConflict
+from accounts.models import Account, AccountTemplate, GatheredAccount
+from accounts.tasks import push_accounts_to_assets_task, template_sync_related_accounts
 from assets.const import Category, AllTypes
 from assets.models import Asset
-from common.serializers import SecretReadableMixin
+from common.serializers import SecretReadableMixin, SecretReadableCheckMixin, CommonBulkModelSerializer
 from common.serializers.fields import ObjectRelatedField, LabeledChoiceField
 from common.utils import get_logger
+from accounts.utils import validate_account_username
 from .base import BaseAccountSerializer, AuthValidateMixin
 
 logger = get_logger(__name__)
@@ -31,7 +34,9 @@ class AccountCreateUpdateSerializerMixin(serializers.Serializer):
         default=False, label=_("Push now"), write_only=True
     )
     params = serializers.JSONField(
-        decoder=None, encoder=None, required=False, style={'base_template': 'textarea.html'}
+        decoder=None, encoder=None, required=False,
+        style={'base_template': 'textarea.html'},
+        label=_('Params'),
     )
     on_invalid = LabeledChoiceField(
         choices=AccountInvalidPolicy.choices, default=AccountInvalidPolicy.ERROR,
@@ -58,13 +63,16 @@ class AccountCreateUpdateSerializerMixin(serializers.Serializer):
         for data in initial_data:
             if not data.get('asset') and not self.instance:
                 raise serializers.ValidationError({'asset': UniqueTogetherValidator.missing_message})
-            asset = data.get('asset') or self.instance.asset
+            asset = data.get('asset') or getattr(self.instance, 'asset', None)
             self.from_template_if_need(data)
             self.set_uniq_name_if_need(data, asset)
 
     def set_uniq_name_if_need(self, initial_data, asset):
         name = initial_data.get('name')
         if name is not None:
+            return
+        request = self.context.get('request')
+        if request and request.method == 'PATCH':
             return
         if not name:
             name = initial_data.get('username')
@@ -75,19 +83,31 @@ class AccountCreateUpdateSerializerMixin(serializers.Serializer):
         initial_data['name'] = name
 
     @staticmethod
-    def get_template_attr_for_account(template):
-        # Set initial data from template
+    def get_template_attr_for_account(template, follow_template=False):
         field_names = [
-            'username', 'secret', 'secret_type', 'privileged', 'is_active'
+            'name', 'username',
+            'secret_type',
+            'privileged', 'is_active'
         ]
+
+        field_map = {
+            'push_params': 'params',
+            'auto_push': 'push_now'
+        }
+
+        field_names.extend(field_map.keys())
 
         attrs = {}
         for name in field_names:
             value = getattr(template, name, None)
             if value is None:
                 continue
-            attrs[name] = value
-        attrs['secret'] = template.get_secret()
+
+            attr_name = field_map.get(name, name)
+            attrs[attr_name] = value
+
+        if not follow_template:
+            attrs['secret'] = template.get_secret()
         return attrs
 
     def from_template_if_need(self, initial_data):
@@ -103,11 +123,19 @@ class AccountCreateUpdateSerializerMixin(serializers.Serializer):
         else:
             template = template_id
         if not template:
-            raise serializers.ValidationError({'template': 'Template not found'})
+            raise serializers.ValidationError({'template': gettext('Template not found')})
 
         self._template = template
-        attrs = self.get_template_attr_for_account(template)
+        try:
+            following = serializers.BooleanField().run_validation(initial_data.get('follow_template', True))
+        except serializers.ValidationError as exc:
+            raise serializers.ValidationError({'follow_template': exc.detail}) from exc
+        attrs = self.get_template_attr_for_account(template, follow_template=following)
+        if following:
+            initial_data.pop('secret', None)
+            initial_data.pop('passphrase', None)
         initial_data.update(attrs)
+        initial_data.setdefault('follow_template', True)
         initial_data.update({
             'source': Source.TEMPLATE,
             'source_id': str(template.id)
@@ -117,6 +145,52 @@ class AccountCreateUpdateSerializerMixin(serializers.Serializer):
             return
         asset = get_object_or_404(Asset, pk=asset_id)
         initial_data['su_from'] = template.get_su_from_account(asset)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        instance = self.instance
+        following = attrs.get('follow_template', getattr(instance, 'follow_template', False))
+        if not following:
+            return attrs
+        if instance and instance.follow_template and (
+            'secret' in attrs or bool(attrs.get('passphrase'))
+            or ('secret_type' in attrs and attrs['secret_type'] != instance.secret_type)
+        ):
+            raise TemplateFollowingConflict()
+        source = attrs.get('source', getattr(instance, 'source', None))
+        source_id = attrs.get('source_id', getattr(instance, 'source_id', None))
+        try:
+            template = (AccountTemplate.objects.filter(id=source_id).first()
+                        if source == Source.TEMPLATE and source_id else None)
+        except (ValueError, TypeError, DjangoValidationError):
+            template = None
+        owner = instance or attrs.get('asset')
+        if source != Source.TEMPLATE or template is None or (
+            owner and template.org_id != owner.org_id
+        ):
+            raise serializers.ValidationError({
+                'follow_template': _('Following requires a valid account template in the same organization.')
+            })
+        secret_type = attrs.get('secret_type', getattr(instance, 'secret_type', template.secret_type))
+        if secret_type != template.secret_type:
+            raise serializers.ValidationError({'secret_type': _('Account and template secret types must match.')})
+        if 'secret' in attrs:
+            raise serializers.ValidationError({'secret': _('Following accounts use template credentials.')})
+        if instance:
+            for field in Account.TEMPLATE_SYNC_FIELDS:
+                if field in attrs and attrs[field] != getattr(instance, field):
+                    raise serializers.ValidationError({
+                        field: _('Disable template following before editing this field.')
+                    })
+        return attrs
+
+    def clean_auth_fields(self, validated_data):
+        following = validated_data.get('follow_template', getattr(self.instance, 'follow_template', False))
+        if following:
+            validated_data.pop('secret', None)
+            validated_data.pop('passphrase', None)
+            return
+        super().clean_auth_fields(validated_data)
 
     def push_account_if_need(self, instance, push_now, params, stat):
         if not push_now or stat not in ['created', 'updated']:
@@ -162,14 +236,15 @@ class AccountCreateUpdateSerializerMixin(serializers.Serializer):
             instance.save()
             return instance, 'updated'
         else:
-            raise serializers.ValidationError('Account already exists')
+            raise serializers.ValidationError(_('Account already exists'))
 
     def create(self, validated_data):
         push_now = validated_data.pop('push_now', None)
         params = validated_data.pop('params', None)
         self.clean_auth_fields(validated_data)
         instance, stat = self.do_create(validated_data)
-        self.push_account_if_need(instance, push_now, params, stat)
+        if instance.source == Source.LOCAL:
+            self.push_account_if_need(instance, push_now, params, stat)
         return instance
 
     def update(self, instance, validated_data):
@@ -178,20 +253,28 @@ class AccountCreateUpdateSerializerMixin(serializers.Serializer):
         validated_data.pop('on_invalid', None)
         push_now = validated_data.pop('push_now', None)
         params = validated_data.pop('params', None)
-        validated_data['source_id'] = None
+        start_following = validated_data.get('follow_template', False) and not instance.follow_template
+        if instance.follow_template and validated_data.get('follow_template') is False:
+            # DRF assigns fields in order; detach before invoking the secret setter.
+            validated_data = {'follow_template': False, **validated_data}
+            validated_data.setdefault('secret_type', instance.secret_type)
         instance = super().update(instance, validated_data)
+        if start_following and Account.TEMPLATE_SYNC_FIELDS:
+            template_id = instance.source_id
+            transaction.on_commit(lambda: template_sync_related_accounts.delay(template_id))
         self.push_account_if_need(instance, push_now, params, 'updated')
         return instance
 
 
 class AccountAssetSerializer(serializers.ModelSerializer):
-    platform = ObjectRelatedField(read_only=True)
+    platform = ObjectRelatedField(read_only=True, attrs=('id', 'name', 'type'))
     category = LabeledChoiceField(choices=Category.choices, read_only=True, label=_('Category'))
     type = LabeledChoiceField(choices=AllTypes.choices(), read_only=True, label=_('Type'))
 
     class Meta:
         model = Asset
         fields = ['id', 'name', 'address', 'type', 'category', 'platform', 'auto_config']
+        exclude_backup_fields = ['platform', 'auto_config']
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
@@ -205,80 +288,140 @@ class AccountAssetSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(_('Asset not found'))
 
 
+class SuFromAccountRelatedField(ObjectRelatedField):
+    def to_representation(self, value):
+        data = super().to_representation(value)
+        # 目录服务账号显示 UPN (user@domain)
+        data['username'] = value.full_username
+        return data
+
+
 class AccountSerializer(AccountCreateUpdateSerializerMixin, BaseAccountSerializer):
     asset = AccountAssetSerializer(label=_('Asset'))
+    asset_address = serializers.CharField(source='asset.address', read_only=True, label=_('Asset IP'))
     source = LabeledChoiceField(
         choices=Source.choices, label=_("Source"), required=False,
         allow_null=True, default=Source.LOCAL
     )
-    su_from = ObjectRelatedField(
+    su_from = SuFromAccountRelatedField(
         required=False, queryset=Account.objects, allow_null=True, allow_empty=True,
         label=_('Su from'), attrs=('id', 'name', 'username')
     )
+    ds = ObjectRelatedField(read_only=True, label=_('Directory service'), attrs=('id', 'name', 'domain_name'))
 
     class Meta(BaseAccountSerializer.Meta):
         model = Account
-        fields = BaseAccountSerializer.Meta.fields + [
-            'su_from', 'asset', 'version',
-            'source', 'source_id', 'connectivity',
-        ] + AccountCreateUpdateSerializerMixin.Meta.fields
-        read_only_fields = BaseAccountSerializer.Meta.read_only_fields + [
-            'connectivity'
+        automation_fields = [
+            'date_last_login', 'login_by', 'date_verified', 'connectivity',
+            'date_change_secret', 'change_secret_status'
         ]
+        fields = BaseAccountSerializer.Meta.fields + [
+            'su_from', 'asset', 'asset_address', 'version', 'ds',
+            'source', 'source_id', 'follow_template', 'secret_reset',
+        ] + AccountCreateUpdateSerializerMixin.Meta.fields + automation_fields
+        read_only_fields = BaseAccountSerializer.Meta.read_only_fields + automation_fields + ['asset_address']
+        fields = [f for f in fields if f not in ['spec_info']]
         extra_kwargs = {
             **BaseAccountSerializer.Meta.extra_kwargs,
             'name': {'required': False},
             'source_id': {'required': False, 'allow_null': True},
+            'follow_template': {
+                'help_text': _('Only applies to template accounts. Credentials are read from the current template.')
+            },
         }
+        fields_unimport_template = ['params', 'asset_address']
+        # 手动判断唯一性校验
+        validators = []
 
     @classmethod
     def setup_eager_loading(cls, queryset):
         """ Perform necessary eager loading of data. """
         queryset = queryset.prefetch_related(
             'asset', 'asset__platform',
-            'asset__platform__automation'
+            'asset__platform__automation',
+            'su_from__asset__platform', 'su_from__asset__ds'
         )
         return queryset
 
+    def validate(self, attrs):
+        attrs = self.validate_dynamic_credential(attrs)
+        instance = getattr(self, "instance", None)
+        if instance:
+            return super().validate(attrs)
+
+        field_errors = {}
+        for _fields in Account._meta.unique_together:
+            lookup = {field: attrs.get(field) for field in _fields}
+            if Account.objects.filter(**lookup).exists():
+                verbose_names = ', '.join([str(Account._meta.get_field(f).verbose_name) for f in _fields])
+                msg_template = _('Account already exists. Field(s): {fields} must be unique.')
+                field_errors[_fields[0]] = msg_template.format(fields=verbose_names)
+                raise serializers.ValidationError(field_errors)
+        return super().validate(attrs)
+
 
 class AccountDetailSerializer(AccountSerializer):
+    source_template = serializers.SerializerMethodField(label=_('Source template'))
+
+    @staticmethod
+    def get_source_template(obj):
+        if obj.source != Source.TEMPLATE or not obj.source_id:
+            return None
+        try:
+            template = AccountTemplate.objects.filter(
+                id=obj.source_id, org_id=obj.org_id,
+            ).values('id', 'name').first()
+        except (DjangoValidationError, ValueError, TypeError):
+            return None
+        if template is None:
+            return None
+        return {'id': str(template['id']), 'name': template['name']}
+
     has_secret = serializers.BooleanField(label=_("Has secret"), read_only=True)
 
     class Meta(AccountSerializer.Meta):
         model = Account
-        fields = AccountSerializer.Meta.fields + ['has_secret']
+        fields = AccountSerializer.Meta.fields + ['has_secret', 'spec_info', 'source_template']
         read_only_fields = AccountSerializer.Meta.read_only_fields + ['has_secret']
+
+
+class SuFromAccountSerializer(AccountSerializer):
+    # 切换自下拉框显示 "名称(用户名)"，目录服务账号显示 UPN (user@domain)
+    username = serializers.CharField(source='full_username', read_only=True, label=_('Username'))
 
 
 class AssetAccountBulkSerializerResultSerializer(serializers.Serializer):
     asset = serializers.CharField(read_only=True, label=_('Asset'))
+    account = serializers.CharField(read_only=True, label=_('Account'))
     state = serializers.CharField(read_only=True, label=_('State'))
     error = serializers.CharField(read_only=True, label=_('Error'))
     changed = serializers.BooleanField(read_only=True, label=_('Changed'))
 
 
 class AssetAccountBulkSerializer(
-    AccountCreateUpdateSerializerMixin, AuthValidateMixin, serializers.ModelSerializer
+    AccountCreateUpdateSerializerMixin, AuthValidateMixin, CommonBulkModelSerializer
 ):
     su_from_username = serializers.CharField(
         max_length=128, required=False, write_only=True, allow_null=True, label=_("Su from"),
         allow_blank=True,
     )
-    assets = serializers.PrimaryKeyRelatedField(queryset=Asset.objects, many=True, label=_('Assets'))
 
     class Meta:
         model = Account
         fields = [
-            'name', 'username', 'secret', 'secret_type', 'passphrase',
-            'privileged', 'is_active', 'comment', 'template',
-            'on_invalid', 'push_now', 'assets', 'su_from_username',
-            'source', 'source_id',
+            'name', 'username', 'secret', 'secret_type', 'secret_reset',
+            'passphrase', 'privileged', 'is_active', 'comment', 'template',
+            'on_invalid', 'push_now', 'params',
+            'su_from_username', 'source', 'source_id', 'follow_template',
         ]
         extra_kwargs = {
             'name': {'required': False},
             'secret_type': {'required': False},
             'source': {'required': False, 'allow_null': True},
             'source_id': {'required': False, 'allow_null': True},
+            'follow_template': {
+                'help_text': _('Only applies to template accounts. Credentials are read from the current template.')
+            },
         }
 
     def set_initial_value(self):
@@ -286,6 +429,10 @@ class AssetAccountBulkSerializer(
             return
         initial_data = self.initial_data
         self.from_template_if_need(initial_data)
+
+    @staticmethod
+    def validate_username(value):
+        return validate_account_username(value)
 
     @staticmethod
     def get_filter_lookup(vd):
@@ -301,10 +448,6 @@ class AssetAccountBulkSerializer(
 
     @staticmethod
     def _handle_update_create(vd, lookup):
-        ori = Account.objects.filter(**lookup).first()
-        if ori and ori.secret == vd.get('secret'):
-            return ori, False, 'skipped'
-
         instance, value = Account.objects.update_or_create(defaults=vd, **lookup)
         state = 'created' if value else 'updated'
         return instance, True, state
@@ -330,7 +473,7 @@ class AssetAccountBulkSerializer(
         if template:
             su_from = template.get_su_from_account(asset)
         elif su_from_username:
-            su_from = asset.accounts.filter(username=su_from_username).first()
+            su_from = asset.find_account(su_from_username)
         validated_data['su_from'] = su_from
 
     def perform_create(self, vd, handler):
@@ -353,8 +496,7 @@ class AssetAccountBulkSerializer(
             handler = self._handle_err_create
         return handler
 
-    def perform_bulk_create(self, vd):
-        assets = vd.pop('assets')
+    def perform_bulk_create(self, vd, assets):
         on_invalid = vd.pop('on_invalid', 'skip')
         secret_type = vd.get('secret_type', 'password')
 
@@ -362,15 +504,15 @@ class AssetAccountBulkSerializer(
             vd['name'] = vd.get('username')
 
         create_handler = self.get_create_handler(on_invalid)
-        asset_ids = [asset.id for asset in assets]
-        secret_type_supports = Asset.get_secret_type_assets(asset_ids, secret_type)
+        secret_type_supports = Asset.get_secret_type_assets(assets, secret_type)
 
         _results = {}
         for asset in assets:
-            if asset not in secret_type_supports:
+            if asset not in secret_type_supports and asset.category != Category.CUSTOM:
                 _results[asset] = {
                     'error': _('Asset does not support this secret type: %s') % secret_type,
                     'state': 'error',
+                    'account': vd['name'],
                 }
                 continue
 
@@ -380,13 +522,13 @@ class AssetAccountBulkSerializer(
                 self.clean_auth_fields(vd)
                 instance, changed, state = self.perform_create(vd, create_handler)
                 _results[asset] = {
-                    'changed': changed, 'instance': instance.id, 'state': state
+                    'changed': changed, 'instance': instance.id, 'state': state, 'account': vd['name']
                 }
             except serializers.ValidationError as e:
-                _results[asset] = {'error': e.detail[0], 'state': 'error'}
+                _results[asset] = {'error': e.detail[0], 'state': 'error', 'account': vd['name']}
             except Exception as e:
                 logger.exception(e)
-                _results[asset] = {'error': str(e), 'state': 'error'}
+                _results[asset] = {'error': str(e), 'state': 'error', 'account': vd['name']}
 
         results = [{'asset': asset, **result} for asset, result in _results.items()]
         state_score = {'created': 3, 'updated': 2, 'skipped': 1, 'error': 0}
@@ -403,37 +545,61 @@ class AssetAccountBulkSerializer(
             errors.append({
                 'error': _('Account has exist'),
                 'state': 'error',
-                'asset': str(result['asset'])
+                'asset': str(result['asset']),
+                'account': result.get('account'),
             })
         if errors:
             raise serializers.ValidationError(errors)
         return results
 
     @staticmethod
-    def push_accounts_if_need(results, push_now):
+    def push_accounts_if_need(results, push_now, params):
         if not push_now:
             return
-        accounts = [str(v['instance']) for v in results if v.get('instance')]
-        push_accounts_to_assets_task.delay(accounts)
 
-    def create(self, validated_data):
+        account_ids = [v['instance'] for v in results if v.get('instance')]
+        accounts = Account.objects.filter(id__in=account_ids, source=Source.LOCAL)
+        if not accounts.exists():
+            return
+
+        account_ids = [str(_id) for _id in accounts.values_list('id', flat=True)]
+        push_accounts_to_assets_task.delay(account_ids, params)
+
+    def bulk_create(self, validated_data, assets):
+        if not assets:
+            raise serializers.ValidationError(
+                {'assets': _('At least one asset or node must be specified')},
+                {'nodes': _('At least one asset or node must be specified')}
+            )
+
+        params = validated_data.pop('params', None)
         push_now = validated_data.pop('push_now', False)
-        results = self.perform_bulk_create(validated_data)
-        self.push_accounts_if_need(results, push_now)
+        results = self.perform_bulk_create(validated_data, assets)
+        self.push_accounts_if_need(results, push_now, params)
         for res in results:
             res['asset'] = str(res['asset'])
         return results
 
 
-class AccountSecretSerializer(SecretReadableMixin, AccountSerializer):
+class AccountSecretSerializer(SecretReadableCheckMixin, SecretReadableMixin, AccountSerializer):
+    spec_info = serializers.DictField(label=_('Spec info'), read_only=True)
+
     class Meta(AccountSerializer.Meta):
+        fields = AccountSerializer.Meta.fields + ['spec_info']
         extra_kwargs = {
+            **AccountSerializer.Meta.extra_kwargs,
             'secret': {'write_only': False},
+            'spec_info': {'label': _('Spec info')},
         }
+        exclude_backup_fields = [
+            'passphrase', 'push_now', 'params', 'spec_info'
+        ]
+        secret_fields = ['secret']
 
 
-class AccountHistorySerializer(serializers.ModelSerializer):
+class AccountHistorySerializer(SecretReadableCheckMixin, serializers.ModelSerializer):
     secret_type = LabeledChoiceField(choices=SecretType.choices, label=_('Secret type'))
+    secret = serializers.CharField(label=_('Secret'), read_only=True)
     id = serializers.IntegerField(label=_('ID'), source='history_id', read_only=True)
 
     class Meta:
@@ -447,17 +613,24 @@ class AccountHistorySerializer(serializers.ModelSerializer):
             'history_user': {'label': _('User')},
             'history_date': {'label': _('Date')},
         }
+        secret_fields = ['secret']
 
 
 class AccountTaskSerializer(serializers.Serializer):
     ACTION_CHOICES = (
-        ('test', 'test'),
         ('verify', 'verify'),
         ('push', 'push'),
+        ('remove', 'remove'),
     )
     action = serializers.ChoiceField(choices=ACTION_CHOICES, write_only=True)
+    assets = serializers.PrimaryKeyRelatedField(
+        queryset=Asset.objects, required=False, allow_empty=True, many=True
+    )
     accounts = serializers.PrimaryKeyRelatedField(
         queryset=Account.objects, required=False, allow_empty=True, many=True
+    )
+    gather_accounts = serializers.PrimaryKeyRelatedField(
+        queryset=GatheredAccount.objects, required=False, allow_empty=True, many=True
     )
     task = serializers.CharField(read_only=True)
     params = serializers.JSONField(

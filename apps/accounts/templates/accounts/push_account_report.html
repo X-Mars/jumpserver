@@ -1,0 +1,8 @@
+{% extends 'automations/base_report.html' %}
+{% load i18n %}
+
+{% block report_type %}{% trans 'Push account' %}{% endblock %}
+
+{% block report_body %}
+    {% include 'accounts/reports/account_results.html' %}
+{% endblock %}

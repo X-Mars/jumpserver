@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db.models import TextChoices, IntegerChoices
 from django.utils.translation import gettext_lazy as _
 
@@ -13,30 +14,36 @@ class TicketType(TextChoices):
 
 
 class TicketState(TextChoices):
-    pending = 'pending', _('Open')
-    closed = 'closed', _("Cancel")
-    reopen = 'reopen', _("Reopen")
-    approved = 'approved', _('Approved')
-    rejected = 'rejected', _('Rejected')
+    all = 'all', _('All')
+    pending = 'pending', _('Ticket open')
+    closed = 'closed', _("Ticket closed")
+    approved = 'approved', _('Ticket approved')
+    rejected = 'rejected', _('Ticket rejected')
+    expired = 'expired', _('Expired')
+    error = 'error', _('Error')
 
 
 class TicketStatus(TextChoices):
-    open = 'open', _("Open")
-    closed = 'closed', _("Finished")
+    open = 'open', _("Ticket open")
+    closed = 'closed', _("Ticket finished")
+
+
+class TicketOrigin(TextChoices):
+    manual = 'manual', _("Manual request")
+    system = 'system', _("System triggered")
 
 
 class StepState(TextChoices):
-    pending = 'pending', _('Pending')
-    closed = 'closed', _("Closed")
-    reopen = 'reopen', _("Reopen")
-    approved = 'approved', _('Approved')
-    rejected = 'rejected', _('Rejected')
+    pending = 'pending', _('Step pending')
+    closed = 'closed', _("Step closed")
+    approved = 'approved', _('Step approved')
+    rejected = 'rejected', _('Step rejected')
 
 
 class StepStatus(TextChoices):
-    active = 'active', _('Active')
-    closed = 'closed', _("Closed")
-    pending = 'pending', _('Pending')
+    active = 'active', _('Step active')
+    closed = 'closed', _("Step closed")
+    pending = 'pending', _('Step pending')
 
 
 class TicketAction(TextChoices):
@@ -49,10 +56,24 @@ class TicketAction(TextChoices):
 class TicketLevel(IntegerChoices):
     one = 1, _("One level")
     two = 2, _("Two level")
+    three = 3, _("Three level")
+    four = 4, _("Four level")
+    five = 5, _("Five level")
 
 
-class TicketApprovalStrategy(TextChoices):
-    org_admin = 'org_admin', _("Org admin")
-    custom_user = 'custom_user', _("Custom user")
-    super_admin = 'super_admin', _("Super admin")
-    super_org_admin = 'super_org_admin', _("Super admin and org admin")
+class TicketApplyAssetScope(TextChoices):
+    all = 'all', _("All assets")
+    permed = 'permed', _("Permed assets")
+    permed_valid = 'permed_valid', _('Permed valid assets')
+
+    @classmethod
+    def get_scope(cls):
+        return settings.TICKET_APPLY_ASSET_SCOPE.lower()
+
+    @classmethod
+    def is_permed(cls):
+        return cls.get_scope() == cls.permed
+
+    @classmethod
+    def is_permed_valid(cls):
+        return cls.get_scope() == cls.permed_valid

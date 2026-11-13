@@ -8,15 +8,15 @@ from terminal.const import RiskLevelChoices
 from terminal.models import Command
 
 logger = get_logger(__name__)
-__all__ = ['SessionCommandSerializer', 'InsecureCommandAlertSerializer']
+__all__ = ['SessionCommandSerializer', 'SessionCommandReceiptSerializer', 'InsecureCommandAlertSerializer']
 
 
 class SimpleSessionCommandSerializer(serializers.ModelSerializer):
     """ 简单Session命令序列类, 用来提取公共字段 """
     user = serializers.CharField(label=_("User"))  # 限制 64 字符，见 validate_user
     asset = serializers.CharField(max_length=128, label=_("Asset"))
-    input = serializers.CharField(max_length=2048, label=_("Command"))
-    session = serializers.CharField(max_length=36, label=_("Session ID"))
+    input = serializers.CharField(label=_("Command"))
+    session = serializers.CharField(max_length=36, label=_("Session"))
     risk_level = LabeledChoiceField(
         choices=RiskLevelChoices.choices,
         required=False, label=_("Risk level"),
@@ -46,7 +46,7 @@ class InsecureCommandAlertSerializer(SimpleSessionCommandSerializer):
 
     class Meta(SimpleSessionCommandSerializer.Meta):
         fields = SimpleSessionCommandSerializer.Meta.fields + [
-            'cmd_filter_acl', 'cmd_group',
+            'cmd_filter_acl', 'cmd_group', 'timestamp'
         ]
 
     def validate(self, attrs):
@@ -69,8 +69,8 @@ class SessionCommandSerializerMixin(serializers.Serializer):
     """使用这个类作为基础Command Log Serializer类, 用来序列化"""
     id = serializers.UUIDField(read_only=True)
     # 限制 64 字符，不能直接迁移成 128 字符，命令表数据量会比较大
-    account = serializers.CharField(label=_("Account "))
-    output = serializers.CharField(max_length=2048, allow_blank=True, label=_("Output"))
+    account = serializers.CharField(label=_("Account"))
+    output = serializers.CharField(allow_blank=True, label=_("Output"))
     timestamp = serializers.IntegerField(label=_('Timestamp'))
     timestamp_display = serializers.DateTimeField(read_only=True, label=_('Datetime'))
     remote_addr = serializers.CharField(read_only=True, label=_('Remote Address'))
@@ -88,3 +88,9 @@ class SessionCommandSerializer(SessionCommandSerializerMixin, SimpleSessionComma
         fields = SimpleSessionCommandSerializer.Meta.fields + [
             'id', 'account', 'output', 'timestamp', 'timestamp_display', 'remote_addr'
         ]
+
+
+class SessionCommandReceiptSerializer(SessionCommandSerializer):
+    # Only the component upload endpoint opts in. Ordinary command APIs retain
+    # their read-only id contract; repeated SQL executions get different ids.
+    id = serializers.UUIDField(required=True)

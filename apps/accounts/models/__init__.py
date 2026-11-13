@@ -3,3 +3,8 @@ from .base import *  # noqa
 from .automations import *  # noqa
 from .template import *  # noqa
 from .virtual import *  # noqa
+from .application import *  # noqa
+from .personal import *  # noqa
+from .credential import *  # noqa
+from .application_audit import *  # noqa
+from .application_command import *  # noqa

@@ -1,26 +1,29 @@
 # -*- coding: utf-8 -*-
 #
-from django.utils import translation
+from datetime import datetime
+
 from django.utils import timezone
 from rest_framework import generics
 from rest_framework.fields import DateTimeField
 from rest_framework.response import Response
+from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_201_CREATED
 
 from acls.models import CommandFilterACL, CommandGroup
-from terminal.models import CommandStorage, Session, Command
-from terminal.filters import CommandFilter
-from orgs.utils import current_org
 from common.api import JMSBulkModelViewSet
 from common.utils import get_logger
-from terminal.serializers import (
-    SessionCommandSerializer,  InsecureCommandAlertSerializer
-)
-from terminal.exceptions import StorageInvalid
+from orgs.utils import current_org
 from terminal.backends import (
     get_command_storage, get_multi_command_storage
 )
-from terminal.notifications import CommandAlertMessage, CommandWarningMessage
+from terminal.backends.command.receipt import ComponentCommandReceipt
 from terminal.const import RiskLevelChoices
+from terminal.exceptions import StorageInvalid
+from terminal.filters import CommandFilter
+from terminal.models import CommandStorage, Session, Command
+from terminal.notifications import CommandAlertMessage, CommandWarningMessage
+from terminal.serializers import (
+    SessionCommandSerializer, InsecureCommandAlertSerializer
+)
 
 logger = get_logger(__name__)
 __all__ = ['CommandViewSet', 'InsecureCommandAlertAPI']
@@ -140,8 +143,8 @@ class CommandViewSet(JMSBulkModelViewSet):
         if session_id and not command_storage_id:
             # 会话里的命令列表肯定会提供 session_id，这里防止 merge 的时候取全量的数据
             return self.merge_all_storage_list(request, *args, **kwargs)
-
-        queryset = self.filter_queryset(self.get_queryset())
+        queryset = self.get_queryset()
+        queryset = self.filter_queryset(queryset)
 
         page = self.paginate_queryset(queryset)
         if page is not None:
@@ -166,11 +169,16 @@ class CommandViewSet(JMSBulkModelViewSet):
         return commands
 
     def get_queryset(self):
-        command_storage_id = self.request.query_params.get('command_storage_id')
-        if not command_storage_id:
+        if getattr(self, 'swagger_fake_view', False):
             return Command.objects.none()
 
-        storage = CommandStorage.objects.get(id=command_storage_id)
+        command_storage_id = self.request.query_params.get('command_storage_id')
+        if not command_storage_id:
+            storage = CommandStorage.default()
+            if not storage:
+                return Command.objects.none()
+        else:
+            storage = CommandStorage.objects.get(id=command_storage_id)
         if not storage.is_valid():
             raise StorageInvalid
         else:
@@ -178,17 +186,21 @@ class CommandViewSet(JMSBulkModelViewSet):
         return qs
 
     def create(self, request, *args, **kwargs):
-        serializer = self.serializer_class(data=request.data, many=True)
-        if serializer.is_valid():
-            ok = self.command_store.bulk_save(serializer.validated_data)
-            if ok:
-                return Response("ok", status=201)
-            else:
-                return Response("Save error", status=500)
+        receipt = request.headers.get('X-JMS-Audit-Protocol') == '1'
+        serializer_class = self.serializer_class
+        if receipt:
+            from terminal.serializers.command import SessionCommandReceiptSerializer
+            serializer_class = SessionCommandReceiptSerializer
+        serializer = serializer_class(data=request.data, many=True)
+        serializer.is_valid(raise_exception=True)
+        if receipt:
+            delivery = ComponentCommandReceipt(request.user, self.command_store)
+            return Response(delivery.save(serializer.validated_data), status=HTTP_201_CREATED)
+        ok = self.command_store.bulk_save(serializer.validated_data)
+        if ok:
+            return Response("ok", status=HTTP_201_CREATED)
         else:
-            msg = "Command not valid: {}".format(serializer.errors)
-            logger.error(msg)
-            return Response({"msg": msg}, status=401)
+            return Response("Save error", status=HTTP_400_BAD_REQUEST)
 
 
 class InsecureCommandAlertAPI(generics.CreateAPIView):
@@ -217,6 +229,7 @@ class InsecureCommandAlertAPI(generics.CreateAPIView):
         cmd_group_mapper = {str(i.id): i for i in cmd_groups}
 
         for command in commands:
+            command['_time'] = datetime.fromtimestamp(command['timestamp'])
             cmd_acl = acl_mapper.get(command['cmd_filter_acl'])
             command['_cmd_filter_acl'] = cmd_acl
             cmd_group = cmd_group_mapper.get(command['cmd_group'])
@@ -228,6 +241,9 @@ class InsecureCommandAlertAPI(generics.CreateAPIView):
                 command.update({
                     '_account': session.account,
                     '_org_name': session.org.name,
+                    '_protocol': session.protocol,
+                    '_remote_addr': session.remote_addr,
+                    '_login_from': session.get_login_from_display(),
                 })
 
             if risk_level in [RiskLevelChoices.reject, RiskLevelChoices.review_reject]:

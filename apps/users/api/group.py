@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 #
+
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from orgs.mixins.api import OrgBulkModelViewSet
 from ..models import UserGroup, User
-from ..serializers import UserGroupSerializer
+from ..serializers import UserGroupSerializer, UserGroupListSerializer
 
 __all__ = ['UserGroupViewSet']
 
@@ -15,8 +16,10 @@ class UserGroupViewSet(OrgBulkModelViewSet):
     model = UserGroup
     filterset_fields = ("name",)
     search_fields = filterset_fields
-    serializer_class = UserGroupSerializer
-    ordering = ('name',)
+    serializer_classes = {
+        'default': UserGroupSerializer,
+        'list': UserGroupListSerializer,
+    }
     rbac_perms = (
         ("add_all_users", "users.add_usergroup"),
     )

@@ -3,29 +3,35 @@ import uuid
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
-from assets.models import Node, Asset
-from perms.models import PermNode
-from perms.utils.user_perm import UserPermAssetUtil
-from common.serializers.fields import ReadableHiddenField
+from assets.models import Asset, Node
+from common.serializers import WritableNestedModelSerializer
+from common.serializers.fields import ReadableHiddenField, ObjectRelatedField
 from ops.mixin import PeriodTaskSerializerMixin
 from ops.models import Job, JobExecution
+from ops.serializers import JobVariableSerializer
 from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 
 
-class JobSerializer(BulkOrgResourceModelSerializer, PeriodTaskSerializerMixin):
+class JobSerializer(BulkOrgResourceModelSerializer, PeriodTaskSerializerMixin, WritableNestedModelSerializer):
     creator = ReadableHiddenField(default=serializers.CurrentUserDefault())
-    run_after_save = serializers.BooleanField(label=_("Run after save"), default=False, required=False)
+    run_after_save = serializers.BooleanField(label=_("Run on save"), default=False, required=False)
     nodes = serializers.ListField(required=False, child=serializers.CharField())
     date_last_run = serializers.DateTimeField(label=_('Date last run'), read_only=True)
     name = serializers.CharField(label=_('Name'), max_length=128, allow_blank=True, required=False)
-    assets = serializers.PrimaryKeyRelatedField(label=_('Assets'), queryset=Asset.objects, many=True,
-                                                required=False)
+    assets = serializers.PrimaryKeyRelatedField(label=_('Assets'), queryset=Asset.objects, many=True, required=False)
+    nodes = ObjectRelatedField(label=_('Nodes'), queryset=Node.objects, many=True, required=False)
+    variable = JobVariableSerializer(many=True, required=False, allow_null=True, label=_('Variable'))
+    parameters = serializers.DictField(label=_('Parameters'), default=dict, write_only=True, required=False,
+                                       allow_null=True)
 
     def to_internal_value(self, data):
         instant = data.get('instant', False)
+        job_type = data.get('type', '')
+        _uid = str(uuid.uuid4()).split('-')[-1]
         if instant:
-            _uid = str(uuid.uuid4()).split('-')[-1]
             data['name'] = f'job-{_uid}'
+        if job_type == 'upload_file':
+            data['name'] = f'upload_file-{_uid}'
         return super().to_internal_value(data)
 
     def get_request_user(self):
@@ -33,11 +39,25 @@ class JobSerializer(BulkOrgResourceModelSerializer, PeriodTaskSerializerMixin):
         user = request.user if request else None
         return user
 
+    def get_periodic_variable(self, variables):
+        periodic_variable = {}
+        for variable in variables:
+            periodic_variable[variable['var_name']] = variable['default_value']
+        return periodic_variable
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if attrs.get('is_periodic') is True:
+            attrs['periodic_variable'] = self.get_periodic_variable(attrs.get('variable', []))
+        return attrs
+
     class Meta:
         model = Job
         read_only_fields = [
-            "id", "date_last_run", "date_created", "date_updated", "average_time_cost"
+            "id", "date_last_run", "date_created", "periodic_display",
+            "date_updated", "average_time_cost", "created_by", "material"
         ]
+        fields_m2m = ['variable']
         fields = read_only_fields + [
             "name", "instant", "type", "module",
             "args", "playbook", "assets",
@@ -45,17 +65,45 @@ class JobSerializer(BulkOrgResourceModelSerializer, PeriodTaskSerializerMixin):
             "use_parameter_define", "parameters_define",
             "timeout", "chdir", "comment", "summary",
             "is_periodic", "interval", "crontab", "nodes",
-            "run_after_save",
-        ]
+            "run_after_save", "parameters", "periodic_variable"
+        ] + fields_m2m
+        extra_kwargs = {
+            'average_time_cost': {'label': _('Duration')},
+        }
+
+
+class FileSerializer(serializers.Serializer):
+    files = serializers.FileField(allow_empty_file=True, max_length=128)
+
+    class Meta:
+        ref_name = "JobFileSerializer"
+
+
+class JobExecutionResultSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobExecution
+        fields = read_only_fields = ['id', 'result']
+
+
+class JobTaskStopSerializer(serializers.Serializer):
+    task_id = serializers.CharField(max_length=128)
+
+    class Meta:
+        ref_name = "JobTaskStopSerializer"
+
+
+class FileUploadCancelSerializer(serializers.Serializer):
+    job_id = serializers.UUIDField()
 
 
 class JobExecutionSerializer(BulkOrgResourceModelSerializer):
+    parameters = serializers.DictField(label=_('Parameters'), required=False, default=dict)
     creator = ReadableHiddenField(default=serializers.CurrentUserDefault())
-    job_type = serializers.ReadOnlyField(label=_("Job type"))
+    job_type = serializers.ReadOnlyField(source='get_job_type_display', label=_("Job type"))
     material = serializers.ReadOnlyField(label=_("Command"))
     is_success = serializers.ReadOnlyField(label=_("Is success"))
     is_finished = serializers.ReadOnlyField(label=_("Is finished"))
-    time_cost = serializers.ReadOnlyField(label=_("Time cost"))
+    time_cost = serializers.ReadOnlyField(label=_("Duration"))
 
     class Meta:
         model = JobExecution
@@ -66,3 +114,49 @@ class JobExecutionSerializer(BulkOrgResourceModelSerializer):
         fields = read_only_fields + [
             "job", "parameters", "creator"
         ]
+        extra_kwargs = {
+            "task_id": {
+                "label": _("Task id"),
+            },
+            "job": {
+                "label": _("Job"),
+                "required": True,
+                "allow_null": False,
+            }
+        }
+
+    def validate_job(self, job_obj):
+        if job_obj.creator != self.context['request'].user:
+            raise serializers.ValidationError(_("You do not have permission for the current job."))
+        return job_obj
+
+    def validate_parameters(self, parameters):
+        return self.transform_parameters(parameters)
+    
+    def transform_parameters(self, parameters):
+        prefix = "jms_"
+        new_parameters = {}
+        for key, value in parameters.items():
+            if not key.startswith("jms_"):
+                key = prefix + key
+            new_parameters[key] = value
+        return new_parameters
+    
+    def get_job_default_parameters(self, job):
+        try:
+            vars = job.variable.all()
+            parameters = {var.var_name: var.default_value for var in vars}
+            return self.transform_parameters(parameters)
+        except AttributeError:
+            return {}
+    
+    def update_parameters(self, attrs):
+        job = attrs.get('job')
+        job_params = self.get_job_default_parameters(job)
+        input_params = attrs.get('parameters', {})
+        job_params.update(input_params)
+        attrs['parameters'] = job_params
+    
+    def validate(self, attrs):
+        self.update_parameters(attrs)
+        return super().validate(attrs)

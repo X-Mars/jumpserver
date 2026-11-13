@@ -29,7 +29,7 @@ class CommandFilter(OrgModelMixin):
     )
     nodes = models.ManyToManyField(
         'assets.Node', related_name='cmd_filters', blank=True,
-        verbose_name=_("Nodes")
+        verbose_name=_("Node")
     )
     assets = models.ManyToManyField(
         'assets.Asset', related_name='cmd_filters', blank=True,
@@ -76,7 +76,7 @@ class CommandFilterRule(OrgModelMixin):
         default=50, verbose_name=_("Priority"), help_text=_("1-100, the lower the value will be match first"),
         validators=[MinValueValidator(1), MaxValueValidator(100)]
     )
-    content = models.TextField(verbose_name=_("Content"), help_text=_("One line one command"))
+    content = models.TextField(verbose_name=_("Content"), help_text=_("One command per line"))
     ignore_case = models.BooleanField(default=True, verbose_name=_('Ignore case'))
     action = models.IntegerField(default=ActionChoices.deny, choices=ActionChoices.choices, verbose_name=_("Action"))
     # 动作: 附加字段

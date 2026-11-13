@@ -1,38 +1,55 @@
 import os
 import shutil
-import zipfile
 
 from django.conf import settings
 from django.core.exceptions import SuspiciousFileOperation
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
-from django.utils.translation import gettext_lazy as _
 from rest_framework import status
 
+from common.api.generic import JMSBulkModelViewSet, JMSGenericViewSet
 from common.exceptions import JMSException
-from orgs.mixins.api import OrgBulkModelViewSet
+from common.permissions import IsOwnerOrAdminWritable
+from common.serializers import EmptySerializer
+from common.utils.http import is_true
+from common.utils.zip import safe_extract_zip
+from ops.filters import PlaybookFilterSet
 from rbac.permissions import RBACPermission
+from ..const import Scope
 from ..exception import PlaybookNoValidEntry
 from ..models import Playbook
-from ..serializers.playbook import PlaybookSerializer
+from ..serializers.playbook import PlaybookSerializer, PlaybookFileCreateSerializer, PlaybookFileUpdateSerializer
 
-__all__ = ["PlaybookViewSet", "PlaybookFileBrowserAPIView"]
+__all__ = ["PlaybookViewSet", "PlaybookFileViewSet"]
 
-from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.utils._os import safe_join
+from django.utils.translation import gettext, gettext_lazy as _
 
 
-def unzip_playbook(src, dist):
-    fz = zipfile.ZipFile(src, 'r')
-    for file in fz.namelist():
-        fz.extract(file, dist)
+def unzip_playbook(src, dest):
+    safe_extract_zip(src, dest)
 
 
-class PlaybookViewSet(OrgBulkModelViewSet):
+class PlaybookViewSet(JMSBulkModelViewSet):
     serializer_class = PlaybookSerializer
-    permission_classes = (RBACPermission,)
-    model = Playbook
+    permission_classes = (RBACPermission, IsOwnerOrAdminWritable)
+    queryset = Playbook.objects.all()
     search_fields = ('name', 'comment')
+    filterset_class = PlaybookFilterSet
+    custom_filter_fields = [
+        {'name': 'only_mine', 'type': 'boolean', 'methods': ['GET']},
+        {'name': 'clone_from', 'schema': {'type': 'string', 'format': 'uuid'}, 'methods': ['POST']},
+    ]
+    ordering_fields = (
+        'name', 'scope', 'create_method', 'created_by', 'date_created',
+        'date_updated',
+    )
+
+    def allow_bulk_destroy(self, qs, filtered):
+        for obj in filtered:
+            self.check_object_permissions(self.request, obj)
+        return True
 
     def perform_destroy(self, instance):
         if instance.job_set.exists():
@@ -40,48 +57,98 @@ class PlaybookViewSet(OrgBulkModelViewSet):
         instance_id = instance.id
         super().perform_destroy(instance)
         dest_path = safe_join(settings.DATA_DIR, "ops", "playbook", instance_id.__str__())
-        shutil.rmtree(dest_path)
+        if os.path.exists(dest_path):
+            shutil.rmtree(dest_path)
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        queryset = queryset.filter(creator=self.request.user)
+        user = self.request.user
+        if is_true(self.request.query_params.get('only_mine')):
+            queryset = queryset.filter(creator=user)
+        else:
+            queryset = queryset.filter(Q(creator=user) | Q(scope=Scope.public))
         return queryset
 
     def perform_create(self, serializer):
         instance = serializer.save()
+        base_path = safe_join(settings.DATA_DIR, "ops", "playbook")
+        clone_id = self.request.query_params.get('clone_from')
+
+        if clone_id:
+            queryset = self.get_queryset()
+            clone_from = queryset.filter(id=clone_id).first()
+            if not clone_from:
+                raise JMSException(code='invalid_clone_id', detail={"msg": gettext("Invalid clone_from id")})
+            src_path = safe_join(base_path, clone_id)
+            dest_path = safe_join(base_path, str(instance.id))
+            if not os.path.exists(src_path):
+                raise JMSException(code='invalid_playbook_id', detail={"msg": gettext("clone playbook file not found")})
+            shutil.copytree(src_path, dest_path)
+            return
+
         if 'multipart/form-data' in self.request.headers['Content-Type']:
             src_path = safe_join(settings.MEDIA_ROOT, instance.path.name)
-            dest_path = safe_join(settings.DATA_DIR, "ops", "playbook", instance.id.__str__())
+            dest_path = safe_join(base_path, str(instance.id))
+
             try:
-                unzip_playbook(src_path, dest_path)
-            except RuntimeError as e:
-                raise JMSException(code='invalid_playbook_file', detail={"msg": "Unzip failed"})
+                try:
+                    unzip_playbook(src_path, dest_path)
+                except RuntimeError:
+                    raise JMSException(code='invalid_playbook_file', detail={"msg": gettext("Unzip failed")})
 
-            if 'main.yml' not in os.listdir(dest_path):
-                raise PlaybookNoValidEntry
+                if 'main.yml' not in os.listdir(dest_path):
+                    raise PlaybookNoValidEntry
+            except Exception:
+                # The request transaction rolls back the model, but not files.
+                try:
+                    if os.path.exists(dest_path):
+                        shutil.rmtree(dest_path)
+                finally:
+                    instance.path.delete(save=False)
+                raise
 
-        else:
-            if instance.create_method == 'blank':
-                dest_path = safe_join(settings.DATA_DIR, "ops", "playbook", instance.id.__str__())
-                os.makedirs(dest_path)
-                with open(safe_join(dest_path, 'main.yml'), 'w') as f:
-                    f.write('## write your playbook here')
+        elif instance.create_method == 'blank':
+            dest_path = safe_join(base_path, str(instance.id))
+            os.makedirs(dest_path)
+            with open(safe_join(dest_path, 'main.yml'), 'w') as f:
+                f.write('## write your playbook here')
 
 
-class PlaybookFileBrowserAPIView(APIView):
-    rbac_perms = ()
+class PlaybookFileViewSet(JMSGenericViewSet):
     permission_classes = (RBACPermission,)
+    serializer_classes = {
+        'default': EmptySerializer,
+        'create': PlaybookFileCreateSerializer,
+        'partial_update': PlaybookFileUpdateSerializer,
+    }
+    custom_filter_fields = [
+        {'name': 'key', 'methods': ['GET']},
+        {'name': 'expand', 'methods': ['GET']},
+        {'name': 'key', 'required': True, 'methods': ['DELETE']},
+    ]
     rbac_perms = {
-        'GET': 'ops.change_playbook',
-        'POST': 'ops.change_playbook',
-        'DELETE': 'ops.change_playbook',
-        'PATCH': 'ops.change_playbook',
+        'retrieve': 'ops.view_playbook',
+        'create': 'ops.change_playbook',
+        'destroy': 'ops.change_playbook',
+        'partial_update': 'ops.change_playbook',
     }
     protected_files = ['root', 'main.yml']
 
-    def get(self, request, **kwargs):
+    def get_response_serializer(self):
+        if self.action == 'create':
+            return {200: self.get_serializer()}
+        if self.action == 'partial_update':
+            return None
+        return self.get_serializer()
+
+    def get_playbook(self, playbook_id):
+        playbook = get_object_or_404(Playbook, id=playbook_id, creator=self.request.user)
+        return playbook
+
+    def retrieve(self, request, **kwargs):
         playbook_id = kwargs.get('pk')
-        playbook = get_object_or_404(Playbook, id=playbook_id)
+        user = self.request.user
+        playbook = get_object_or_404(Playbook, Q(creator=user) | Q(scope=Scope.public), id=playbook_id)
         work_path = playbook.work_dir
         file_key = request.query_params.get('key', '')
         if file_key:
@@ -91,7 +158,7 @@ class PlaybookFileBrowserAPIView(APIView):
                     content = f.read()
             except UnicodeDecodeError:
                 content = _('Unsupported file content')
-            except SuspiciousFileOperation:
+            except (SuspiciousFileOperation, FileNotFoundError):
                 raise JMSException(code='invalid_file_path', detail={"msg": _("Invalid file path")})
             return Response({'content': content})
         else:
@@ -99,12 +166,15 @@ class PlaybookFileBrowserAPIView(APIView):
             nodes = self.generate_tree(playbook, work_path, expand_key)
             return Response(nodes)
 
-    def post(self, request, **kwargs):
+    def create(self, request, **kwargs):
         playbook_id = kwargs.get('pk')
-        playbook = get_object_or_404(Playbook, id=playbook_id)
+        playbook = self.get_playbook(playbook_id)
         work_path = playbook.work_dir
 
-        parent_key = request.data.get('key', '')
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        parent_key = data.get('key', '')
         if parent_key == 'root':
             parent_key = ''
         if os.path.dirname(parent_key) == 'root':
@@ -112,9 +182,9 @@ class PlaybookFileBrowserAPIView(APIView):
 
         full_path = safe_join(work_path, parent_key)
 
-        is_directory = request.data.get('is_directory', False)
-        content = request.data.get('content', '')
-        name = request.data.get('name', '')
+        is_directory = data.get('is_directory', False)
+        content = data.get('content', '')
+        name = data.get('name', '')
 
         def find_new_name(p, is_file=False):
             if not p:
@@ -153,15 +223,21 @@ class PlaybookFileBrowserAPIView(APIView):
         }
         if not is_directory:
             new_node['iconSkin'] = 'file'
-        return Response(new_node)
+        return Response(self.get_serializer(new_node).data)
 
-    def patch(self, request, **kwargs):
+    def partial_update(self, request, **kwargs):
         playbook_id = kwargs.get('pk')
-        playbook = get_object_or_404(Playbook, id=playbook_id)
+        playbook = self.get_playbook(playbook_id)
         work_path = playbook.work_dir
 
         file_key = request.data.get('key', '')
-        new_name = request.data.get('new_name', '')
+        if not file_key:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        file_key = data['key']
+        new_name = data.get('new_name', '')
 
         if file_key in self.protected_files and new_name:
             raise JMSException(code='this_file_can_not_be_rename', detail={"msg": _("This file can not be rename")})
@@ -169,10 +245,9 @@ class PlaybookFileBrowserAPIView(APIView):
         if os.path.dirname(file_key) == 'root':
             file_key = os.path.basename(file_key)
 
-        content = request.data.get('content', '')
-        is_directory = request.data.get('is_directory', False)
-
-        if not file_key or file_key == 'root':
+        content = data.get('content', '')
+        is_directory = data.get('is_directory', False)
+        if file_key == 'root':
             return Response(status=status.HTTP_400_BAD_REQUEST)
         file_path = safe_join(work_path, file_key)
 
@@ -195,9 +270,9 @@ class PlaybookFileBrowserAPIView(APIView):
                     f.write(content)
         return Response(status=status.HTTP_200_OK)
 
-    def delete(self, request, **kwargs):
+    def destroy(self, request, **kwargs):
         playbook_id = kwargs.get('pk')
-        playbook = get_object_or_404(Playbook, id=playbook_id)
+        playbook = self.get_playbook(playbook_id)
         work_path = playbook.work_dir
         file_key = request.query_params.get('key', '')
         if not file_key:

@@ -2,17 +2,19 @@
 #
 from functools import lru_cache
 
-from rest_framework import generics
 from django.db.models import F
 from django.shortcuts import get_object_or_404
+from rest_framework import generics
 
-from orgs.mixins.api import OrgRelationMixin
-from orgs.mixins.api import OrgBulkModelViewSet
-from orgs.utils import current_org
-from perms import serializers
-from perms import models
-from perms.utils import AssetPermissionPermAssetUtil
+from accounts.models import Account
 from accounts.serializers import AccountSerializer
+from assets.models import Asset
+from orgs.mixins.api import OrgRelationMixin, OrgBulkModelViewSet
+from orgs.utils import current_org
+from perms import models
+from perms import serializers
+from perms.utils import AssetPermissionPermAssetUtil
+from users.models import User
 
 __all__ = [
     'AssetPermissionUserRelationViewSet', 'AssetPermissionUserGroupRelationViewSet',
@@ -24,10 +26,11 @@ __all__ = [
 
 class RelationMixin(OrgRelationMixin, OrgBulkModelViewSet):
     perm_model = models.AssetPermission
+    http_method_names = ['get', 'post', 'delete']
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        org_id = current_org.org_id()
+        org_id = current_org.id
         if org_id is not None:
             queryset = queryset.filter(assetpermission__org_id=org_id)
         queryset = queryset.annotate(assetpermission_display=F('assetpermission__name'))
@@ -52,6 +55,7 @@ class AssetPermissionAllUserListApi(generics.ListAPIView):
     serializer_class = serializers.AssetPermissionAllUserSerializer
     filterset_fields = ("username", "name")
     search_fields = filterset_fields
+    queryset = User.objects.none()
 
     def get_queryset(self):
         pk = self.kwargs.get("pk")
@@ -91,6 +95,7 @@ class AssetPermissionAssetRelationViewSet(RelationMixin):
 
 
 class AssetPermissionAllAssetListApi(generics.ListAPIView):
+    queryset = Asset.objects.none()
     serializer_class = serializers.AssetPermissionAllAssetSerializer
     filterset_fields = ("name", "address")
     search_fields = filterset_fields
@@ -117,6 +122,7 @@ class AssetPermissionNodeRelationViewSet(RelationMixin):
 
 
 class AssetPermissionAccountListApi(generics.ListAPIView):
+    queryset = Account.objects.none()
     serializer_class = AccountSerializer
     filterset_fields = ("name", "username", "privileged", "version")
     search_fields = filterset_fields

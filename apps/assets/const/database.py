@@ -1,3 +1,5 @@
+from django.db.models import TextChoices
+
 from .base import BaseType
 
 
@@ -7,6 +9,9 @@ class DatabaseTypes(BaseType):
     POSTGRESQL = 'postgresql', 'PostgreSQL'
     ORACLE = 'oracle', 'Oracle'
     SQLSERVER = 'sqlserver', 'SQLServer'
+    DB2 = 'db2', 'DB2'
+    DAMENG = 'dameng', 'Dameng'
+    OCEANBASE = 'oceanbase', 'OceanBase'
     CLICKHOUSE = 'clickhouse', 'ClickHouse'
     MONGODB = 'mongodb', 'MongoDB'
     REDIS = 'redis', 'Redis'
@@ -16,7 +21,7 @@ class DatabaseTypes(BaseType):
         return {
             '*': {
                 'charset_enabled': False,
-                'domain_enabled': True,
+                'gateway_enabled': True,
                 'su_enabled': False,
             }
         }
@@ -35,6 +40,7 @@ class DatabaseTypes(BaseType):
                 'verify_account_enabled': True,
                 'change_secret_enabled': True,
                 'push_account_enabled': True,
+                'remove_account_enabled': True,
             },
             cls.REDIS: {
                 'ansible_enabled': False,
@@ -44,6 +50,34 @@ class DatabaseTypes(BaseType):
                 'verify_account_enabled': False,
                 'change_secret_enabled': False,
                 'push_account_enabled': False,
+            },
+            cls.DB2: {
+                'ansible_enabled': False,
+                'ping_enabled': False,
+                'gather_facts_enabled': False,
+                'gather_accounts_enabled': False,
+                'verify_account_enabled': False,
+                'change_secret_enabled': False,
+                'push_account_enabled': False,
+            },
+            cls.DAMENG: {
+                'ansible_enabled': False,
+                'ping_enabled': False,
+                'gather_facts_enabled': False,
+                'gather_accounts_enabled': False,
+                'verify_account_enabled': False,
+                'change_secret_enabled': False,
+                'push_account_enabled': False,
+            },
+            cls.OCEANBASE: {
+                'ansible_enabled': False,
+                'ping_enabled': False,
+                'gather_facts_enabled': False,
+                'gather_accounts_enabled': False,
+                'verify_account_enabled': False,
+                'change_secret_enabled': False,
+                'push_account_enabled': False,
+                'remove_account_enabled': False,
             },
             cls.CLICKHOUSE: {
                 'ansible_enabled': False,
@@ -62,7 +96,9 @@ class DatabaseTypes(BaseType):
         return {
             '*': {
                 'choices': '__self__',
-            }
+            },
+            # OceanBase tenants use MySQL-family wire framing in both modes.
+            cls.OCEANBASE: {'choices': ['mysql']},
         }
 
     @classmethod
@@ -73,6 +109,12 @@ class DatabaseTypes(BaseType):
             cls.POSTGRESQL: [{'name': 'PostgreSQL'}],
             cls.ORACLE: [{'name': 'Oracle'}],
             cls.SQLSERVER: [{'name': 'SQLServer'}],
+            cls.DB2: [{'name': 'DB2'}],
+            cls.DAMENG: [{'name': 'Dameng'}],
+            cls.OCEANBASE: [
+                {'name': 'OceanBase-MySQL', 'protocols_setting': {'mysql': {'tenant_mode': 'mysql'}}},
+                {'name': 'OceanBase-Oracle', 'protocols_setting': {'mysql': {'tenant_mode': 'oracle'}}},
+            ],
             cls.CLICKHOUSE: [{'name': 'ClickHouse'}],
             cls.MONGODB: [{'name': 'MongoDB'}],
             cls.REDIS: [
@@ -94,5 +136,13 @@ class DatabaseTypes(BaseType):
     @classmethod
     def get_community_types(cls):
         return [
-            cls.MYSQL, cls.MARIADB, cls.MONGODB, cls.REDIS
+            cls.MYSQL, cls.MARIADB, cls.POSTGRESQL,
+            cls.MONGODB, cls.REDIS,
         ]
+
+
+class PostgresqlSSLMode(TextChoices):
+    PREFER = 'prefer', 'Prefer'
+    REQUIRE = 'require', 'Require'
+    VERIFY_CA = 'verify-ca', 'Verify CA'
+    VERIFY_FULL = 'verify-full', 'Verify Full'

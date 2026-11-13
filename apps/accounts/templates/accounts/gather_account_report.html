@@ -1,0 +1,27 @@
+{% extends 'automations/base_report.html' %}
+{% load i18n %}
+
+{% block report_type %}{% trans 'Gather accounts' %}{% endblock %}
+
+{% block report_body %}
+<section class="summary" aria-label="{% trans 'Accounts' %}">
+    <div class="metric"><span class="metric-label">{% trans 'New found accounts' %}</span><strong class="metric-value success">{{ summary.new_accounts|default:0 }}</strong></div>
+    <div class="metric"><span class="metric-label">{% trans 'Lost accounts' %}</span><strong class="metric-value unsupported">{{ summary.lost_accounts|default:0 }}</strong></div>
+</section>
+{% include 'accounts/reports/asset_summary.html' %}
+
+<section class="report-section">
+    <h2>{% trans 'Execution results' %}</h2>
+    <table>
+        <colgroup><col><col><col class="status-column"></colgroup>
+        <thead><tr><th scope="col">{% trans 'Asset' %}</th><th scope="col">{% trans 'Username' %}</th><th scope="col">{% trans 'Status' %}</th></tr></thead>
+        <tbody>
+            {% include 'accounts/reports/account_rows.html' with accounts=result.lost_accounts tone='unsupported' label=_('Lost accounts') has_errors=False %}
+            {% include 'accounts/reports/account_rows.html' with accounts=result.new_accounts tone='success' label=_('New found') has_errors=False %}
+            {% if not result.lost_accounts and not result.new_accounts %}
+                <tr><td class="empty" colspan="3">{% trans 'No account changes' %}</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

@@ -101,7 +101,7 @@ def get_ip_city(ip):
 
     info = get_ip_city_by_ipip(ip)
     if info:
-        city = info.get('city', _("Unknown"))
+        city = info.get('city') or _("Unknown")
         country = info.get('country')
 
         # 国内城市 并且 语言是中文就使用国内
@@ -113,6 +113,14 @@ def get_ip_city(ip):
 
 def lookup_domain(domain):
     try:
-        return socket.gethostbyname(domain), ''
+        addrinfos = socket.getaddrinfo(
+            domain, None, socket.AF_UNSPEC, socket.SOCK_DGRAM
+        )
+        family, _, _, _, sockaddr = addrinfos[0]
+        if family == socket.AF_INET:
+            return sockaddr[0], ''
+        if family == socket.AF_INET6:
+            return sockaddr[0], ''
+        return domain, ''
     except Exception as e:
         return None, f'Cannot resolve {domain}: Unknown host, {e}'

@@ -1,0 +1,11 @@
+{% extends 'automations/base_report.html' %}
+{% load i18n %}
+
+{% block report_type %}{% trans 'Backup account' %}{% endblock %}
+
+{% block report_body %}
+<section class="summary" aria-label="{% trans 'Result' %}">
+    <div class="metric"><span class="metric-label">{% trans 'Accounts amount' %}</span><strong class="metric-value">{{ summary.total_accounts|default:0 }}</strong></div>
+    <div class="metric"><span class="metric-label">{% trans 'Type count' %}</span><strong class="metric-value">{{ summary.total_types|default:0 }}</strong></div>
+</section>
+{% endblock %}

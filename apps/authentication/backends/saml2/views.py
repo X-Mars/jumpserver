@@ -1,14 +1,14 @@
 import copy
-
 from urllib import parse
 
-from django.views import View
-from django.contrib import auth
-from django.urls import reverse
 from django.conf import settings
-from django.views.decorators.csrf import csrf_exempt
+from django.contrib import auth
+from django.db import IntegrityError
 from django.http import HttpResponseRedirect, HttpResponse, HttpResponseServerError
-
+from django.urls import reverse
+from django.utils.translation import gettext_lazy as _
+from django.views import View
+from django.views.decorators.csrf import csrf_exempt
 from onelogin.saml2.auth import OneLogin_Saml2_Auth
 from onelogin.saml2.errors import OneLogin_Saml2_Error
 from onelogin.saml2.idp_metadata_parser import (
@@ -16,23 +16,32 @@ from onelogin.saml2.idp_metadata_parser import (
     dict_deep_merge
 )
 
+from authentication.backends.http import TLSConfigurationError, create_http_session
+from authentication.views.mixins import FlashMessageMixin
+from common.utils import get_logger, safe_next_url
 from .settings import JmsSaml2Settings
 
-from common.utils import get_logger
-
 logger = get_logger(__file__)
+SAML2_METADATA_HTTP_TIMEOUT = (5, 20)
 
 
 class PrepareRequestMixin:
-    @staticmethod
-    def is_secure():
-        url_result = parse.urlparse(settings.SITE_URL)
-        return 'on' if url_result.scheme == 'https' else 'off'
+
+    @property
+    def parsed_url(self):
+        return parse.urlparse(settings.SITE_URL)
+
+    def is_secure(self):
+        return 'on' if self.parsed_url.scheme == 'https' else 'off'
+
+    def http_host(self):
+        return f"{self.parsed_url.hostname}:{self.parsed_url.port}" \
+            if self.parsed_url.port else self.parsed_url.hostname
 
     def prepare_django_request(self, request):
         result = {
             'https': self.is_secure(),
-            'http_host': request.META['HTTP_HOST'],
+            'http_host': self.http_host(),
             'script_name': request.META['PATH_INFO'],
             'get_data': request.GET.copy(),
             'post_data': request.POST.copy()
@@ -50,16 +59,27 @@ class PrepareRequestMixin:
             if idp_metadata_xml.strip():
                 xml_idp_settings = IdPMetadataParse.parse(idp_metadata_xml)
         except Exception as err:
-            logger.warning('Failed to get IDP metadata XML settings, error: %s', str(err))
+            logger.warning('Failed to get IDP Metadata XML settings, error: %s', str(err))
 
         url_idp_settings = None
-        try:
-            if idp_metadata_url.strip():
-                url_idp_settings = IdPMetadataParse.parse_remote(
-                    idp_metadata_url, timeout=20
+        if idp_metadata_url.strip():
+            try:
+                with create_http_session(
+                    settings.SAML2_IDP_METADATA_CERT_VERIFY_MODE,
+                    settings.SAML2_IDP_METADATA_CACERT_CONTENT,
+                ) as session:
+                    response = session.get(
+                        idp_metadata_url, timeout=SAML2_METADATA_HTTP_TIMEOUT
+                    )
+                    response.raise_for_status()
+                    url_idp_settings = IdPMetadataParse.parse(response.content)
+            except TLSConfigurationError:
+                logger.error('SAML2 Metadata TLS configuration is invalid')
+            except Exception as err:
+                logger.warning(
+                    'Failed to get IDP Metadata URL settings, error: %s',
+                    type(err).__name__
                 )
-        except Exception as err:
-            logger.warning('Failed to get IDP metadata URL settings, error: %s', str(err))
 
         idp_settings = url_idp_settings or xml_idp_settings
 
@@ -83,6 +103,7 @@ class PrepareRequestMixin:
             ('name', 'name', False),
             ('phone', 'phone', False),
             ('comment', 'comment', False),
+            ('groups', 'groups', False),
         )
         attr_list = []
         for name, friend_name, is_required in need_attrs:
@@ -127,7 +148,7 @@ class PrepareRequestMixin:
                 "en": {
                     "name": "JumpServer",
                     "displayname": "JumpServer",
-                    "url": "https://jumpserver.org/"
+                    "url": "https://jumpserver.com/"
                 }
             },
         }
@@ -181,7 +202,7 @@ class PrepareRequestMixin:
         user_attrs = {}
         attr_mapping = settings.SAML2_RENAME_ATTRIBUTES
         attrs = saml_instance.get_attributes()
-        valid_attrs = ['username', 'name', 'email', 'comment', 'phone']
+        valid_attrs = ['username', 'name', 'email', 'comment', 'phone', 'groups']
 
         for attr, value in attrs.items():
             attr = attr.rsplit('/', 1)[-1]
@@ -199,13 +220,16 @@ class Saml2AuthRequestView(View, PrepareRequestMixin):
         log_prompt = "Process SAML GET requests: {}"
         logger.debug(log_prompt.format('Start'))
 
+        request_params = request.GET.dict()
+
         try:
             saml_instance = self.init_saml_auth(request)
         except OneLogin_Saml2_Error as error:
             logger.error(log_prompt.format('Init saml auth error: %s' % error))
             return HttpResponse(error, status=412)
 
-        next_url = settings.AUTH_SAML2_PROVIDER_AUTHORIZATION_ENDPOINT
+        next_url = request_params.get('next') or settings.AUTH_SAML2_PROVIDER_AUTHORIZATION_ENDPOINT
+        next_url = safe_next_url(next_url, request=request)
         url = saml_instance.login(return_to=next_url)
         logger.debug(log_prompt.format('Redirect login url'))
         return HttpResponseRedirect(url)
@@ -231,18 +255,19 @@ class Saml2EndSessionView(View, PrepareRequestMixin):
 
             if settings.SAML2_LOGOUT_COMPLETELY:
                 saml_instance = self.init_saml_auth(request)
-                logger.debug(log_prompt.format('Log out IDP user session synchronously'))
+                logger.debug(log_prompt.format('Logout IDP user session synchronously'))
                 return HttpResponseRedirect(saml_instance.logout())
 
         logger.debug(log_prompt.format('Redirect logout url'))
         return HttpResponseRedirect(logout_url)
 
 
-class Saml2AuthCallbackView(View, PrepareRequestMixin):
+class Saml2AuthCallbackView(View, PrepareRequestMixin, FlashMessageMixin):
 
     def post(self, request):
         log_prompt = "Process SAML2 POST requests: {}"
         post_data = request.POST
+        error_title = _("SAML2 Error")
 
         try:
             saml_instance = self.init_saml_auth(request)
@@ -267,16 +292,27 @@ class Saml2AuthCallbackView(View, PrepareRequestMixin):
 
         logger.debug(log_prompt.format('Process authenticate'))
         saml_user_data = self.get_attributes(saml_instance)
-        user = auth.authenticate(request=request, saml_user_data=saml_user_data)
+        try:
+            user = auth.authenticate(request=request, saml_user_data=saml_user_data)
+        except IntegrityError as e:
+            msg = _('Please check if a user with the same username or email already exists')
+            logger.error(e, exc_info=True)
+            response = self.get_failed_response('/', error_title, msg)
+            return response
         if user and user.is_valid:
             logger.debug(log_prompt.format('Login: {}'.format(user)))
             auth.login(self.request, user)
 
+        if not user and getattr(request, 'error_message', ''):
+            response = self.get_failed_response('/', title=error_title, msg=request.error_message)
+            return response
+
         logger.debug(log_prompt.format('Redirect'))
-        redir = post_data.get('RelayState')
-        if not redir or len(redir) == 0:
-          redir = "/"
-        next_url = saml_instance.redirect_to(redir)
+        relay_state = post_data.get('RelayState')
+        if not relay_state or len(relay_state) == 0:
+            relay_state = "/"
+        next_url = saml_instance.redirect_to(relay_state)
+        next_url = safe_next_url(next_url, request=request)
         return HttpResponseRedirect(next_url)
 
     @csrf_exempt

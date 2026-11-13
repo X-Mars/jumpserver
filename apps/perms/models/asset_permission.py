@@ -8,8 +8,9 @@ from django.utils.translation import gettext_lazy as _
 from accounts.const import AliasAccount
 from accounts.models import Account
 from assets.models import Asset
-from common.utils import date_expired_default
+from common.utils import asset_permission_date_expired_default, lazyproperty
 from common.utils.timezone import local_now
+from labels.mixins import LabeledMixin
 from orgs.mixins.models import JMSOrgBaseModel
 from orgs.mixins.models import OrgManager
 from perms.const import ActionChoices
@@ -52,7 +53,11 @@ class AssetPermissionManager(OrgManager):
         return self.get_queryset().filter(Q(date_start__lte=now) | Q(date_expired__gte=now))
 
 
-class AssetPermission(JMSOrgBaseModel):
+def default_protocols():
+    return ['all']
+
+
+class AssetPermission(LabeledMixin, JMSOrgBaseModel):
     name = models.CharField(max_length=128, verbose_name=_('Name'))
     users = models.ManyToManyField(
         'users.User', related_name='%(class)ss', blank=True, verbose_name=_("User")
@@ -64,14 +69,24 @@ class AssetPermission(JMSOrgBaseModel):
         'assets.Asset', related_name='granted_by_permissions', blank=True, verbose_name=_("Asset")
     )
     nodes = models.ManyToManyField(
-        'assets.Node', related_name='granted_by_permissions', blank=True, verbose_name=_("Nodes")
+        'assets.Node', related_name='granted_by_permissions', blank=True, verbose_name=_("Node")
     )
     # 特殊的账号: @ALL, @INPUT @USER 默认包含，将来在全局设置中进行控制.
     accounts = models.JSONField(default=list, verbose_name=_("Account"))
+    protocols = models.JSONField(default=default_protocols, verbose_name=_("Protocols"))
     actions = models.IntegerField(default=ActionChoices.connect, verbose_name=_("Actions"))
     date_start = models.DateTimeField(default=timezone.now, db_index=True, verbose_name=_("Date start"))
     date_expired = models.DateTimeField(
-        default=date_expired_default, db_index=True, verbose_name=_('Date expired')
+        default=asset_permission_date_expired_default, db_index=True, verbose_name=_('Date expired')
+    )
+    expire_soon_notice_minutes = models.PositiveIntegerField(
+        null=True, blank=True, verbose_name=_('Expiration-soon notice minutes')
+    )
+    expire_soon_notice_at = models.DateTimeField(
+        null=True, blank=True, db_index=True, verbose_name=_('Expiration-soon notice time')
+    )
+    expire_soon_notice_sent_at = models.DateTimeField(
+        null=True, blank=True, verbose_name=_('Expiration-soon notice sent time')
     )
     is_active = models.BooleanField(default=True, verbose_name=_('Active'))
     from_ticket = models.BooleanField(default=False, verbose_name=_('From ticket'))
@@ -99,6 +114,38 @@ class AssetPermission(JMSOrgBaseModel):
             return True
         return False
 
+    @property
+    def real_accounts(self):
+        return [a for a in self.accounts if not a.startswith('@') or a == '@ALL']
+
+    @real_accounts.setter
+    def real_accounts(self, value):
+        self.accounts += value
+
+    @property
+    def virtual_accounts(self):
+        return [a for a in self.accounts if a.startswith('@') and a != '@ALL']
+
+    @virtual_accounts.setter
+    def virtual_accounts(self, value):
+        self.accounts += value
+
+    @lazyproperty
+    def users_amount(self):
+        return self.users.count()
+
+    @lazyproperty
+    def user_groups_amount(self):
+        return self.user_groups.count()
+
+    @lazyproperty
+    def assets_amount(self):
+        return self.assets.count()
+
+    @lazyproperty
+    def nodes_amount(self):
+        return self.nodes.count()
+
     def get_all_users(self):
         from users.models import User
         user_ids = self.users.all().values_list('id', flat=True)
@@ -108,7 +155,7 @@ class AssetPermission(JMSOrgBaseModel):
         qs1_ids = User.objects.filter(id__in=user_ids).distinct().values_list('id', flat=True)
         qs2_ids = User.objects.filter(groups__id__in=group_ids).distinct().values_list('id', flat=True)
         qs_ids = list(qs1_ids) + list(qs2_ids)
-        qs = User.objects.filter(id__in=qs_ids)
+        qs = User.objects.filter(id__in=qs_ids, is_service_account=False)
         return qs
 
     def get_all_assets(self, flat=False):
@@ -130,6 +177,8 @@ class AssetPermission(JMSOrgBaseModel):
         q = Q(asset_id__in=asset_ids)
         if AliasAccount.ALL not in self.accounts:
             q &= Q(username__in=self.accounts)
+        excluded_usernames = [alias.lstrip('!') for alias in self.accounts if alias.startswith('!')]
+        q &= ~Q(username__in=excluded_usernames)
         accounts = Account.objects.filter(q).order_by('asset__name', 'name', 'username')
         if not flat:
             return accounts
@@ -137,11 +186,14 @@ class AssetPermission(JMSOrgBaseModel):
 
     @classmethod
     def get_all_users_for_perms(cls, perm_ids, flat=False):
-        user_ids = cls.users.through.objects.filter(assetpermission_id__in=perm_ids) \
+        user_ids = cls.users.through.objects \
+            .filter(assetpermission_id__in=perm_ids) \
             .values_list('user_id', flat=True).distinct()
-        group_ids = cls.user_groups.through.objects.filter(assetpermission_id__in=perm_ids) \
+        group_ids = cls.user_groups.through.objects \
+            .filter(assetpermission_id__in=perm_ids) \
             .values_list('usergroup_id', flat=True).distinct()
-        group_user_ids = User.groups.through.objects.filter(usergroup_id__in=group_ids) \
+        group_user_ids = User.groups.through.objects \
+            .filter(usergroup_id__in=group_ids) \
             .values_list('user_id', flat=True).distinct()
         user_ids = set(user_ids) | set(group_user_ids)
         if flat:

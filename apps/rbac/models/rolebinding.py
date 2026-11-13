@@ -7,6 +7,7 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework.serializers import ValidationError
 
 from common.db.models import JMSBaseModel, CASCADE_SIGNAL_SKIP
+from common.exceptions import JMSException
 from common.utils import lazyproperty
 from orgs.utils import current_org, tmp_to_root_org
 from .role import Role
@@ -56,6 +57,7 @@ class RoleBinding(JMSBaseModel):
         on_delete=models.CASCADE, verbose_name=_('Organization')
     )
     objects = RoleBindingManager()
+    objects_raw = models.Manager()
 
     class Meta:
         verbose_name = _('Role binding')
@@ -70,7 +72,7 @@ class RoleBinding(JMSBaseModel):
         return display
 
     @property
-    def org_name(self):
+    def org_name(self) -> str:
         if self.org:
             return self.org.name
         return ''
@@ -108,6 +110,13 @@ class RoleBinding(JMSBaseModel):
 
     def is_scope_org(self):
         return self.scope == Scope.org
+
+    @classmethod
+    def is_org_admin(cls, user):
+        from rbac.builtin import BuiltinRole
+        return cls.objects_raw.filter(
+            role_id=BuiltinRole.org_admin.id, user_id=user.id
+        ).exists()
 
     @staticmethod
     def orgs_order_by_name(orgs):
@@ -152,13 +161,15 @@ class RoleBinding(JMSBaseModel):
         orgs = cls.orgs_order_by_name(orgs)
         workbench_perm = 'rbac.view_workbench'
         # 全局组织
+        has_root_org = False
+        root_org = Organization.root()
         if orgs and perm != workbench_perm and user.has_perm('orgs.view_rootorg'):
-            root_org = Organization.root()
-            orgs = [root_org, *list(orgs)]
+            has_root_org = True
         elif orgs and perm == workbench_perm and user.has_perm('orgs.view_alljoinedorg'):
-            # Todo: 先复用组织
-            root_org = Organization.root()
-            root_org.name = _("All organizations")
+            root_org.name = _('All organizations')
+            has_root_org = True
+
+        if has_root_org and system_bindings:
             orgs = [root_org, *list(orgs)]
         return orgs
 
@@ -189,7 +200,7 @@ class OrgRoleBinding(RoleBinding):
         if not has_other_role:
             error = _('User last role in org, can not be delete, '
                       'you can remove user from org instead')
-            raise ValidationError({'error': error})
+            raise JMSException(code='org_role_delete_error', detail=error)
         return super().delete(**kwargs)
 
     class Meta:

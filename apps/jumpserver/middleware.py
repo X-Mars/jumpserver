@@ -4,15 +4,27 @@ import json
 import os
 import re
 import time
+from urllib.parse import urlparse, quote
 
 import pytz
 from django.conf import settings
 from django.core.exceptions import MiddlewareNotUsed
-from django.http.response import HttpResponseForbidden
+from django.db.utils import OperationalError
+from django.http.response import HttpResponseForbidden, JsonResponse
+from django.middleware.csrf import CsrfViewMiddleware
 from django.shortcuts import HttpResponse
+from django.shortcuts import redirect
+from django.urls import reverse
 from django.utils import timezone
+from django.utils.translation import gettext
+from rest_framework import status
 
+from common.utils import get_logger
 from .utils import set_current_request
+
+logger = get_logger(__name__)
+
+IGNORE_CSRF_CHECK = '*' in os.getenv("DOMAINS", "").split(',')
 
 
 class TimezoneMiddleware:
@@ -66,11 +78,6 @@ class RequestMiddleware:
     def __call__(self, request):
         set_current_request(request)
         response = self.get_response(request)
-        is_request_api = request.path.startswith('/api')
-        if not settings.SESSION_EXPIRE_AT_BROWSER_CLOSE and \
-                not is_request_api:
-            age = request.session.get_expiry_age()
-            request.session.set_expiry(age)
         return response
 
 
@@ -142,3 +149,69 @@ class EndMiddleware:
         response = self.get_response(request)
         request._e_time_end = time.time()
         return response
+
+    def process_exception(self, request, exception):
+        if isinstance(exception, OperationalError):
+            logger.debug("Database operational error: %s", exception)
+            return JsonResponse({
+                'error': gettext('Service temporarily unavailable'),
+                'message': gettext('Database operation failed, please try again later.'),
+                'code': 'DB_ERROR'
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return None
+
+
+class SafeRedirectMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+
+        if not (300 <= response.status_code < 400):
+            return response
+        if (
+                request.resolver_match and
+                request.resolver_match.namespace.startswith('authentication') and
+                not request.resolver_match.namespace.startswith('authentication:oauth2-provider')
+        ):
+            # 认证相关的路由跳过验证 /core/auth/..., 
+            # 但 oauth2-provider 除外, 因为它会重定向到第三方客户端, 希望给出更友好的提示
+            return response
+        location = response.get('Location')
+        if not location:
+            return response
+        parsed = urlparse(location)
+        if parsed.scheme and parsed.netloc:
+            target_host = parsed.netloc
+            if target_host in [*settings.ALLOWED_HOSTS]:
+                return response
+            target_host, target_port = self._split_host_port(parsed.netloc)
+            origin_host, origin_port = self._split_host_port(request.get_host())
+            if self.check_proxy_origin_verified(request, origin_host):
+                return response
+            if target_host != origin_host:
+                safe_redirect_url = '%s?%s' % (reverse('redirect-confirm'), f'next={quote(location)}')
+                return redirect(safe_redirect_url)
+        return response
+
+    @staticmethod
+    def _split_host_port(netloc):
+        if ':' in netloc:
+            host, port = netloc.split(':', 1)
+            return host, port
+        return netloc, '80'
+
+    def check_proxy_origin_verified(self, request, origin_host):
+        if settings.USE_X_FORWARDED_HOST and ("HTTP_X_FORWARDED_HOST" in request.META):
+            proxy_host, proxy_port = self._split_host_port(request.META["HTTP_X_FORWARDED_HOST"])
+            return proxy_host == origin_host
+        return False
+
+
+class CsrfCheckMiddleware(CsrfViewMiddleware):
+    def _origin_verified(self, request):
+        if IGNORE_CSRF_CHECK:
+            request._dont_enforce_csrf_checks = True
+            return True
+        return super()._origin_verified(request)

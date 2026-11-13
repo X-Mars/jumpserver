@@ -3,10 +3,13 @@ from django.db.models.functions import Concat
 from django.utils.translation import gettext as _
 
 from common.exceptions import JMSException
+from common.permissions import IsValidLicenseForWriteAction
 from orgs.mixins.api import OrgBulkModelViewSet
 from orgs.utils import current_org
+from ..filters import RoleBindingFilter
 from .. import serializers
 from ..models import RoleBinding, SystemRoleBinding, OrgRoleBinding
+from ..permissions import RBACPermission
 
 __all__ = [
     'RoleBindingViewSet', 'SystemRoleBindingViewSet',
@@ -17,10 +20,7 @@ __all__ = [
 class RoleBindingViewSet(OrgBulkModelViewSet):
     model = RoleBinding
     serializer_class = serializers.RoleBindingSerializer
-    filterset_fields = [
-        'scope', 'user', 'role', 'org',
-        'user__name', 'user__username', 'role__name'
-    ]
+    filterset_class = RoleBindingFilter
     search_fields = [
         'user__name', 'user__username', 'role__name'
     ]
@@ -49,6 +49,7 @@ class SystemRoleBindingViewSet(RoleBindingViewSet):
 
 class OrgRoleBindingViewSet(RoleBindingViewSet):
     serializer_class = serializers.OrgRoleBindingSerializer
+    permission_classes = [RBACPermission, IsValidLicenseForWriteAction]
 
     def _get_queryset(self):
         return OrgRoleBinding.objects.root_all()

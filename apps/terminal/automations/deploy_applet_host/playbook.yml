@@ -1,232 +1,394 @@
 ---
-
 - hosts: all
   vars:
-    APPLET_DOWNLOAD_HOST: https://demo.jumpserver.org
+    APPLET_DOWNLOAD_HOST: https://demo.example.com
     IGNORE_VERIFY_CERTS: true
-    HOST_NAME: test
     HOST_ID: 00000000-0000-0000-0000-000000000000
-    CORE_HOST: https://demo.jumpserver.org
-    BOOTSTRAP_TOKEN: PleaseChangeMe
-    RDS_Licensing: false
-    RDS_LicenseServer: 127.0.0.1
-    RDS_LicensingMode: 4
-    RDS_fSingleSessionPerUser: 1
-    RDS_MaxDisconnectionTime: 60000
-    RDS_RemoteAppLogoffTimeLimit: 0
-    TinkerInstaller: Tinker_Installer.exe
+    CORE_HOST: https://demo.example.com
+    RDS_LICENSE_SERVER: ''
+    PYTHON_VERSION: 3.11.11
 
   tasks:
-    - name: Install RDS-RD-Server (RDS)
-      ansible.windows.win_feature:
-        name: RDS-RD-Server
-        state: present
-        include_management_tools: yes
-      register: rds_install
+    - block:
+        - name: Check CORE_HOST without redirects
+          ansible.windows.win_uri:
+            url: "{{ CORE_HOST }}"
+            method: GET
+            follow_redirects: none
+            status_code: 200
+            validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
 
-    - name: Stop Tinker before install (jumpserver)
-      ansible.windows.win_powershell:
-        script: |
-          if (Get-Process -Name 'tinker' -ErrorAction SilentlyContinue) {
-            TASKKILL /F /IM tinker.exe /T
-          }
-          else {
-           $Ansible.Changed = $false
-          }
+        - name: Download current Tinker installer
+          ansible.windows.win_get_url:
+            url: "{{ APPLET_DOWNLOAD_HOST }}/download/applets/Tinker_Installer_{{ TINKER_VERSION }}.exe?deployment={{ DEPLOYMENT_ID }}"
+            dest: "{{ ansible_env.TEMP }}\\Tinker_Installer_{{ TINKER_VERSION }}.exe"
+            force: true
+            checksum_algorithm: sha256
+            validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
+          register: tinker_installer
 
-    - name: Stop Tinkerd before install (jumpserver)
-      ansible.windows.win_powershell:
-        script: |
-          if (Get-Service -Name 'JumpServer Tinker' -ErrorAction SilentlyContinue) {
-            Stop-Service -Name 'JumpServer Tinker' -Force
-          }
-          else {
-           $Ansible.Changed = $false
-          }
+        - name: Record Tinker installer SHA256
+          ansible.builtin.debug:
+            msg: "Tinker installer SHA256={{ tinker_installer.checksum_dest }}"
 
-    - name: Download JumpServer Tinker installer (jumpserver)
-      ansible.windows.win_get_url:
-        url: "{{ APPLET_DOWNLOAD_HOST }}/download/applets/{{ TinkerInstaller }}"
-        dest: "{{ ansible_env.TEMP }}\\{{ TinkerInstaller }}"
-        validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
+        - name: Download python-{{ PYTHON_VERSION }}
+          ansible.windows.win_get_url:
+            url: "{{ APPLET_DOWNLOAD_HOST }}/download/applets/jumpserver-tinker-python-{{ PYTHON_VERSION }}-win64.zip"
+            dest: "{{ ansible_env.TEMP }}\\jumpserver-tinker-python-{{ PYTHON_VERSION }}-win64.zip"
+            validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
 
-    - name: Install JumpServer Tinker (jumpserver)
-      ansible.windows.win_package:
-        path: "{{ ansible_env.TEMP }}\\{{ TinkerInstaller }}"
-        arguments:
-          - /VERYSILENT
-          - /SUPPRESSMSGBOXES
-          - /NORESTART
-        state: present
+      tags: [install]
+      rescue:
+        - fail:
+            msg: >-
+              Deployment precheck or download failed at "{{ ansible_failed_task.name }}".
+              Resolve the task error and redeploy.
 
-    - name: Set Tinkerd on the global system path (jumpserver)
-      ansible.windows.win_path:
-        elements:
-          - '%USERPROFILE%\AppData\Local\Programs\Tinker\'
-        scope: user
+    - block:
+        - name: Install RDS-RD-Server (RDS)
+          ansible.windows.win_feature:
+            name: RDS-RD-Server
+            state: present
+            include_management_tools: yes
+          register: rds_install
 
-    - name: Download python-3.10.11
-      ansible.windows.win_get_url:
-        url: "{{ APPLET_DOWNLOAD_HOST }}/download/applets/python-3.10.11-amd64.exe"
-        dest: "{{ ansible_env.TEMP }}\\python-3.10.11-amd64.exe"
-        validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
+        - name: Reboot after RDS role installation if required
+          ansible.windows.win_reboot:
+            post_reboot_delay: 10
+            test_command: whoami
+          when: rds_install.reboot_required
 
-    - name: Install the python-3.10.11
-      ansible.windows.win_package:
-        path: "{{ ansible_env.TEMP }}\\python-3.10.11-amd64.exe"
-        product_id: '{371d0d73-d418-4ffe-b280-58c3e7987525}'
-        arguments:
-          - /quiet
-          - InstallAllUsers=1
-          - PrependPath=1
-          - Include_test=0
-          - Include_launcher=0
-        state: present
-      register: win_install_python
+        - name: Check RDS session host connection capacity
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $Ansible.Changed = $false
+              $namespace = 'root/cimv2/terminalservices'
+              $server = @(Get-CimInstance -Namespace $namespace -ClassName Win32_TerminalServiceSetting)
+              if ($server.Count -ne 1 -or $server[0].TerminalServerMode -notin @(0, 1)) {
+                  throw 'Cannot read the effective RDS Session Host operating mode.'
+              }
+              if ($server[0].TerminalServerMode -ne 1) {
+                  throw 'RDS Session Host is not active. Check role installation and any pending reboot.'
+              }
+              $listener = @(Get-CimInstance -Namespace $namespace -ClassName Win32_TSNetworkAdapterSetting `
+                  -Filter "TerminalName='RDP-Tcp'")
+              if ($listener.Count -ne 1 -or $null -eq $listener[0].MaximumConnections -or
+                  $null -eq $listener[0].PolicySourceMaximumConnections) {
+                  throw 'Cannot read the effective RDP-Tcp connection limit or its policy source.'
+              }
+              $policySource = $listener[0].PolicySourceMaximumConnections
+              $source = switch ($policySource) {
+                  0 { 'Server' }
+                  1 { 'Group Policy' }
+                  2 { 'Default' }
+                  default { "Unknown ($policySource)" }
+              }
+              $maximum = $listener[0].MaximumConnections
+              $Ansible.Result = @{ MaximumConnections = $maximum; PolicySource = $source }
+              Write-Output "RDP-Tcp MaximumConnections=$maximum; source=$source. The RDP connection limit is unchanged."
+              if ($listener[0].PolicySourceMaximumConnections -eq 1) {
+                  Write-Output 'Review the effective Limit number of connections policy if more concurrent sessions are needed.'
+              }
+          register: rds_ready
+          until: rds_ready is succeeded
+          retries: 30
+          delay: 10
 
-    - name: Check pip command exists
-      ansible.windows.win_powershell:
-        script: |
-          if (Get-Command -Name 'pip' -ErrorAction SilentlyContinue) {
-            $Ansible.Changed = $false
-          }
-          else {
-           $Ansible.Changed = $true
-          }
-      register: check_pip_command
-      ignore_errors: yes
+        - name: Read the NLA Group Policy setting
+          ansible.windows.win_reg_stat:
+            path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
+            name: UserAuthentication
+          register: nla_policy
 
-    - name: Reboot if installing requires it
-      ansible.windows.win_reboot:
-        post_reboot_delay: 10
-        test_command: whoami
-      when: check_pip_command.changed or rds_install.reboot_required or win_install_python.reboot_required
+        - name: Check that Group Policy permits disabling NLA
+          ansible.builtin.assert:
+            that:
+              - not nla_policy.exists or (nla_policy.type == 'REG_DWORD' and nla_policy.value == 0)
+            fail_msg: |-
+              RDP Group Policy is incompatible with Tinker auto-login: "Require user authentication for remote connections by using Network Level Authentication".
+              Observed policy UserAuthentication: type={{ nla_policy.type | default('unknown') }}, value={{ nla_policy.value | default('unknown') }}. Required: REG_DWORD 0 or not configured.
+              Policy location: Computer Configuration > Administrative Templates > Windows Components > Remote Desktop Services > Remote Desktop Session Host > Security.
+              Set this policy to Disabled in its source GPO. For a local policy, use gpedit.msc on this host; for a domain policy, ask the domain administrator to change the winning GPO.
+              Run "gpupdate /target:computer /force" on this host, then redeploy.
 
-    - name: Set RDS LicenseServer (regedit)
-      ansible.windows.win_regedit:
-        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
-        name: LicenseServers
-        data: "{{ RDS_LicenseServer }}"
-        type: string
-      when: RDS_Licensing
+        - name: Read the password prompt Group Policy setting
+          ansible.windows.win_reg_stat:
+            path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
+            name: fPromptForPassword
+          register: password_prompt_policy
 
-    - name: Set RDS LicensingMode (regedit)
-      ansible.windows.win_regedit:
-        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
-        name: LicensingMode
-        data: "{{ RDS_LicensingMode }}"
-        type: dword
-      when: RDS_Licensing
+        - name: Check that Group Policy permits automatic RDP logon
+          ansible.builtin.assert:
+            that:
+              - not password_prompt_policy.exists or (password_prompt_policy.type == 'REG_DWORD' and password_prompt_policy.value == 0)
+            fail_msg: |-
+              RDP Group Policy is incompatible with Tinker auto-login: "Always prompt for password upon connection".
+              Observed policy fPromptForPassword: type={{ password_prompt_policy.type | default('unknown') }}, value={{ password_prompt_policy.value | default('unknown') }}. Required: REG_DWORD 0 or not configured.
+              Policy location: Computer Configuration > Administrative Templates > Windows Components > Remote Desktop Services > Remote Desktop Session Host > Security.
+              Set this policy to Disabled in its source GPO. For a local policy, use gpedit.msc on this host; for a domain policy, ask the domain administrator to change the winning GPO.
+              Run "gpupdate /target:computer /force" on this host, then redeploy.
 
-    - name: Set RDS fSingleSessionPerUser (regedit)
-      ansible.windows.win_regedit:
-        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
-        name: fSingleSessionPerUser
-        data: "{{ RDS_fSingleSessionPerUser }}"
-        type: dword
-      when: RDS_Licensing
+        - name: Disable NLA for the RDP-Tcp listener
+          ansible.windows.win_regedit:
+            path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+            name: UserAuthentication
+            data: 0
+            type: dword
+            state: present
 
-    - name: Set RDS MaxDisconnectionTime (regedit)
-      ansible.windows.win_regedit:
-        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
-        name: MaxDisconnectionTime
-        data: "{{ RDS_MaxDisconnectionTime }}"
-        type: dword
-      when: RDS_MaxDisconnectionTime >= 60000
+        # The new installer ends Tinker-managed sessions, uninstalls the old
+        # Tinker and clears its managed runtime state before installing afresh.
+        # Ordinary administrator sessions and installed applications are retained.
+        # Leave the new service stopped until fresh Core credentials are imported.
+        - name: Fully reinstall Tinker
+          ansible.windows.win_command:
+            argv:
+              - "{{ ansible_env.TEMP }}\\Tinker_Installer_{{ TINKER_VERSION }}.exe"
+              - /VERYSILENT
+              - /SUPPRESSMSGBOXES
+              - /NORESTART
+              - /RESTARTEXITCODE=3010
+              - /NOSTART=1
+          async: 1200
+          poll: 5
+          register: tinker_install
+          failed_when: (tinker_install.rc | default(-1)) not in [0, 3010]
 
-    - name: Set RDS RemoteAppLogoffTimeLimit (regedit)
-      ansible.windows.win_regedit:
-        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
-        name: RemoteAppLogoffTimeLimit
-        data: "{{ RDS_RemoteAppLogoffTimeLimit }}"
-        type: dword
+        - name: Reboot after Tinker installation if required and wait for Windows
+          ansible.windows.win_reboot:
+            reboot_timeout: 600
+            post_reboot_delay: 10
+          when: tinker_install.rc == 3010
 
-    - name: Download pip packages
-      ansible.windows.win_get_url:
-        url: "{{ APPLET_DOWNLOAD_HOST }}/download/applets/pip_packages.zip"
-        dest: "{{ ansible_env.TEMP }}\\pip_packages.zip"
-        validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
+        - name: Install the python-{{ PYTHON_VERSION }}
+          community.windows.win_unzip:
+            src: "{{ ansible_env.TEMP }}\\jumpserver-tinker-python-{{ PYTHON_VERSION }}-win64.zip"
+            dest: "%ProgramFiles%\\JumpServer\\applications"
 
-    - name: Unzip pip_packages
-      community.windows.win_unzip:
-        src: "{{ ansible_env.TEMP }}\\pip_packages.zip"
-        dest: "{{ ansible_env.TEMP }}\\pip_packages"
+        - name: Check and Clean global system path (Python)
+          ansible.windows.win_path:
+            elements:
+              - 'C:\Program Files\Python310\Scripts'
+              - 'C:\Program Files\Python310'
+              - 'C:\Program Files\Python311\Scripts'
+              - 'C:\Program Files\Python311'
+            state: absent
 
-    - name: Install python requirements offline
-      ansible.windows.win_powershell:
-        script: |
-          pip install -r '{{ ansible_env.TEMP }}\pip_packages\pip_packages\requirements.txt' --no-index --find-links='{{ ansible_env.TEMP }}\pip_packages\pip_packages'
+        - name: Set python-{{ PYTHON_VERSION }} on the global system path
+          ansible.windows.win_path:
+            elements:
+              - '%ProgramFiles%\JumpServer\applications\Python'
+              - '%ProgramFiles%\JumpServer\applications\Python\Scripts'
 
-    - name: Download chromedriver (Chrome)
-      ansible.windows.win_get_url:
-        url: "{{ APPLET_DOWNLOAD_HOST }}/download/applets/chromedriver_win32.zip"
-        dest: "{{ ansible_env.TEMP }}\\chromedriver_win32.zip"
-        validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
+        - name: Set python-{{ PYTHON_VERSION }} on the global system python path
+          ansible.windows.win_path:
+            name: PYTHONPATH
+            scope: machine
+            elements:
+              - '%ProgramFiles%\JumpServer\applications\Python\packages'
+              - '%ProgramFiles%\JumpServer\applications\Python\Lib\site-packages'
 
-    - name: Unzip chromedriver (Chrome)
-      community.windows.win_unzip:
-        src: "{{ ansible_env.TEMP }}\\chromedriver_win32.zip"
-        dest: C:\Program Files\JumpServer\drivers\chromedriver_win32
+        - name: Set explicitly configured RDS license server
+          ansible.windows.win_regedit:
+            path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
+            name: LicenseServers
+            data: "{{ RDS_LICENSE_SERVER }}"
+            type: string
+          when: RDS_LICENSE_SERVER | default('') | trim | length > 0
 
-    - name: Download Chrome zip package (Chrome)
-      ansible.windows.win_get_url:
-        url: "{{ APPLET_DOWNLOAD_HOST }}/download/applets/chrome-win.zip"
-        dest: "{{ ansible_env.TEMP }}\\chrome-win.zip"
-        validate_certs: "{{ not IGNORE_VERIFY_CERTS }}"
+      tags: [install]
+      rescue:
+        - fail:
+            msg: |-
+              Applet host installation or runtime configuration failed at "{{ ansible_failed_task.name }}".
+              {{ ansible_failed_result.msg | default('Review the failed task output for details.', true) }}
 
-    - name: Unzip Chrome (Chrome)
-      community.windows.win_unzip:
-        src: "{{ ansible_env.TEMP }}\\chrome-win.zip"
-        dest: C:\Program Files\JumpServer\applications
+    - block:
+        - name: Configure Tinker and import its component key
+          ansible.windows.win_powershell:
+            parameters:
+              NAME: "{{ HOST_NAME }}"
+              CORE_HOST: "{{ CORE_HOST }}"
+              HOST_ID: "{{ HOST_ID }}"
+              IGNORE_VERIFY_CERTS: "{{ IGNORE_VERIFY_CERTS | string | lower }}"
+              ComponentKey: "{{ TINKER_ACCESS_KEY }}"
+            script: |
+              param([string]$NAME, [string]$CORE_HOST, [string]$HOST_ID,
+                    [string]$IGNORE_VERIFY_CERTS, [string]$ComponentKey)
+              $ErrorActionPreference = 'Stop'
+              $ComponentKey | & "$env:SystemRoot\System32\config\systemprofile\AppData\Local\Tinker\tinkerd.exe" config `
+                --hostname $NAME --core_host $CORE_HOST --host_id $HOST_ID `
+                "--ignore-verify-certs=$IGNORE_VERIFY_CERTS" --stdin
+              if ($LASTEXITCODE -ne 0) { throw "Tinker configuration failed: $LASTEXITCODE" }
+          no_log: true
 
-    - name: Check and Clean global system path (Chrome)
-      ansible.windows.win_path:
-        elements:
-          - 'C:\Program Files\Chrome\chrome-win32'
-          - 'C:\Program Files\Chrome\chrome-win'
-          - 'C:\Program Files\chrome-win'
-        state: absent
+        - name: Start tinkerd service
+          ansible.windows.win_powershell:
+            script: |
+              & "$env:SystemRoot\System32\config\systemprofile\AppData\Local\Tinker\tinkerd.exe" service start
+              if ($LASTEXITCODE -ne 0) { throw "Tinker service startup failed: $LASTEXITCODE" }
 
-    - name: Set Chrome and driver on the global system path (Chrome)
-      ansible.windows.win_path:
-        elements:
-          - 'C:\Program Files\JumpServer\applications\Chrome\Application'
-          - 'C:\Program Files\JumpServer\drivers\chromedriver_win32'
+        - name: Wait Tinker api health
+          ansible.windows.win_uri:
+            url: http://localhost:6068/api/health/
+            status_code: 200
+            method: GET
+          register: _result
+          until: _result.status_code == 200
+          retries: 30
+          delay: 5
 
-    - name: Set Chrome variables disable Google Api (Chrome)
-      ansible.windows.win_environment:
-        level: machine
-        variables:
-          GOOGLE_API_KEY: ''
-          GOOGLE_DEFAULT_CLIENT_ID: ''
-          GOOGLE_DEFAULT_CLIENT_SECRET: ''
+        # Installation/startup may replace the pre-install listener setting.
+        - name: Persist the disabled NLA setting before refreshing Remote Desktop Services
+          ansible.windows.win_regedit:
+            path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+            name: UserAuthentication
+            data: 0
+            type: dword
+            state: present
 
-    - name: Generate tinkerd component config
-      ansible.windows.win_powershell:
-        script: |
-          tinkerd config --hostname {{ HOST_NAME }} --core_host {{ CORE_HOST }} --token {{ BOOTSTRAP_TOKEN }} --host_id {{ HOST_ID }} --ignore-verify-certs {{ IGNORE_VERIFY_CERTS }}
+        - name: Disable the password prompt for the RDP-Tcp listener
+          ansible.windows.win_regedit:
+            path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+            name: fPromptForPassword
+            data: 0
+            type: dword
+            state: present
 
-    - name: Install tinkerd service
-      ansible.windows.win_powershell:
-        script: |
-          tinkerd service install
+        # Restart exactly once. Only the read-only readiness check below retries.
+        - name: Refresh Remote Desktop Services after Tinker is ready
+          ansible.windows.win_service:
+            name: TermService
+            state: restarted
+            force_dependent_services: true
+          async: 120
+          poll: 5
 
-    - name: Start tinkerd service
-      ansible.windows.win_powershell:
-        script: |
-          tinkerd service start
+        - name: Ensure Remote Desktop Services UserMode Port Redirector is running
+          ansible.windows.win_service:
+            name: UmRdpService
+            state: started
 
-    - name: Wait Tinker api health
-      ansible.windows.win_uri:
-        url: http://localhost:6068/api/health/
-        status_code: 200
-        method: GET
-      register: _result
-      until: _result.status_code == 200
-      retries: 30
-      delay: 5
+        - name: Verify RDP login settings and listener after the service refresh
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $Ansible.Changed = $false
+              $namespace = 'root/cimv2/terminalservices'
+              $listenerPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+              $nlaPolicyName = 'Require user authentication for remote connections by using Network Level Authentication'
+              $passwordPromptPolicyName = 'Always prompt for password upon connection'
+              $policyInstructions = 'Policy location: Computer Configuration > Administrative Templates > Windows Components > Remote Desktop Services > Remote Desktop Session Host > Security. Set the conflicting policy to Disabled in its source GPO: use gpedit.msc for local policies, or ask the domain administrator for domain policies. Run "gpupdate /target:computer /force", then redeploy.'
+              function Assert-RdpLoginSettings {
+                  $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+                  if (Test-Path -LiteralPath $policyPath) {
+                      $policy = Get-ItemProperty -LiteralPath $policyPath
+                      if ($policy.UserAuthentication -eq 1) {
+                          throw "Group Policy still requires NLA (UserAuthentication=1): '$nlaPolicyName'. $policyInstructions"
+                      }
+                      if ($policy.fPromptForPassword -eq 1) {
+                          throw "Group Policy still requires a password prompt (fPromptForPassword=1): '$passwordPromptPolicyName'. $policyInstructions"
+                      }
+                  }
+                  $local = Get-ItemProperty -LiteralPath $listenerPath
+                  $effective = @(Get-CimInstance -Namespace $namespace -ClassName Win32_TSGeneralSetting `
+                      -Filter "TerminalName='RDP-Tcp'")
+                  if ($local.UserAuthentication -ne 0 -or $effective.Count -ne 1 -or
+                      $effective[0].UserAuthenticationRequired -ne 0) {
+                      throw "RDP-Tcp NLA configuration did not take effect. Expected UserAuthentication=0 and WMI UserAuthenticationRequired=0; observed registry=$($local.UserAuthentication), WMI=$($effective.UserAuthenticationRequired). Listener: $listenerPath. Check '$nlaPolicyName'. $policyInstructions"
+                  }
+                  $logon = @(Get-CimInstance -Namespace $namespace -ClassName Win32_TSLogonSetting `
+                      -Filter "TerminalName='RDP-Tcp'" -Property TerminalName,PromptForPassword,PolicySourcePromptForPassword)
+                  if ($local.fPromptForPassword -ne 0 -or $logon.Count -ne 1 -or
+                      $logon[0].PromptForPassword -ne 0) {
+                      throw "RDP-Tcp password prompt configuration did not take effect. Expected fPromptForPassword=0 and WMI PromptForPassword=0; observed registry=$($local.fPromptForPassword), WMI=$($logon.PromptForPassword). Listener: $listenerPath. Check '$passwordPromptPolicyName'. $policyInstructions"
+                  }
+                  return $local
+              }
+              $services = @(Get-Service -Name Tinker,TermService,UmRdpService)
+              if (@($services | Where-Object Status -ne 'Running').Count) {
+                  throw 'Tinker, TermService and UmRdpService must all be running.'
+              }
+              $local = Assert-RdpLoginSettings
+              $server = @(Get-CimInstance -Namespace $namespace -ClassName Win32_TerminalServiceSetting)
+              if ($server.Count -ne 1 -or $server[0].AllowTSConnections -ne 1) {
+                  throw 'Remote Desktop connections are not allowed.'
+              }
+              $port = $local.PortNumber
+              if ($null -eq $port -or $port -lt 1 -or $port -gt 65535) {
+                  throw 'Cannot read a valid RDP-Tcp port.'
+              }
+              function Read-RdpBytes([IO.Stream]$Stream, [int]$Length, [Diagnostics.Stopwatch]$Clock) {
+                  $buffer = New-Object byte[] $Length
+                  $offset = 0
+                  while ($offset -lt $Length) {
+                      $remaining = 5000 - [int]$Clock.ElapsedMilliseconds
+                      if ($remaining -le 0) { throw 'RDP negotiation timed out.' }
+                      $Stream.ReadTimeout = $remaining
+                      $read = $Stream.Read($buffer, $offset, $Length - $offset)
+                      if ($read -eq 0) { throw 'RDP listener closed an incomplete negotiation response.' }
+                      $offset += $read
+                  }
+                  return ,$buffer
+              }
+              $client = [Net.Sockets.TcpClient]::new()
+              $stream = $null
+              $waitHandle = $null
+              $clock = [Diagnostics.Stopwatch]::StartNew()
+              try {
+                  $pending = $client.BeginConnect('127.0.0.1', [int]$port, $null, $null)
+                  $waitHandle = $pending.AsyncWaitHandle
+                  if (-not $waitHandle.WaitOne(5000)) { throw 'RDP listener connection timed out.' }
+                  $client.EndConnect($pending)
+                  $stream = $client.GetStream()
+                  $stream.WriteTimeout = [Math]::Max(1, 5000 - [int]$clock.ElapsedMilliseconds)
+                  # Request TLS without CredSSP to verify that NLA is not required.
+                  [byte[]]$request = 3,0,0,19,14,224,0,0,0,0,0,1,0,8,0,1,0,0,0
+                  $stream.Write($request, 0, $request.Length)
+                  $header = Read-RdpBytes $stream 4 $clock
+                  $length = ([int]$header[2] -shl 8) -bor [int]$header[3]
+                  if ($header[0] -ne 3 -or $header[1] -ne 0 -or $length -lt 19 -or $length -gt 4096) {
+                      throw 'Invalid RDP TPKT response.'
+                  }
+                  $reply = Read-RdpBytes $stream ($length - 4) $clock
+                  if ($reply[0] -ne ($length - 5) -or $reply[1] -ne 208 -or
+                      [BitConverter]::ToUInt16($reply, 9) -ne 8) {
+                      throw 'Invalid RDP negotiation response.'
+                  }
+                  $protocol = [BitConverter]::ToUInt32($reply, 11)
+                  if ($reply[7] -eq 3) {
+                      if ($protocol -eq 5) { throw 'RDP listener still requires NLA (HYBRID_REQUIRED_BY_SERVER).' }
+                      throw "RDP negotiation failed with code $protocol."
+                  }
+                  if ($reply[7] -ne 2 -or $protocol -ne 1) {
+                      throw 'RDP listener did not accept TLS without NLA.'
+                  }
+              } finally {
+                  if ($stream) { $stream.Dispose() }
+                  if ($waitHandle) { $waitHandle.Close() }
+                  $client.Dispose()
+              }
+              Start-Sleep -Seconds 2
+              $null = Assert-RdpLoginSettings
+              $Ansible.Result = @{ Port = $port; NLARequired = $false; PromptForPassword = $false; NegotiatedProtocol = 'TLS' }
+          register: rdp_ready
+          until: rdp_ready is succeeded
+          retries: 6
+          delay: 5
 
-    - name: Sync all remote applets
-      ansible.windows.win_powershell:
-        script: |
-          tinkerd install all
+      tags: [deploy]
+      rescue:
+        - fail:
+            msg: |-
+              Tinker configuration, startup, health or RDP readiness check failed at "{{ ansible_failed_task.name }}".
+              {% if ansible_failed_task.no_log | default(false) or ansible_failed_result._ansible_no_log | default(false) %}
+              Failure details are hidden because this task handles component credentials.
+              {% else %}
+              {% set errors = ansible_failed_result.error | default([], true) %}
+              {% if errors %}
+              {{ (errors[0].exception | default({}, true)).message | default(ansible_failed_result.msg | default('Review the failed task output for details.', true), true) }}
+              {% else %}
+              {{ ansible_failed_result.msg | default('Review the failed task output for details.', true) }}
+              {% endif %}
+              {% endif %}

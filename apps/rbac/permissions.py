@@ -16,10 +16,10 @@ class RBACPermission(permissions.DjangoModelPermissions):
         ('bulk_update', '%(app_label)s.change_%(model_name)s'),
         ('partial_bulk_update', '%(app_label)s.change_%(model_name)s'),
         ('bulk_destroy', '%(app_label)s.delete_%(model_name)s'),
-        ('render_to_json', '%(app_label)s.add_%(model_name)s'),
-        ('metadata', '*'),
+        ('render_to_json', 'none'),
+        ('metadata', 'none'),
         ('GET', '%(app_label)s.view_%(model_name)s'),
-        ('OPTIONS', '*'),
+        ('OPTIONS', 'none'),
         ('HEAD', '%(app_label)s.view_%(model_name)s'),
         ('POST', '%(app_label)s.add_%(model_name)s'),
         ('PUT', '%(app_label)s.change_%(model_name)s'),
@@ -52,7 +52,7 @@ class RBACPermission(permissions.DjangoModelPermissions):
         return cls.format_perms(perm_tmpl, model_cls)
 
     def get_default_action_perms(self, model_cls):
-        if model_cls is None:
+        if model_cls is None or not hasattr(model_cls, '_meta'):
             return {}
 
         perms = {}
@@ -139,7 +139,7 @@ class RBACPermission(permissions.DjangoModelPermissions):
         if isinstance(perms, str):
             perms = [perms]
         has = request.user.has_perms(perms)
-        logger.debug('View require perms: {}, result: {}'.format(perms, has))
+        logger.debug('Api require perms: {}, result: {}'.format(perms, has))
         return has
 
     def has_object_permission(self, request, view, obj):

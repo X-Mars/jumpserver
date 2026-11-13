@@ -7,25 +7,60 @@ from . import api
 app_name = 'accounts'
 
 router = BulkRouter()
+router.register(r'application-audits', api.ApplicationAuditViewSet, 'application-audit')
+router.register(r'application-event-logs', api.ApplicationEventLogViewSet, 'application-event-log')
 
 router.register(r'accounts', api.AccountViewSet, 'account')
 router.register(r'virtual-accounts', api.VirtualAccountViewSet, 'virtual-account')
 router.register(r'gathered-accounts', api.GatheredAccountViewSet, 'gathered-account')
 router.register(r'account-secrets', api.AccountSecretsViewSet, 'account-secret')
+router.register(r'personal-asset-credentials', api.PersonalAssetCredentialViewSet,'personal-asset-credential')
 router.register(r'account-templates', api.AccountTemplateViewSet, 'account-template')
 router.register(r'account-template-secrets', api.AccountTemplateSecretsViewSet, 'account-template-secret')
-router.register(r'account-backup-plans', api.AccountBackupPlanViewSet, 'account-backup')
-router.register(r'account-backup-plan-executions', api.AccountBackupPlanExecutionViewSet, 'account-backup-execution')
+router.register(r'account-backup-plans', api.BackupAccountViewSet, 'account-backup')
+router.register(r'account-backup-plan-executions', api.BackupAccountExecutionViewSet, 'account-backup-execution')
 router.register(r'change-secret-automations', api.ChangeSecretAutomationViewSet, 'change-secret-automation')
+router.register(r'change-secret-status', api.ChangeSecretStatusViewSet, 'change-secret-status')
 router.register(r'change-secret-executions', api.ChangSecretExecutionViewSet, 'change-secret-execution')
 router.register(r'change-secret-records', api.ChangeSecretRecordViewSet, 'change-secret-record')
-router.register(r'gather-account-automations', api.GatherAccountsAutomationViewSet, 'gather-account-automation')
-router.register(r'gather-account-executions', api.GatherAccountsExecutionViewSet, 'gather-account-execution')
+router.register(r'gather-account-automations', api.DiscoverAccountsAutomationViewSet, 'gather-account-automation')
+router.register(r'gather-account-executions', api.DiscoverAccountsExecutionViewSet, 'gather-account-execution')
 router.register(r'push-account-automations', api.PushAccountAutomationViewSet, 'push-account-automation')
 router.register(r'push-account-executions', api.PushAccountExecutionViewSet, 'push-account-execution')
 router.register(r'push-account-records', api.PushAccountRecordViewSet, 'push-account-record')
+router.register(r'check-account-automations', api.CheckAccountAutomationViewSet, 'check-account-automation')
+router.register(r'check-account-executions', api.CheckAccountExecutionViewSet, 'check-account-execution')
+router.register(r'verify-account-automations', api.VerifyAccountAutomationViewSet, 'verify-account-automation')
+router.register(r'connectivity-automations', api.ConnectivityAutomationViewSet, 'connectivity-automation')
+router.register(r'connectivity-executions', api.ConnectivityExecutionViewSet, 'connectivity-execution')
+router.register(r'connectivity-records', api.ConnectivityRecordViewSet, 'connectivity-record')
+router.register(r'verify-account-executions', api.VerifyAccountExecutionViewSet, 'verify-account-execution')
+router.register(r'ping-automations', api.PingAutomationViewSet, 'ping-automation')
+router.register(r'ping-executions', api.PingExecutionViewSet, 'ping-execution')
+router.register(r'account-check-engines', api.CheckAccountEngineViewSet, 'account-check-engine')
+router.register(r'account-risks', api.AccountRiskViewSet, 'account-risks')
+router.register(r'integration-applications', api.IntegrationApplicationViewSet, 'integration-apps')
+router.register(r'application-webhooks', api.ApplicationWebhookViewSet, 'application-webhook')
+router.register(r'application-credentials', api.ApplicationCredentialViewSet, 'application-credential')
+router.register(
+    r'credential-application-bindings',
+    api.CredentialApplicationBindingViewSet,
+    'credential-application-binding',
+)
+router.register(
+    r'credential-client-instances',
+    api.CredentialClientInstanceViewSet,
+    'credential-client-instance',
+)
+router.register(r'credential-client', api.CredentialClientViewSet, 'credential-client')
 
 urlpatterns = [
+    path('client-source/<slug:language>/', api.PAMClientSourceDownloadAPI.as_view(), name='pam-client-source'),
+    path('python-sdk/', api.PythonSDKDownloadAPI.as_view(), name='python-sdk-download'),
+    path('accounts/<uuid:pk>/reveal-by-ticket/', api.AccountTicketSecretAPI.as_view(),
+         name='account-ticket-secret'),
+    path('accounts/<uuid:pk>/request-secret-ticket/', api.AccountTicketSecretRequestAPI.as_view(),
+         name='account-ticket-secret-request'),
     path('accounts/bulk/', api.AssetAccountBulkCreateApi.as_view(), name='account-bulk-create'),
     path('accounts/tasks/', api.AccountsTaskCreateAPI.as_view(), name='account-task-create'),
     path('account-secrets/<uuid:pk>/histories/', api.AccountHistoriesSecretAPI.as_view(),
@@ -44,6 +79,39 @@ urlpatterns = [
     path('push-account/<uuid:pk>/nodes/', api.PushAccountNodeAddRemoveApi.as_view(),
          name='push-account-add-or-remove-node'),
     path('push-account/<uuid:pk>/assets/', api.PushAccountAssetsListApi.as_view(), name='push-account-assets'),
+
+    path('gather-account/<uuid:pk>/asset/remove/', api.DiscoverAccountsRemoveAssetApi.as_view(),
+         name='gather-account-remove-asset'),
+    path('gather-account/<uuid:pk>/asset/add/', api.DiscoverAccountsAddAssetApi.as_view(),
+         name='gather-account-add-asset'),
+    path('gather-account/<uuid:pk>/nodes/', api.DiscoverAccountsNodeAddRemoveApi.as_view(),
+         name='gather-account-add-or-remove-node'),
+    path('gather-account/<uuid:pk>/assets/', api.DiscoverAccountsAssetsListApi.as_view(),
+         name='gather-account-assets'),
+
+    path('check-account/<uuid:pk>/asset/remove/', api.CheckAccountRemoveAssetApi.as_view(),
+         name='check-account-remove-asset'),
+    path('check-account/<uuid:pk>/asset/add/', api.CheckAccountAddAssetApi.as_view(),
+         name='check-account-add-asset'),
+    path('check-account/<uuid:pk>/nodes/', api.CheckAccountNodeAddRemoveApi.as_view(),
+         name='check-account-add-or-remove-node'),
+    path('check-account/<uuid:pk>/assets/', api.CheckAccountAssetsListApi.as_view(),
+         name='check-account-assets'),
+    path('verify-account/<uuid:pk>/asset/remove/', api.VerifyAccountRemoveAssetApi.as_view(),
+         name='verify-account-remove-asset'),
+    path('verify-account/<uuid:pk>/asset/add/', api.VerifyAccountAddAssetApi.as_view(),
+         name='verify-account-add-asset'),
+    path('verify-account/<uuid:pk>/nodes/', api.VerifyAccountNodeAddRemoveApi.as_view(),
+         name='verify-account-add-or-remove-node'),
+    path('verify-account/<uuid:pk>/assets/', api.VerifyAccountAssetsListApi.as_view(),
+         name='verify-account-assets'),
+
+    path('ping/<uuid:pk>/asset/remove/', api.PingRemoveAssetApi.as_view(), name='ping-remove-asset'),
+    path('ping/<uuid:pk>/asset/add/', api.PingAddAssetApi.as_view(), name='ping-add-asset'),
+    path('ping/<uuid:pk>/nodes/', api.PingNodeAddRemoveApi.as_view(), name='ping-add-or-remove-node'),
+    path('ping/<uuid:pk>/assets/', api.PingAssetsListApi.as_view(), name='ping-assets'),
+    path('pam-dashboard/', api.PamDashboardApi.as_view(), name='pam-dashboard'),
+    path('change-secret-dashboard/', api.ChangeSecretDashboardApi.as_view(), name='change-secret-dashboard'),
 ]
 
 urlpatterns += router.urls

@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 #
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError
 from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
+from rest_framework.fields import empty
 
+from accounts.const import Source
 from accounts.models import AccountTemplate, Account
-from accounts.tasks import push_accounts_to_assets_task
 from assets.models import Asset, Node
+from common.serializers import ResourceLabelsMixin
 from common.serializers.fields import BitChoicesField, ObjectRelatedField
 from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 from perms.models import ActionChoices, AssetPermission
+from perms.utils.expire_soon_notice import sync_expire_soon_notice
 from users.models import User, UserGroup
 
-__all__ = ["AssetPermissionSerializer", "ActionChoicesField"]
+__all__ = ["AssetPermissionSerializer", "ActionChoicesField", "AssetPermissionListSerializer"]
 
 
 class ActionChoicesField(BitChoicesField):
@@ -25,35 +30,78 @@ class ActionChoicesField(BitChoicesField):
     def to_file_internal_value(self, data):
         return data
 
+    @property
+    def default(self):
+        if self._default is empty:
+            return self._default
+        return self.to_representation(self._default)
 
-class AssetPermissionSerializer(BulkOrgResourceModelSerializer):
-    users = ObjectRelatedField(queryset=User.objects, many=True, required=False, label=_('User'))
+    @default.setter
+    def default(self, value):
+        self._default = value
+
+
+class PermAccountsSerializer(serializers.ListField):
+    child = serializers.CharField(trim_whitespace=False)
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault('help_text', self.get_render_help_text())
+        super().__init__(**kwargs)
+
+    def get_render_help_text(self):
+        return _('Account usernames, not account IDs. '
+                 'Format ["@virtual", "root", "%template_id"], '
+                 'virtual choices: @ALL, @SPEC, @USER, @ANON, @INPUT')
+
+
+class PermProtocolsSerializer(serializers.ListField):
+    def get_render_help_text(self):
+        return _('Protocols, format ["ssh", "rdp", "vnc"] or ["all"]')
+
+
+class AssetPermissionSerializer(ResourceLabelsMixin, BulkOrgResourceModelSerializer):
+    users = ObjectRelatedField(queryset=User.objects, many=True, required=False, label=_('Users'))
     user_groups = ObjectRelatedField(
-        queryset=UserGroup.objects, many=True, required=False, label=_('User group')
+        queryset=UserGroup.objects, many=True, required=False, label=_('Groups')
     )
-    assets = ObjectRelatedField(queryset=Asset.objects, many=True, required=False, label=_('Asset'))
-    nodes = ObjectRelatedField(queryset=Node.objects, many=True, required=False, label=_('Node'))
-    actions = ActionChoicesField(required=False, allow_null=True, label=_("Actions"))
+    assets = ObjectRelatedField(queryset=Asset.objects, many=True, required=False, label=_('Assets'))
+    nodes = ObjectRelatedField(queryset=Node.objects, many=True, required=False, label=_('Nodes'))
+    users_amount = serializers.IntegerField(read_only=True, label=_("Users amount"))
+    user_groups_amount = serializers.IntegerField(read_only=True, label=_("Groups amount"))
+    assets_amount = serializers.IntegerField(read_only=True, label=_("Assets amount"))
+    nodes_amount = serializers.IntegerField(read_only=True, label=_("Nodes amount"))
+    actions = ActionChoicesField(required=False, allow_null=True, label=_("Action"))
     is_valid = serializers.BooleanField(read_only=True, label=_("Is valid"))
     is_expired = serializers.BooleanField(read_only=True, label=_("Is expired"))
-    accounts = serializers.ListField(label=_("Account"), required=False)
+    accounts = PermAccountsSerializer(label=_("Accounts"), required=False)
+    protocols = PermProtocolsSerializer(label=_("Protocols"), required=False)
 
     template_accounts = AccountTemplate.objects.none()
 
     class Meta:
         model = AssetPermission
         fields_mini = ["id", "name"]
+        relation_count_fields = {
+            'users_amount': 'users',
+            'user_groups_amount': 'user_groups',
+            'assets_amount': 'assets',
+            'nodes_amount': 'nodes',
+        }
+        amount_fields = list(relation_count_fields)
         fields_generic = [
-            "accounts", "actions", "created_by", "date_created",
-            "date_start", "date_expired", "is_active", "is_expired",
-            "is_valid", "comment", "from_ticket",
+            "accounts", "protocols", "actions",
+            "created_by", "date_created", "date_start", "date_expired", "is_active",
+            "is_expired", "is_valid", "comment", "from_ticket",
+            "expire_soon_notice_minutes", "expire_soon_notice_at",
         ]
         fields_small = fields_mini + fields_generic
-        fields_m2m = ["users", "user_groups", "assets", "nodes"]
+        fields_m2m = ["users", "user_groups", "assets", "nodes", "labels"] + amount_fields
         fields = fields_mini + fields_m2m + fields_generic
-        read_only_fields = ["created_by", "date_created", "from_ticket"]
+        read_only_fields = [
+            "created_by", "date_created", "from_ticket", "expire_soon_notice_at",
+        ]
         extra_kwargs = {
-            "actions": {"label": _("Actions")},
+            "actions": {"label": _("Action"), },
             "is_expired": {"label": _("Is expired")},
             "is_valid": {"label": _("Is valid")},
         }
@@ -66,7 +114,7 @@ class AssetPermissionSerializer(BulkOrgResourceModelSerializer):
         actions = self.fields.get("actions")
         if not actions:
             return
-        actions.default = list(actions.choices.keys())
+        actions.default = ActionChoices.all()
 
     @staticmethod
     def get_all_assets(nodes, assets):
@@ -76,48 +124,53 @@ class AssetPermissionSerializer(BulkOrgResourceModelSerializer):
         return Asset.objects.filter(id__in=asset_ids)
 
     def create_accounts(self, assets):
-        need_create_accounts = []
+        account_objs = []
         account_attribute = [
             'name', 'username', 'secret_type', 'secret',
             'privileged', 'is_active', 'org_id'
         ]
         for asset in assets:
-            asset_exist_accounts = Account.objects.none()
+            asset_exist_account_names = set(asset.accounts.values_list('name', flat=True))
+
+            asset_exist_accounts = asset.accounts.values('username', 'secret_type')
+            username_secret_type_set = {(acc['username'], acc['secret_type']) for acc in asset_exist_accounts}
             for template in self.template_accounts:
-                asset_exist_accounts |= asset.accounts.filter(
-                    username=template.username,
-                    secret_type=template.secret_type,
-                )
-            username_secret_type_dict = asset_exist_accounts.values('username', 'secret_type')
-            for template in self.template_accounts:
-                condition = {
-                    'username': template.username,
-                    'secret_type': template.secret_type
-                }
-                if condition in username_secret_type_dict:
+                condition = (template.username, template.secret_type)
+                if condition in username_secret_type_set or template.name in asset_exist_account_names:
                     continue
+
                 account_data = {key: getattr(template, key) for key in account_attribute}
                 account_data['su_from'] = template.get_su_from_account(asset)
-                account_data['name'] = f"{account_data['name']}-{_('Account template')}"
-                need_create_accounts.append(Account(**{'asset_id': asset.id, **account_data}))
-        return Account.objects.bulk_create(need_create_accounts)
+                account_data['source'] = Source.TEMPLATE
+                account_data['source_id'] = str(template.id)
+                account_objs.append(Account(asset=asset, **account_data))
 
-    def create_and_push_account(self, nodes, assets):
+        if account_objs:
+            try:
+                Account.objects.bulk_create(account_objs)
+            except IntegrityError as e:
+                raise serializers.ValidationError(
+                    _('Please ensure that the selected account templates use the same username.'))
+
+    def create_account_through_template(self, nodes, assets):
         if not self.template_accounts:
             return
+        if self.instance:
+            assets = assets or self.instance.assets.all()
+            nodes = nodes or self.instance.nodes.all()
         assets = self.get_all_assets(nodes, assets)
-        accounts = self.create_accounts(assets)
-        account_ids = [str(account.id) for account in accounts]
-        slice_count = 20
-        for i in range(0, len(account_ids), slice_count):
-            push_accounts_to_assets_task.delay(account_ids[i:i + slice_count])
+        self.create_accounts(assets)
 
     def validate_accounts(self, usernames):
         template_ids = []
         account_usernames = []
-        for username in usernames:
+        for index, username in enumerate(usernames):
             if username.startswith('%'):
-                template_ids.append(username[1:])
+                try:
+                    template_id = serializers.UUIDField().run_validation(username[1:])
+                except serializers.ValidationError as exc:
+                    raise serializers.ValidationError({index: exc.detail}) from exc
+                template_ids.append(template_id)
             else:
                 account_usernames.append(username)
         self.template_accounts = AccountTemplate.objects.filter(id__in=template_ids)
@@ -136,8 +189,8 @@ class AssetPermissionSerializer(BulkOrgResourceModelSerializer):
     def perform_display_create(instance, **kwargs):
         # 用户
         users_to_set = User.objects.filter(
-            Q(name__in=kwargs.get("users_display"))
-            | Q(username__in=kwargs.get("users_display"))
+            Q(name__in=kwargs.get("users_display")) |
+            Q(username__in=kwargs.get("users_display"))
         ).distinct()
         instance.users.add(*users_to_set)
         # 用户组
@@ -147,8 +200,8 @@ class AssetPermissionSerializer(BulkOrgResourceModelSerializer):
         instance.user_groups.add(*user_groups_to_set)
         # 资产
         assets_to_set = Asset.objects.filter(
-            Q(address__in=kwargs.get("assets_display"))
-            | Q(name__in=kwargs.get("assets_display"))
+            Q(address__in=kwargs.get("assets_display")) |
+            Q(name__in=kwargs.get("assets_display"))
         ).distinct()
         instance.assets.add(*assets_to_set)
         # 节点
@@ -158,11 +211,23 @@ class AssetPermissionSerializer(BulkOrgResourceModelSerializer):
         instance.nodes.add(*nodes_to_set)
 
     def validate(self, attrs):
-        self.create_and_push_account(
+        attrs = super().validate(attrs)
+        if self.instance is None:
+            attrs.setdefault(
+                'date_start', AssetPermission._meta.get_field('date_start').get_default()
+            )
+            attrs.setdefault(
+                'date_expired', AssetPermission._meta.get_field('date_expired').get_default()
+            )
+        try:
+            sync_expire_soon_notice(self.instance, attrs)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict) from exc
+        self.create_account_through_template(
             attrs.get("nodes", []),
             attrs.get("assets", [])
         )
-        return super().validate(attrs)
+        return attrs
 
     def create(self, validated_data):
         display = {
@@ -174,3 +239,17 @@ class AssetPermissionSerializer(BulkOrgResourceModelSerializer):
         instance = super().create(validated_data)
         self.perform_display_create(instance, **display)
         return instance
+
+
+class AssetPermissionListSerializer(AssetPermissionSerializer):
+    class Meta(AssetPermissionSerializer.Meta):
+        fields = [
+            item for item in (
+                AssetPermissionSerializer.Meta.fields + AssetPermissionSerializer.Meta.amount_fields
+            ) if item not in ["users", "assets", "nodes", "user_groups"]
+        ]
+
+    @classmethod
+    def setup_eager_loading(cls, queryset):
+        # 重写父类的方法，列表时不需要预加载 m2m 关系，避免性能问题
+        return queryset

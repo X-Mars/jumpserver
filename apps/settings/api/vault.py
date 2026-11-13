@@ -5,31 +5,43 @@ from rest_framework.generics import GenericAPIView
 from rest_framework.views import Response, APIView
 
 from accounts.backends import get_vault_client
-from accounts.tasks.vault import sync_secret_to_vault
+from accounts.tasks.vault import restore_secret_from_vault, sync_secret_to_vault
+from common.exceptions import JMSException
 from settings.models import Setting
 from .. import serializers
 
 
 class VaultTestingAPI(GenericAPIView):
-    serializer_class = serializers.VaultSettingSerializer
+    backends_serializer = {
+        'openbao': serializers.OpenBaoSerializer,
+        'azure': serializers.AzureKVSerializer,
+        'aws': serializers.AmazonSMSerializer,
+        'hcp': serializers.HashicorpKVSerializer
+    }
     rbac_perms = {
         'POST': 'settings.change_vault'
     }
 
-    def get_config(self, request):
-        serializer = self.serializer_class(data=request.data)
+    def get_config(self, request, backend):
+        serializer_class = self.backends_serializer.get(backend)
+        if serializer_class is None:
+            raise JMSException()
+        serializer = serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        for k, v in data.items():
-            if v:
+        for name in serializer.fields:
+            if name in data and data[name] not in ('', None):
                 continue
-            # 页面没有传递值, 从 settings 中获取
-            data[k] = getattr(settings, k, None)
+            # 页面没有传递值, 从 settings 中获取。False 是有效的开关值。
+            data[name] = getattr(settings, name, None)
+        if backend == 'openbao':
+            data['VAULT_OPENBAO_CACERT_FILE'] = settings.VAULT_OPENBAO_CACERT_FILE
         return data
 
-    def post(self, request):
-        config = self.get_config(request)
+    def post(self, request, backend):
+        config = self.get_config(request, backend)
         config['VAULT_ENABLED'] = settings.VAULT_ENABLED
+        config['VAULT_BACKEND'] = backend
         try:
             client = get_vault_client(raise_exception=True, **config)
             ok, error = client.is_active()
@@ -59,3 +71,9 @@ class VaultSyncDataAPI(APIView):
         task = sync_secret_to_vault.delay()
         return task
 
+
+class VaultRestoreDataAPI(VaultSyncDataAPI):
+    @staticmethod
+    def _run_task():
+        task = restore_secret_from_vault.delay()
+        return task

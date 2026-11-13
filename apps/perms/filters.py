@@ -1,27 +1,102 @@
 from django.db.models import QuerySet, Q
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 from django_filters import rest_framework as filters
 
+from assets.const import AllTypes, Category, GATEWAY_NAME
 from assets.models import Node, Asset
 from common.drf.filters import BaseFilterSet
-from common.utils import get_object_or_none
+from common.utils import get_object_or_none, is_uuid
 from perms.models import AssetPermission, AssetPermissionQuerySet
 from users.models import User, UserGroup
+from users.tree import get_ungrouped_users
+
+
+class PermedAssetFilterSet(BaseFilterSet):
+    user_name = filters.CharFilter(
+        field_name='user_custom__name', label=_('Custom Name')
+    )
+    user_comment = filters.CharFilter(
+        field_name='user_custom__comment', label=_('Custom Comment')
+    )
+    platform = filters.CharFilter(
+        method='filter_platform', label=_('Platform name or ID')
+    )
+    type = filters.ChoiceFilter(
+        field_name='platform__type', choices=AllTypes.choices(),
+        label=_('Platform type')
+    )
+    category = filters.ChoiceFilter(
+        field_name='platform__category', choices=Category.choices,
+        label=_('Platform category')
+    )
+    protocols = filters.CharFilter(
+        method='filter_protocols', label=_('Protocols')
+    )
+    zone = filters.CharFilter(
+        method='filter_zone', label=_('Zone name or ID')
+    )
+
+    class Meta:
+        model = Asset
+        fields = [
+            'id', 'name', 'address', 'platform', 'type', 'category', 'protocols',
+            'zone', 'is_active', 'comment', 'user_name', 'user_comment',
+        ]
+        fields_operator = {
+            'platform': ('exact',),
+            'category': ('in',),
+            'protocols': ('in',),
+            'zone': ('icontains',),
+        }
+
+    @staticmethod
+    def filter_platform(queryset, name, value):
+        if value.isdigit():
+            return queryset.filter(platform_id=value)
+        if value == GATEWAY_NAME:
+            return queryset.filter(
+                platform__name__istartswith=GATEWAY_NAME
+            )
+        return queryset.filter(platform__name=value)
+
+    @staticmethod
+    def filter_protocols(queryset, name, value):
+        protocols = value.split(',')
+        return queryset.filter(protocols__name__in=protocols).distinct()
+
+    @staticmethod
+    def filter_zone(queryset, name, value):
+        if is_uuid(value):
+            return queryset.filter(zone_id=value)
+        return queryset.filter(zone__name__icontains=value)
 
 
 class PermissionBaseFilter(BaseFilterSet):
-    is_valid = filters.BooleanFilter(method='do_nothing')
-    user_id = filters.UUIDFilter(method='do_nothing')
-    username = filters.CharFilter(method='do_nothing')
-    account_id = filters.UUIDFilter(method='do_nothing')
-    account = filters.CharFilter(method='do_nothing')
-    user_group_id = filters.UUIDFilter(method='do_nothing')
-    user_group = filters.CharFilter(method='do_nothing')
-    all = filters.BooleanFilter(method='do_nothing')
+    is_valid = filters.BooleanFilter(
+        method='do_nothing', label=_('Is valid')
+    )
+    is_expired = filters.BooleanFilter(
+        method='filter_expired', label=_('Is expired')
+    )
+    user_id = filters.UUIDFilter(method='do_nothing', label=_('User ID'))
+    username = filters.CharFilter(method='do_nothing', label=_('Username'))
+    user_group_id = filters.UUIDFilter(
+        method='do_nothing', label=_('User group ID')
+    )
+    user_group = filters.CharFilter(
+        field_name='user_groups__name', method='do_nothing',
+        label=_('User group name')
+    )
+    all = filters.BooleanFilter(method='do_nothing', label=_('All'))
+    include_inherited = filters.BooleanFilter(
+        method='do_nothing', label=_('Include inherited permissions')
+    )
 
     class Meta:
         fields = (
-            'user_id', 'username', 'account_id', 'account',
-            'user_group_id', 'user_group', 'name', 'all', 'is_valid',
+            'user_id', 'username', 'user_group_id', 'user_group', 'name',
+            'all', 'include_inherited', 'is_valid', 'is_expired',
         )
 
     @property
@@ -31,6 +106,15 @@ class PermissionBaseFilter(BaseFilterSet):
         qs = self.filter_user(qs)
         qs = self.filter_user_group(qs)
         return qs
+
+    @staticmethod
+    def filter_expired(queryset, name, is_expired):
+        now = timezone.now()
+        if is_expired:
+            queryset = queryset.filter(Q(date_start__gt=now) | Q(date_expired__lt=now))
+        else:
+            queryset = queryset.filter(Q(date_start__lt=now) | Q(date_expired__gt=now))
+        return queryset
 
     def filter_valid(self, queryset):
         is_valid = self.get_query_param('is_valid')
@@ -44,7 +128,9 @@ class PermissionBaseFilter(BaseFilterSet):
         return queryset
 
     def filter_user(self, queryset):
-        is_query_all = self.get_query_param('all', True)
+        is_query_all = self.get_query_param(
+            'include_inherited', self.get_query_param('all', True)
+        )
         user_id = self.get_query_param('user_id')
         username = self.get_query_param('username')
 
@@ -90,23 +176,46 @@ class PermissionBaseFilter(BaseFilterSet):
 
 
 class AssetPermissionFilter(PermissionBaseFilter):
-    is_effective = filters.BooleanFilter(method='do_nothing')
-    node_id = filters.UUIDFilter(method='do_nothing')
-    node_name = filters.CharFilter(method='do_nothing')
-    asset_id = filters.UUIDFilter(method='do_nothing')
-    asset_name = filters.CharFilter(method='do_nothing')
-    address = filters.CharFilter(method='do_nothing')
-    accounts = filters.CharFilter(method='do_nothing')
-    ip = filters.CharFilter(method='do_nothing')
+    ungrouped_users = filters.BooleanFilter(
+        method='filter_ungrouped_users', label=_('Ungrouped users')
+    )
+    is_effective = filters.BooleanFilter(
+        method='do_nothing', label=_('Is effective')
+    )
+    node_id = filters.UUIDFilter(method='do_nothing', label=_('Node ID'))
+    node_name = filters.CharFilter(
+        method='do_nothing', label=_('Node name')
+    )
+    asset_id = filters.UUIDFilter(method='do_nothing', label=_('Asset ID'))
+    asset_name = filters.CharFilter(
+        field_name='assets__name', method='do_nothing',
+        label=_('Asset name')
+    )
+    address = filters.CharFilter(method='do_nothing', label=_('Asset address'))
+    accounts = filters.CharFilter(method='do_nothing', label=_('Accounts'))
+    is_no_resource = filters.BooleanFilter(
+        method='filter_no_resource', label=_('No resource')
+    )
 
     class Meta:
         model = AssetPermission
         fields = (
-            'user_id', 'username', 'user_group_id',
-            'user_group', 'node_id', 'node_name', 'asset_id', 'asset_name',
-            'name', 'ip', 'name',
-            'all', 'is_valid', 'is_effective', 'from_ticket'
+            'id', 'name', 'all', 'include_inherited',
+            'user_id', 'username', 'user_group_id', 'user_group', 'ungrouped_users',
+            'node_id', 'node_name', 'asset_id', 'asset_name',
+            'address', 'accounts',
+            'is_active', 'is_valid', 'is_expired',
+            'is_effective', 'is_no_resource', 'from_ticket',
         )
+        fields_operator = {
+            'accounts': ('in',),
+        }
+
+    @staticmethod
+    def filter_ungrouped_users(queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(users__in=get_ungrouped_users()).distinct()
 
     @property
     def qs(self):
@@ -127,7 +236,9 @@ class AssetPermissionFilter(PermissionBaseFilter):
         return queryset
 
     def filter_node(self, queryset: QuerySet):
-        is_query_all = self.get_query_param('all', True)
+        is_query_all = self.get_query_param(
+            'include_inherited', self.get_query_param('all', True)
+        )
         node_id = self.get_query_param('node_id')
         node_name = self.get_query_param('node_name')
         if node_id:
@@ -151,7 +262,9 @@ class AssetPermissionFilter(PermissionBaseFilter):
         return queryset
 
     def filter_asset(self, queryset):
-        is_query_all = self.get_query_param('all', True)
+        is_query_all = self.get_query_param(
+            'include_inherited', self.get_query_param('all', True)
+        )
         asset_id = self.get_query_param('asset_id')
         asset_name = self.get_query_param('asset_name')
         address = self.get_query_param('address')
@@ -187,6 +300,19 @@ class AssetPermissionFilter(PermissionBaseFilter):
         qs = queryset.filter(id__in=qs_ids)
         return qs
 
+    @staticmethod
+    def filter_no_resource(queryset, name, value):
+        not_have_user_q = Q(users__isnull=True) & Q(user_groups__isnull=True)
+        not_have_asset_q = Q(assets__isnull=True) & Q(nodes__isnull=True)
+        not_have_action_q = Q(actions=0)
+        q = not_have_user_q | not_have_asset_q | not_have_action_q
+
+        if value:
+            queryset = queryset.filter(q)
+        else:
+            queryset = queryset.exclude(q)
+        return queryset
+
     def filter_effective(self, queryset):
         is_effective = self.get_query_param('is_effective')
         if is_effective is None:
@@ -197,13 +323,15 @@ class AssetPermissionFilter(PermissionBaseFilter):
             have_asset_q = Q(assets__isnull=False) | Q(nodes__isnull=False)
             have_action_q = Q(actions__gt=0)
 
+            valid_ids = AssetPermission.objects.valid().values_list('pk', flat=True)
             queryset = queryset.filter(have_user_q & have_asset_q & have_action_q)
-            queryset &= AssetPermission.objects.valid()
+            queryset = queryset.filter(pk__in=valid_ids)
         else:
             not_have_user_q = Q(users__isnull=True) & Q(user_groups__isnull=True)
             not_have_asset_q = Q(assets__isnull=True) & Q(nodes__isnull=True)
             not_have_action_q = Q(actions=0)
 
-            queryset = queryset.filter(not_have_user_q | not_have_asset_q | not_have_action_q)
-            queryset |= AssetPermission.objects.invalid()
+            invalid_ids = AssetPermission.objects.invalid().values_list('pk', flat=True)
+            condition_q = not_have_user_q | not_have_asset_q | not_have_action_q | Q(pk__in=invalid_ids)
+            queryset = queryset.filter(condition_q)
         return queryset

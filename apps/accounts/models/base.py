@@ -5,7 +5,7 @@ from hashlib import md5
 
 import sshpubkeys
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
 
 from accounts.const import SecretType, SecretStrategy
@@ -22,6 +22,18 @@ logger = get_logger(__file__)
 
 
 class BaseAccountQuerySet(VaultQuerySetMixin, models.QuerySet):
+    @transaction.atomic
+    def update(self, **kwargs):
+        if self.model._meta.model_name == 'account':
+            from rest_framework.exceptions import ValidationError
+            if 'follow_template' in kwargs:
+                raise ValidationError(_('Update template following through account save to preserve credentials.'))
+            protected = {'secret', '_secret', 'secret_type', 'source', 'source_id'}
+            if protected.intersection(kwargs) and self.filter(source='template', follow_template=True).exists():
+                raise ValidationError(_('Disable template following before editing credentials or their source.'))
+        # VaultQuerySetMixin emits password history signals after the SQL update.
+        return super().update(**kwargs)
+
     def active(self):
         return self.filter(is_active=True)
 
@@ -54,10 +66,9 @@ class SecretWithRandomMixin(models.Model):
         )
 
     def get_secret(self):
-        if self.secret_strategy == 'random':
-            return self.secret_generator.get_secret()
-        else:
+        if self.secret_strategy == SecretStrategy.custom:
             return self.secret
+        return self.secret_generator.get_secret()
 
 
 class BaseAccount(VaultModelMixin, JMSOrgBaseModel):
@@ -73,28 +84,31 @@ class BaseAccount(VaultModelMixin, JMSOrgBaseModel):
 
     @property
     def has_secret(self):
+        if self.secret_type == SecretType.SSH_CERTIFICATE:
+            return True
         return bool(self.secret)
 
     @property
-    def has_username(self):
+    def has_username(self) -> bool:
         return bool(self.username)
 
     @property
-    def spec_info(self):
+    def spec_info(self) -> dict:
         data = {}
         if self.secret_type != SecretType.SSH_KEY:
             return data
         data['ssh_key_fingerprint'] = self.ssh_key_fingerprint
+        data['ssh_key_fingerprint_sha256'] = self.ssh_key_fingerprint_sha256
         return data
 
     @property
-    def password(self):
+    def password(self) -> str:
         if self.secret_type == SecretType.PASSWORD:
             return self.secret
         return None
 
     @property
-    def private_key(self):
+    def private_key(self) -> str:
         if self.secret_type == SecretType.SSH_KEY:
             return self.secret
         return None
@@ -111,7 +125,7 @@ class BaseAccount(VaultModelMixin, JMSOrgBaseModel):
         return None
 
     @property
-    def ssh_key_fingerprint(self):
+    def ssh_key_fingerprint(self) -> str:
         if self.public_key:
             public_key = self.public_key
         elif self.private_key:
@@ -130,6 +144,13 @@ class BaseAccount(VaultModelMixin, JMSOrgBaseModel):
         return fingerprint
 
     @property
+    def ssh_key_fingerprint_sha256(self) -> str:
+        public_key_obj = self.public_key_obj
+        if not public_key_obj:
+            return ''
+        return public_key_obj.hash_sha256()
+
+    @property
     def private_key_obj(self):
         if self.private_key:
             key_obj = ssh_key_string_to_obj(self.private_key)
@@ -137,16 +158,13 @@ class BaseAccount(VaultModelMixin, JMSOrgBaseModel):
         else:
             return None
 
-    @property
-    def private_key_path(self):
+    def get_private_key_path(self, path):
         if self.secret_type != SecretType.SSH_KEY \
                 or not self.secret \
                 or not self.private_key:
             return None
-        project_dir = settings.PROJECT_DIR
-        tmp_dir = os.path.join(project_dir, 'tmp')
         key_name = '.' + md5(self.private_key.encode('utf-8')).hexdigest()
-        key_path = os.path.join(tmp_dir, key_name)
+        key_path = os.path.join(path, key_name)
         if not os.path.exists(key_path):
             # https://github.com/ansible/ansible-runner/issues/544
             # ssh requires OpenSSH format keys to have a full ending newline.
@@ -157,6 +175,12 @@ class BaseAccount(VaultModelMixin, JMSOrgBaseModel):
                     f.write("\n")
             os.chmod(key_path, 0o400)
         return key_path
+
+    @property
+    def private_key_path(self):
+        project_dir = settings.PROJECT_DIR
+        tmp_dir = os.path.join(project_dir, 'tmp')
+        return self.get_private_key_path(tmp_dir)
 
     def get_private_key(self):
         if not self.private_key:

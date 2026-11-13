@@ -1,18 +1,20 @@
 from django.db import models
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext_lazy as _, pgettext_lazy
+
+from common.utils import string_punctuation
 
 
 class StrategyChoice(models.TextChoices):
     push = 'push', _('Push')
     verify = 'verify', _('Verify')
     collect = 'collect', _('Collect')
-    change_secret = 'change_secret', _('Change password')
+    change_secret = 'change_secret', _('Change secret')
 
 
 class SSHKeyStrategy(models.TextChoices):
     add = 'add', _('Append SSH KEY')
     set = 'set', _('Empty and append SSH KEY')
-    set_jms = 'set_jms', _('Replace (Replace only keys pushed by JumpServer) ')
+    set_jms = 'set_jms', _('Replace (Replace only keys pushed by system) ')
 
 
 class PasswordStrategy(models.TextChoices):
@@ -21,7 +23,6 @@ class PasswordStrategy(models.TextChoices):
     random_all = 'random_all', _('All assets use different random password')
 
 
-string_punctuation = '!#$%&()*+,-.:;<=>?@[]^_~'
 DEFAULT_PASSWORD_LENGTH = 30
 DEFAULT_PASSWORD_RULES = {
     'length': DEFAULT_PASSWORD_LENGTH,
@@ -37,11 +38,12 @@ class CreateMethods(models.TextChoices):
 class Types(models.TextChoices):
     adhoc = 'adhoc', _('Adhoc')
     playbook = 'playbook', _('Playbook')
+    upload_file = 'upload_file', _('Upload File')
 
 
 class RunasPolicies(models.TextChoices):
-    privileged_only = 'privileged_only', _('Privileged Only')
-    privileged_first = 'privileged_first', _('Privileged First')
+    privileged_only = 'privileged_only', _('Privileged only')
+    privileged_first = 'privileged_first', _('Privileged first')
     skip = 'skip', _('Skip')
 
 
@@ -53,6 +55,7 @@ class JobModules(models.TextChoices):
     postgresql = 'postgresql', _('PostgreSQL')
     sqlserver = 'sqlserver', _('SQLServer')
     raw = 'raw', _('Raw')
+    huawei = 'huawei', _('HUAWEI')
 
 
 class AdHocModules(models.TextChoices):
@@ -76,3 +79,19 @@ class JobStatus(models.TextChoices):
 
 # celery 日志完成之后，写入的魔法字符，作为结束标记
 CELERY_LOG_MAGIC_MARK = b'\x00\x00\x00\x00\x00'
+
+COMMAND_EXECUTION_DISABLED = _('Command execution disabled')
+LOGIN_ASSET_ACL_DENIED = _(
+    'Access to asset {asset} ({address}) is denied by a login control policy. '
+    'Contact your administrator.'
+)
+
+
+class Scope(models.TextChoices):
+    public = 'public', pgettext_lazy("scope", 'Public')
+    private = 'private', _('Private')
+
+
+class FieldType(models.TextChoices):
+    text = 'text', _('Text')
+    select = 'select', _('Select')

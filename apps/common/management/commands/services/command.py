@@ -1,18 +1,27 @@
-import multiprocessing
-
+import psutil
 from django.core.management.base import BaseCommand
 from django.db.models import TextChoices
 
 from .hands import *
 from .utils import ServicesUtil
 
+SERVER_SIZE = os.environ.get('SERVER_SIZE', 'auto')
+if SERVER_SIZE == 'auto':
+    cpu_count = psutil.cpu_count()
+    mem_total = psutil.virtual_memory().total / 1024 / 1024 / 1024
+
+    if cpu_count < 4 or mem_total < 7:
+        SERVER_SIZE = 'small'
+    else:
+        SERVER_SIZE = 'large'
+
 
 class Services(TextChoices):
     gunicorn = 'gunicorn', 'gunicorn'
     celery_ansible = 'celery_ansible', 'celery_ansible'
     celery_default = 'celery_default', 'celery_default'
+    celery_combine = 'celery_combine', 'celery_combine'
     beat = 'beat', 'beat'
-    flower = 'flower', 'flower'
     ws = 'ws', 'ws'
     web = 'web', 'web'
     celery = 'celery', 'celery'
@@ -24,20 +33,23 @@ class Services(TextChoices):
         from . import services
         services_map = {
             cls.gunicorn.value: services.GunicornService,
-            cls.flower: services.FlowerService,
             cls.celery_default: services.CeleryDefaultService,
             cls.celery_ansible: services.CeleryAnsibleService,
-            cls.beat: services.BeatService
+            cls.celery_combine: services.CeleryCombineService,
+            cls.beat: services.BeatService,
         }
         return services_map.get(name)
 
     @classmethod
     def web_services(cls):
-        return [cls.gunicorn, cls.flower]
+        return [cls.gunicorn]
 
     @classmethod
     def celery_services(cls):
-        return [cls.celery_ansible, cls.celery_default]
+        if SERVER_SIZE == 'small' or os.environ.get('CELERY_COMBINE_QUEUES', '0') == '1':
+            return [cls.celery_combine]
+        else:
+            return [cls.celery_ansible, cls.celery_default]
 
     @classmethod
     def task_services(cls):
@@ -69,10 +81,11 @@ class Services(TextChoices):
             service_class = cls.get_service_object_class(s.value)
             if not service_class:
                 continue
-            kwargs.update({
+            service_kwargs = kwargs.get(s.value, {})
+            service_kwargs.update({
                 'name': s.value
             })
-            service_object = service_class(**kwargs)
+            service_object = service_class(**service_kwargs)
             service_objects.append(service_object)
         return service_objects
 
@@ -101,11 +114,22 @@ class BaseActionCommand(BaseCommand):
         parser.add_argument('-w', '--worker', type=int, nargs="?", default=4)
         parser.add_argument('-f', '--force', nargs="?", const=True)
 
+    def get_services_kwargs(self, options):
+        worker = options.get('worker', 4)
+
+        if SERVER_SIZE == 'small':
+            worker = 1
+
+        return {
+            'gunicorn': {
+                'worker': worker
+            }
+        }
+
     def initial_util(self, *args, **options):
         service_names = options.get('services')
-        service_kwargs = {
-            'worker_gunicorn': options.get('worker')
-        }
+
+        service_kwargs = self.get_services_kwargs(options)
         services = Services.get_service_objects(service_names=service_names, **service_kwargs)
 
         kwargs = {
@@ -124,7 +148,6 @@ class BaseActionCommand(BaseCommand):
 
     def _handle_start(self):
         self.util.start_and_watch()
-        os._exit(0)
 
     def _handle_stop(self):
         self.util.stop()

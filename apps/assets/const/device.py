@@ -4,17 +4,37 @@ from .base import BaseType
 
 
 class DeviceTypes(BaseType):
+    CISCO = 'cisco', _("Cisco")
+    HUAWEI = 'huawei', _("Huawei")
+    H3C = 'h3c', _("H3C")
+    JUNIPER = 'juniper', _("Juniper")
+    TP_LINK = 'tp_link', _("TP-Link")
     GENERAL = 'general', _("General")
     SWITCH = 'switch', _("Switch")
     ROUTER = 'router', _("Router")
     FIREWALL = 'firewall', _("Firewall")
 
     @classmethod
+    def get_choices(cls):
+        choices = super().get_choices()
+        types = set(cls.get_community_types())
+        if len(choices) == len(types):
+            return choices
+        try:
+            from assets.models import Platform
+            types.update(Platform.objects.filter(category='device').values_list('type', flat=True))
+        except Exception:
+            # Models or their table may be unavailable during startup and migrations.
+            return choices
+        return [(value, label) for value, label in choices if value in types]
+
+    @classmethod
     def _get_base_constrains(cls) -> dict:
         return {
             '*': {
                 'charset_enabled': False,
-                'domain_enabled': True,
+                'gateway_enabled': True,
+                'ds_enabled': True,
                 'su_enabled': True,
                 'su_methods': ['enable', 'super', 'super_level']
             }
@@ -34,15 +54,15 @@ class DeviceTypes(BaseType):
             '*': {
                 'ansible_enabled': True,
                 'ansible_config': {
-                    'ansible_connection': 'local',
-                    'first_conn_delay_time': 0.5,
+                    'ansible_connection': 'local'
                 },
                 'ping_enabled': True,
                 'gather_facts_enabled': False,
                 'gather_accounts_enabled': False,
                 'verify_account_enabled': True,
                 'change_secret_enabled': True,
-                'push_account_enabled': False
+                'push_account_enabled': False,
+                'remove_account_enabled': False,
             }
         }
 

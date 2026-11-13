@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 #
 import random
+import secrets
 import socket
 import string
 import struct
 
-string_punctuation = '!#$%&()*+,-.:;<=>?@[]^_~'
+string_punctuation = '!#$%&()*+,-.:;<=?@[]_~'
 
 
 def random_datetime(date_start, date_end):
@@ -17,32 +18,70 @@ def random_ip():
     return socket.inet_ntoa(struct.pack('>I', random.randint(1, 0xffffffff)))
 
 
-def random_string(length: int, lower=True, upper=True, digit=True, special_char=False, symbols=string_punctuation):
-    random.seed()
-    args_names = ['lower', 'upper', 'digit']
-    args_values = [lower, upper, digit]
-    args_string = [string.ascii_lowercase, string.ascii_uppercase, string.digits]
-    args_string_map = dict(zip(args_names, args_string))
-    kwargs = dict(zip(args_names, args_values))
-    kwargs_keys = list(kwargs.keys())
-    kwargs_values = list(kwargs.values())
-    args_true_count = len([i for i in kwargs_values if i])
+def random_replace_char(seq, chars, length):
+    using_index = set()
 
-    assert any(kwargs_values), f'Parameters {kwargs_keys} must have at least one `True`'
-    assert length >= args_true_count, f'Expected length >= {args_true_count}, bug got {length}'
+    if length > len(seq):
+        raise ValueError('Not enough positions available for replacement')
 
-    chars = ''.join([args_string_map[k] for k, v in kwargs.items() if v])
-    password = list(random.choice(chars) for i in range(length))
+    while length > 0:
+        index = secrets.randbelow(len(seq))
+        if index in using_index:
+            continue
+        seq[index] = secrets.choice(chars)
+        using_index.add(index)
+        length -= 1
+    return seq
+
+
+def remove_exclude_char(s, exclude_chars):
+    for i in exclude_chars:
+        s = s.replace(i, '')
+    return s
+
+
+def random_string(
+        length: int, lower=True, upper=True, digit=True,
+        special_char=False, exclude_chars='', symbols=string_punctuation
+):
+    if not any([lower, upper, digit]):
+        raise ValueError('At least one of `lower`, `upper`, `digit` must be `True`')
+    if length < 4:
+        raise ValueError('The length of the string must be greater than 3')
+
+    char_list = []
+    if lower:
+        lower_chars = remove_exclude_char(string.ascii_lowercase, exclude_chars)
+        if not lower_chars:
+            raise ValueError('After excluding characters, no lowercase letters are available.')
+        char_list.append(lower_chars)
+
+    if upper:
+        upper_chars = remove_exclude_char(string.ascii_uppercase, exclude_chars)
+        if not upper_chars:
+            raise ValueError('After excluding characters, no uppercase letters are available.')
+        char_list.append(upper_chars)
+
+    if digit:
+        digit_chars = remove_exclude_char(string.digits, exclude_chars)
+        if not digit_chars:
+            raise ValueError('After excluding characters, no digits are available.')
+        char_list.append(digit_chars)
+
+    secret_chars = [secrets.choice(chars) for chars in char_list]
+
+    all_chars = ''.join(char_list)
+
+    remaining_length = length - len(secret_chars)
+    seq = [secrets.choice(all_chars) for _ in range(remaining_length)]
 
     if special_char:
-        special_num = length // 16 + 1
-        special_index = []
-        for i in range(special_num):
-            index = random.randint(1, length - 1)
-            if index not in special_index:
-                special_index.append(index)
-        for i in special_index:
-            password[i] = random.choice(symbols)
+        special_chars = remove_exclude_char(symbols, exclude_chars)
+        if not special_chars:
+            raise ValueError('After excluding characters, no special characters are available.')
+        symbol_num = length // 16 + 1
+        seq = random_replace_char(seq, special_chars, symbol_num)
+    secret_chars += seq
 
-    password = ''.join(password)
-    return password
+    secrets.SystemRandom().shuffle(secret_chars)
+    return ''.join(secret_chars)

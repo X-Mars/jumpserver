@@ -3,7 +3,7 @@
 from itertools import groupby
 
 from common.utils import get_logger
-from terminal.const import ComponentLoad
+from terminal.const import ComponentLoad, TerminalType
 
 logger = get_logger(__name__)
 
@@ -38,9 +38,13 @@ class ComputeLoadUtil:
         return system_status
 
     @classmethod
-    def compute_load(cls, stat):
+    def compute_load(cls, stat, terminal_type=None):
         if not stat:
-            return ComponentLoad.offline
+            # TODO The core component and celery component will return true for the time being.
+            if terminal_type in [TerminalType.core, TerminalType.celery]:
+                return ComponentLoad.normal
+            else:
+                return ComponentLoad.offline
         system_status_values = cls._compute_system_stat_status(stat).values()
         if ComponentLoad.critical in system_status_values:
             return ComponentLoad.critical
@@ -93,30 +97,30 @@ class ComponentsPrometheusMetricsUtil(TypedComponentsStatusMetricsUtil):
     def convert_status_metrics(metrics):
         return {
             'any': metrics['total'],
-            'normal': metrics['normal'],
-            'high': metrics['high'],
-            'critical': metrics['critical'],
-            'offline': metrics['offline']
+            'normal': len(metrics['normal']),
+            'high': len(metrics['high']),
+            'critical': len(metrics['critical']),
+            'offline': len(metrics['offline'])
         }
 
     def get_component_status_metrics(self):
         prometheus_metrics = list()
         # 各组件状态个数汇总
-        prometheus_metrics.append('# JumpServer 各组件状态个数汇总')
+        prometheus_metrics.append('# 各组件状态个数汇总')
         status_metric_text = 'jumpserver_components_status_total{component_type="%s", status="%s"} %s'
         for metric in self.metrics:
             tp = metric['type']
             prometheus_metrics.append(f'## 组件: {tp}')
             status_metrics = self.convert_status_metrics(metric)
-            for status, value in status_metrics.items():
-                metric_text = status_metric_text % (tp, status, value)
+            for status, count in status_metrics.items():
+                metric_text = status_metric_text % (tp, status, count)
                 prometheus_metrics.append(metric_text)
         return prometheus_metrics
 
     def get_component_session_metrics(self):
         prometheus_metrics = list()
         # 各组件在线会话数汇总
-        prometheus_metrics.append('# JumpServer 各组件在线会话数汇总')
+        prometheus_metrics.append('# 各组件在线会话数汇总')
         session_active_metric_text = 'jumpserver_components_session_active_total{component_type="%s"} %s'
 
         for metric in self.metrics:
@@ -129,7 +133,7 @@ class ComponentsPrometheusMetricsUtil(TypedComponentsStatusMetricsUtil):
     def get_component_stat_metrics(self):
         prometheus_metrics = list()
         # 各组件节点指标
-        prometheus_metrics.append('# JumpServer 各组件一些指标')
+        prometheus_metrics.append('# 各组件一些指标')
         state_metric_text = 'jumpserver_components_%s{component_type="%s", component="%s"} %s'
         stats_key = [
             'cpu_load', 'memory_used', 'disk_used', 'session_online'

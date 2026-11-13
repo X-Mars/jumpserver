@@ -9,6 +9,7 @@ MODELS_NEED_RECORD = set()
 
 
 class OperateChoices(TextChoices):
+    create = "create", _("Create file")
     mkdir = "mkdir", _("Mkdir")
     rmdir = "rmdir", _("Rmdir")
     delete = "delete", _("Delete")
@@ -24,17 +25,31 @@ class ActionChoices(TextChoices):
     update = "update", _("Update")
     delete = "delete", _("Delete")
     create = "create", _("Create")
+    export = "export", _("Export")
     # Activities action
     download = "download", _("Download")
     connect = "connect", _("Connect")
     login = "login", _("Login")
-    change_auth = "change_password", _("Change password")
+    change_auth = "change_password", _("Change secret")
+
+    accept = 'accept', _('Accept')
+    review = 'review', _('Review')
+    notice = 'notice', _('Notifications')
+    reject = 'reject', _('Reject')
+    approve = 'approve', _('Approve')
+    close = 'close', _('Close')
+
+    # Custom action
+    finished = 'finished', _('Finished')
 
 
 class LoginTypeChoices(TextChoices):
     web = "W", _("Web")
     terminal = "T", _("Terminal")
     unknown = "U", _("Unknown")
+
+
+USER_DEVICE_TYPE_CHOICES = [*LoginTypeChoices.choices, ('C', _('Client'))]
 
 
 class ActivityChoices(TextChoices):

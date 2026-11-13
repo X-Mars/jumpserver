@@ -2,22 +2,29 @@ from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 
 from common.utils.verify_code import SendAndVerifyCodeUtil
+from users.serializers import SmsUserSerializer
 from .base import BaseMFA
+from ..const import MFAType
 
 sms_failed_msg = _("SMS verify code invalid")
 
 
 class MFASms(BaseMFA):
-    name = 'sms'
-    display_name = _("SMS")
+    name = MFAType.SMS.value
+    display_name = MFAType.SMS.name
     placeholder = _("SMS verification code")
 
     def __init__(self, user):
         super().__init__(user)
-        phone = user.phone if self.is_authenticated() else ''
-        self.sms = SendAndVerifyCodeUtil(phone, backend=self.name)
+        phone, user_info = '', None
+        if self.is_authenticated():
+            phone = user.phone
+            user_info = SmsUserSerializer(user).data
+        self.sms = SendAndVerifyCodeUtil(
+            phone, backend=self.name, user_info=user_info
+        )
 
-    def check_code(self, code):
+    def _check_code(self, code):
         assert self.is_authenticated()
         ok = False
         msg = ''
@@ -44,13 +51,13 @@ class MFASms(BaseMFA):
         return settings.SMS_ENABLED
 
     def get_enable_url(self) -> str:
-        return '/ui/#/profile/setting?activeTab=ProfileUpdate'
+        return '/ui/#/profile/index'
 
     def can_disable(self) -> bool:
         return True
 
     def disable(self):
-        return '/ui/#/profile/setting?activeTab=ProfileUpdate'
+        return '/ui/#/profile/index'
 
     @staticmethod
     def help_text_of_enable():
@@ -61,4 +68,4 @@ class MFASms(BaseMFA):
         return _("Clear phone number to disable")
 
     def get_disable_url(self) -> str:
-        return '/ui/#/profile/setting?activeTab=ProfileUpdate'
+        return '/ui/#/profile/index'

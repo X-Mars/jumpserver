@@ -9,6 +9,8 @@ from treelib import Tree
 from treelib.exceptions import NodeIDAbsentError
 
 from common.tree import TreeNode
+from reports.audit_contract import THEME_PERMISSIONS
+from .const import LEGACY_REPORT_PERMISSION_CODENAMES
 from .models import Permission, ContentType
 
 # 根节点
@@ -22,6 +24,7 @@ root_node_data = {
 # 第二层 view 节点，手动创建的
 view_nodes_data = [
     {'id': 'view_console', 'name': _('Console view')},
+    {'id': 'view_pam', 'name': _('Pam view')},
     {'id': 'view_workbench', 'name': _('Workbench view')},
     {'id': 'view_audit', 'name': _('Audit view')},
     {'id': 'view_setting', 'name': _('System setting')},
@@ -38,102 +41,190 @@ app_nodes_data = [
     {'id': 'audits', 'view': 'view_audit'},
     {'id': 'rbac', 'view': 'view_console'},
     {'id': 'settings', 'view': 'view_setting'},
+    {'id': 'chat_ai', 'name': _('Chat AI'), 'view': 'view_setting'},
     {'id': 'tickets', 'view': 'view_other'},
+    {'id': 'labels', 'view': 'view_console'},
     {'id': 'authentication', 'view': 'view_other'},
+    {'id': 'ops', 'view': 'view_workbench'},
 ]
 
 # 额外其他节点，可以在不同的层次，需要指定父节点，可以将一些 model 归类到这个节点下面
 extra_nodes_data = [
     {"id": "cloud_import", "name": _("Cloud import"), "pId": "assets"},
-    {"id": "backup_account_node", "name": _("Backup account"), "pId": "accounts"},
-    {"id": "gather_account_node", "name": _("Gather account"), "pId": "accounts"},
-    {"id": "push_account_node", "name": _("Push account"), "pId": "accounts"},
-    {"id": "asset_change_plan_node", "name": _("Asset change auth"), "pId": "accounts"},
-    {"id": "terminal_node", "name": _("Terminal setting"), "pId": "view_setting"},
-    {'id': "task_center", "name": _("Task Center"), "pId": "view_console"},
+    {"id": "account_node", "name": _("Accounts"), "pId": "view_pam"},
+    {"id": "account_risk_node", "name": _("Account risk"), "pId": "view_pam"},
+    {"id": "backup_account_node", "name": _("Backup account"), "pId": "view_pam"},
+    {"id": "gather_account_node", "name": _("Gather account"), "pId": "view_pam"},
+    {"id": "push_account_node", "name": _("Push account"), "pId": "view_pam"},
+    {"id": "account_change_plan_node", "name": _("Account change secret"), "pId": "view_pam"},
+    {"id": "connectivity_node", "name": _("Connectivity"), "pId": "view_pam"},
     {'id': "my_assets", "name": _("My assets"), "pId": "view_workbench"},
     {'id': "operation_center", "name": _('App ops'), "pId": "view_workbench"},
-    {'id': "remote_application", "name": _("Applet"), "pId": "view_setting"},
+    {'id': "notifications", "name": _("Notifications"), "pId": "view_setting"},
+    {'id': "features", "name": _("Feature"), "pId": "view_setting"},
+    {'id': "authentication_setting", "name": _("Authentication"), "pId": "view_setting"},
+    {'id': "storage", "name": _("Storage"), "pId": "view_setting"},
+    {'id': "components", "name": _("Component"), "pId": "view_setting"},
+    {'id': "remote_app", "name": _("Applet"), "pId": "view_setting"},
+    {'id': "security", "name": _("Security"), "pId": "view_setting"},
+    {'id': "appearance", "name": _("Appearance"), "pId": "view_setting"},
+    {'id': "system_tools", "name": _("System tools"), "pId": "view_setting"},
+    {'id': "tasks", "name": _("Task"), "pId": "view_setting"},
+    {'id': "license", "name": _("License"), "pId": "view_setting"},
+    {'id': "other", "name": _("Other"), "pId": "view_setting"},
+    {'id': "job_audit", "name": _("Job audit"), "pId": "view_audit"},
+    {'id': "report_node", "name": _("Report"), "pId": "view_audit"},
+    {'id': 'audit_report_node', 'name': _('Audit reports'), 'pId': 'report_node'},
 ]
+
+# A rename may leave permissions on the old content type when the new one
+# already exists. Both records represent the same RBAC permission.
+model_id_aliases = {'xpack.account': 'xpack.cloudaccount'}
 
 # 将 model 放到其它节点下，而不是本来的 app 中
 special_pid_mapper = {
     'common.permission': 'view_other',
-    'assets.account': 'accounts',
-    'assets.accounttemplate': 'accounts',
     'acls.commandfilteracl': 'perms',
+    'acls.clipboardacl': 'perms',
     'acls.commandgroup': 'perms',
     'acls.loginacl': 'perms',
     'acls.loginassetacl': 'perms',
     'acls.connectmethodacl': 'perms',
-    'xpack.account': 'cloud_import',
+    'acls.datamaskingrule': 'perms',
+    'xpack.cloudaccount': 'cloud_import',
     'xpack.syncinstancedetail': 'cloud_import',
     'xpack.syncinstancetask': 'cloud_import',
     'xpack.syncinstancetaskexecution': 'cloud_import',
     'xpack.strategy': 'cloud_import',
     'xpack.strategyaction': 'cloud_import',
     'xpack.strategyrule': 'cloud_import',
-    'terminal.applet': 'remote_application',
-    'terminal.applethost': 'remote_application',
-    'accounts.accountbackupautomation': "backup_account_node",
-    'accounts.accountbackupexecution': "backup_account_node",
+    'accounts.account': 'account_node',
+    'accounts.accounttemplate': 'account_node',
+    'accounts.accountrisk': 'account_risk_node',
+    'accounts.checkaccountengine': 'account_risk_node',
+    'accounts.checkaccountautomation': 'account_risk_node',
+    'accounts.checkaccountexecution': 'account_risk_node',
+    'accounts.view_accountsession': 'view_pam',
+    'accounts.view_accountactivity': 'view_pam',
+    'accounts.integrationapplication': 'view_pam',
+    'accounts.virtualaccount': 'view_pam',
+    'accounts.backupaccountautomation': 'backup_account_node',
+    'accounts.view_backupaccountexecution': 'backup_account_node',
+    'accounts.add_backupaccountexecution': 'backup_account_node',
     "accounts.pushaccountautomation": "push_account_node",
     "accounts.view_pushaccountexecution": "push_account_node",
     "accounts.add_pushaccountexecution": "push_account_node",
+    'accounts.view_pushsecretrecord': 'push_account_node',
     "accounts.gatheredaccount": "gather_account_node",
     "accounts.gatheraccountsautomation": "gather_account_node",
     "accounts.view_gatheraccountsexecution": "gather_account_node",
     "accounts.add_gatheraccountsexecution": "gather_account_node",
-    "accounts.changesecretautomation": "asset_change_plan_node",
-    "accounts.view_changesecretexecution": "asset_change_plan_node",
-    "accounts.add_changesecretexection": "asset_change_plan_node",
-    "accounts.view_changesecretrecord": "asset_change_plan_node",
-    'orgs.organization': 'view_setting',
-    'settings.setting': 'view_setting',
-    'terminal.terminal': 'terminal_node',
-    'terminal.commandstorage': 'terminal_node',
-    'terminal.replaystorage': 'terminal_node',
-    'terminal.status': 'terminal_node',
-    'terminal.task': 'terminal_node',
-    'terminal.endpoint': 'terminal_node',
-    'terminal.endpointrule': 'terminal_node',
+    "accounts.changesecretautomation": "account_change_plan_node",
+    "accounts.view_changesecretexecution": "account_change_plan_node",
+    "accounts.add_changesecretexecution": "account_change_plan_node",
+    "accounts.view_changesecretrecord": "account_change_plan_node",
+    'assets.pingautomation': 'connectivity_node',
+    'assets.view_pingexecution': 'connectivity_node',
+    'assets.add_pingexecution': 'connectivity_node',
+    'accounts.verifyaccountautomation': 'connectivity_node',
+    'accounts.view_verifyaccountexecution': 'connectivity_node',
+    'accounts.add_verifyaccountexecution': 'connectivity_node',
     'audits.ftplog': 'terminal',
+    'chat_ai.auditconversation': 'audits',
     'perms.view_myassets': 'my_assets',
-    'ops.celerytask': 'task_center',
-    'ops.view_celerytaskexecution': 'task_center',
-    'ops.view_taskmonitor': 'task_center',
-    'ops.adhocexecution': 'task_center',
     'ops.job': 'operation_center',
     'ops.adhoc': 'operation_center',
     'ops.playbook': 'operation_center',
     'ops.jobexecution': 'operation_center',
-    "xpack.interface": "view_setting",
-    "settings.change_terminal": "terminal_node",
-    "settings.view_setting": "view_setting",
     "rbac.view_console": "view_console",
     "rbac.view_audit": "view_audit",
+    "report_node": "view_audit",
+    "rbac.view_pam": "view_pam",
     'audits.usersession': 'view_audit',
+    'audits.ticketaudit': 'view_audit',
     "rbac.view_workbench": "view_workbench",
     "rbac.view_webterminal": "view_workbench",
     "rbac.view_filemanager": "view_workbench",
-    'tickets.view_ticket': 'tickets'
+    "rbac.view_systemtools": "view_workbench",
+    'tickets.view_ticket': 'tickets',
+    "audits.joblog": "job_audit",
+    'oauth2_provider.accesstoken': 'authentication',
 }
 
+
+if settings.XPACK_ENABLED and settings.JDMC_ENABLED:
+    view_nodes_data.append({'id': 'view_jdmc', 'name': _('JDMC console')})
+    special_pid_mapper["rbac.view_jdmc"] = "view_jdmc"
+
+
+special_setting_pid_mapper = {
+    'rbac.view_auditreport': 'audit_report_node',
+    'rbac.view_activityreport': 'audit_report_node',
+    'rbac.view_securityreport': 'audit_report_node',
+    'rbac.view_inventoryreport': 'audit_report_node',
+    'rbac.view_accountreport': 'audit_report_node',
+    "settings.change_email": "notifications",
+    "settings.change_sms": "notifications",
+    "settings.change_systemmsgsubscription": "notifications",
+    "settings.change_announcement": "features",
+    "settings.change_ticket": "features",
+    "settings.change_ops": "features",
+    "settings.change_vault": "features",
+    "settings.change_chatai": "features",
+    "settings.change_virtualapp": "features",
+    "settings.change_auth": "authentication_setting",
+    "terminal.replaystorage": "storage",
+    "terminal.commandstorage": "storage",
+    'terminal.applet': 'remote_app',
+    'terminal.applethost': 'remote_app',
+    'terminal.appletpublication': 'remote_app',
+    'terminal.applethostdeployment': 'remote_app',
+    "terminal.virtualapp": "remote_app",
+    "terminal.virtualapppublication": "remote_app",
+    "terminal.appprovider": "remote_app",
+    "settings.change_terminal": "components",
+    "terminal.terminal": "components",
+    "terminal.endpoint": "components",
+    "terminal.endpointrule": "components",
+    "terminal.status": "components",
+    "settings.change_security": "security",
+    "settings.change_interface": "appearance",
+    "terminal.task": "tasks",
+    'ops.celerytask': 'tasks',
+    'ops.view_celerytaskexecution': 'tasks',
+    'ops.view_taskmonitor': 'tasks',
+    'ops.stop_taskmonitor': 'tasks',
+    "settings.change_clean": "tasks",
+    "settings.change_license": "license",
+    'orgs.organization': 'view_setting',
+    "settings.view_setting": "view_setting",
+    "settings.change_basic": "view_setting",
+    "settings.change_systemtools": "system_tools",
+    "settings.change_other": "other",
+}
+
+special_pid_mapper.update(special_setting_pid_mapper)
+
 verbose_name_mapper = {
+    'xpack.cloudaccount': _('Cloud account'),
     'orgs.organization': _("App organizations"),
     'tickets.comment': _("Ticket comment"),
     'tickets.view_ticket': _("Ticket"),
     'settings.setting': _("Common setting"),
     'rbac.view_permission': _('View permission tree'),
+    'authentication.passkey': _("Passkey"),
+    'oauth2_provider.accesstoken': _("Access token"),
+    'oauth2_provider.view_accesstoken': _("View access token"),
+    'oauth2_provider.delete_accesstoken': _("Revoke access token"),
 }
 
 xpack_nodes = [
     'xpack', 'tickets', 'gather_account_node',
+    'audits.ticketaudit',
     'applications.remoteapp', "assets.accountbackupplan",
     "assets.accountbackupplanexecution",
     "rbac.orgrole", "rbac.orgrolebinding",
     'assets.gathereduser',
-
     'settings.change_interface', 'settings.change_sms',
     'users.invite_user', 'users.remove_user',
 ]
@@ -142,6 +233,10 @@ xpack_nodes = [
 def _sort_action(node):
     if node.isParent:
         return ['zz', 0]
+
+    report_permissions = list(THEME_PERMISSIONS.values())
+    if node.title in report_permissions:
+        return ['auditreport', report_permissions.index(node.title)]
 
     action_resource = node.title.split('.')[-1]
     action, resource = action_resource.split('_', 2)
@@ -208,22 +303,24 @@ class CounterTree(Tree):
         node._checked_count = count
         return count
 
-    def add_nodes_to_tree(self, ztree_nodes, retry=0):
-        failed = []
-        for node in ztree_nodes:
-            pid = node.pId
-            if retry == 2:
-                pid = '$ROOT$'
-
-            try:
-                self.create_node(node.name, node.id, pid, data=node)
-            except NodeIDAbsentError:
-                failed.append(node)
-        if retry > 2:
-            return
-        if failed:
-            retry += 1
-            return self.add_nodes_to_tree(failed, retry)
+    def add_nodes_to_tree(self, ztree_nodes):
+        pending = ztree_nodes
+        while pending:
+            failed = []
+            for node in pending:
+                try:
+                    self.create_node(node.name, node.id, node.pId, data=node)
+                except NodeIDAbsentError:
+                    failed.append(node)
+            if len(failed) == len(pending):
+                # Reparent the missing ancestor (or break one cycle), keeping
+                # descendants attached and the serialized pId in sync.
+                pending_ids = {node.id for node in failed}
+                node = next((node for node in failed if node.pId not in pending_ids), failed[0])
+                node.pId = self.root
+                self.create_node(node.name, node.id, node.pId, data=node)
+                failed.remove(node)
+            pending = failed
 
 
 class PermissionTreeUtil:
@@ -294,9 +391,10 @@ class PermissionTreeUtil:
     def _create_models_nodes(self):
         content_types = ContentType.objects.all()
 
-        nodes = []
+        nodes = {}
         for ct in content_types:
             model_id = '{}.{}'.format(ct.app_label, ct.model)
+            model_id = model_id_aliases.get(model_id, model_id)
             if not self._check_model_xpack(model_id):
                 continue
 
@@ -315,8 +413,8 @@ class PermissionTreeUtil:
                 'name': name,
                 'pId': app,
             }, 'model', is_open=False)
-            nodes.append(node)
-        return nodes
+            nodes[model_id] = node
+        return list(nodes.values())
 
     def _get_permission_name_icon(self, p: Permission, content_types_name_mapper: dict):
         action, resource = p.codename.split('_', 1)
@@ -341,13 +439,19 @@ class PermissionTreeUtil:
         return name, icon
 
     def _create_perms_nodes(self):
-        permissions_id = self.permissions.values_list('id', flat=True)
-        nodes = []
+        permissions_id = set(self.permissions.values_list('id', flat=True))
+        nodes = {}
         content_types = ContentType.objects.all()
         content_types_name_mapper = {ct.app_model: ct.name for ct in content_types}
 
         for p in self.all_permissions:
             model_id = f'{p.app}.{p.model}'
+            canonical_model_id = model_id_aliases.get(model_id, model_id)
+            if (
+                model_id == 'rbac.menupermission'
+                and p.codename in LEGACY_REPORT_PERMISSION_CODENAMES
+            ):
+                continue
             if not self._check_model_xpack(model_id):
                 continue
             title = p.app_label_codename
@@ -359,12 +463,19 @@ class PermissionTreeUtil:
             if settings.DEBUG_DEV:
                 name += '[{}]'.format(p.app_label_codename)
 
-            pid = model_id
+            pid = canonical_model_id
             # perm node 的特殊设置用的是 title，因为 id 是数字，不一致
             if title in special_pid_mapper:
                 pid = special_pid_mapper[title]
 
             checked = p.id in permissions_id
+            key = title if canonical_model_id in model_id_aliases.values() else p.id
+            existing = nodes.get(key)
+            if existing:
+                checked = checked or existing.checked
+                if model_id != canonical_model_id:
+                    existing.checked = checked
+                    continue
 
             node = TreeNode(**{
                 'id': p.id,
@@ -380,8 +491,8 @@ class PermissionTreeUtil:
                     'type': 'perm',
                 }
             })
-            nodes.append(node)
-        return nodes
+            nodes[key] = node
+        return list(nodes.values())
 
     def _create_node(self, data, tp, is_parent=True, is_open=True, icon='', checked=None):
         assert data.get('id')
@@ -403,8 +514,6 @@ class PermissionTreeUtil:
         node = TreeNode(**node_data)
         if settings.DEBUG_DEV:
             node.name += ('[' + node.id + ']')
-        if settings.DEBUG_DEV:
-            node.name += ('-' + node.id)
         return node
 
     def _create_root_tree_node(self):
@@ -454,7 +563,8 @@ class PermissionTreeUtil:
             checked_count, total_count = counter
             if total_count == 0:
                 continue
-            node.name += '({}/{})'.format(checked_count, total_count)
+            if node.isParent:
+                node.name += ' ({}/{})'.format(checked_count, total_count)
             if checked_count != 0:
                 node.checked = True
             nodes.append(node)

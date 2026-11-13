@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import inspect
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +11,7 @@ from functools import wraps
 
 from django.db import transaction
 
+from .db.utils import open_db_connection, safe_atomic_db_connection
 from .utils import logger
 
 
@@ -65,7 +67,7 @@ class EventLoopThread(threading.Thread):
 
 
 _loop_thread = EventLoopThread()
-_loop_thread.setDaemon(True)
+_loop_thread.daemon = True
 _loop_thread.start()
 executor = ThreadPoolExecutor(
     max_workers=10,
@@ -73,6 +75,7 @@ executor = ThreadPoolExecutor(
 )
 _loop_debouncer_func_task_cache = {}
 _loop_debouncer_func_args_cache = {}
+_loop_debouncer_func_task_time_cache = {}
 
 
 def get_loop():
@@ -92,6 +95,21 @@ def cancel_or_remove_debouncer_task(cache_key):
 def run_debouncer_func(cache_key, org, ttl, func, *args, **kwargs):
     cancel_or_remove_debouncer_task(cache_key)
     run_func_partial = functools.partial(_run_func_with_org, cache_key, org, func)
+
+    current = time.time()
+    first_run_time = _loop_debouncer_func_task_time_cache.get(cache_key, None)
+    if first_run_time is None:
+        _loop_debouncer_func_task_time_cache[cache_key] = current
+        first_run_time = current
+
+    if current - first_run_time > ttl:
+        _loop_debouncer_func_args_cache.pop(cache_key, None)
+        _loop_debouncer_func_task_time_cache.pop(cache_key, None)
+        executor.submit(run_func_partial, *args, **kwargs)
+        logger.debug('pid {} executor submit run {}'.format(
+            os.getpid(), func.__name__, ))
+        return
+
     loop = _loop_thread.get_loop()
     _debouncer = Debouncer(run_func_partial, lambda: True, ttl, loop=loop, executor=executor)
     task = asyncio.run_coroutine_threadsafe(_debouncer(*args, **kwargs), loop=loop)
@@ -121,15 +139,31 @@ class Debouncer(object):
         return await self.loop.run_in_executor(self.executor, func)
 
 
+ignore_err_exceptions = (
+    "(3101, 'Plugin instructed the server to rollback the current transaction.')",
+)
+
+
 def _run_func_with_org(key, org, func, *args, **kwargs):
     from orgs.utils import set_current_org
     try:
-        set_current_org(org)
-        func(*args, **kwargs)
+        with open_db_connection() as conn:
+            # 保证执行时使用的是新的 connection 数据库连接
+            # 避免出现 MySQL server has gone away 的情况
+            set_current_org(org)
+            func(*args, **kwargs)
     except Exception as e:
-        logger.error('delay run error: %s' % e)
+        msg = str(e)
+        log_func = logger.error
+        if msg in ignore_err_exceptions:
+            log_func = logger.info
+        pid = os.getpid()
+        thread_name = threading.current_thread()
+        log_func('pid {} thread {} delay run {} error: {}'.format(
+            pid, thread_name, func.__name__, msg))
     _loop_debouncer_func_task_cache.pop(key, None)
     _loop_debouncer_func_args_cache.pop(key, None)
+    _loop_debouncer_func_task_time_cache.pop(key, None)
 
 
 def delay_run(ttl=5, key=None):
@@ -142,6 +176,9 @@ def delay_run(ttl=5, key=None):
 
     def inner(func):
         suffix_key_func = key if key else default_suffix_key
+        sigs = inspect.signature(func)
+        if len(sigs.parameters) != 0:
+            raise ValueError('Merge delay run must not arguments: %s' % func.__name__)
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -165,6 +202,34 @@ def merge_delay_run(ttl=5, key=None):
     :return:
     """
 
+    def delay(func, *args, **kwargs):
+        from orgs.utils import get_current_org
+        # 每次调用 delay 时可以指定本次调用的 ttl
+        current_ttl = kwargs.pop('ttl', ttl)
+        suffix_key_func = key if key else default_suffix_key
+        org = get_current_org()
+        func_name = f'{func.__module__}_{func.__name__}'
+        key_suffix = suffix_key_func(*args, **kwargs)
+        cache_key = f'MERGE_DELAY_RUN_{func_name}_{key_suffix}'
+        cache_kwargs = _loop_debouncer_func_args_cache.get(cache_key, {})
+
+        for k, v in kwargs.items():
+            if not isinstance(v, (tuple, list, set)):
+                raise ValueError('func kwargs value must be list or tuple: %s %s' % (func.__name__, v))
+            v = set(v)
+            if k not in cache_kwargs:
+                cache_kwargs[k] = v
+            else:
+                cache_kwargs[k] = cache_kwargs[k].union(v)
+        _loop_debouncer_func_args_cache[cache_key] = cache_kwargs
+        run_debouncer_func(cache_key, org, current_ttl, func, *args, **cache_kwargs)
+
+    def apply(func, sync=False, *args, **kwargs):
+        if sync:
+            return func(*args, **kwargs)
+        else:
+            return delay(func, *args, **kwargs)
+
     def inner(func):
         sigs = inspect.signature(func)
         if len(sigs.parameters) != 1:
@@ -172,28 +237,12 @@ def merge_delay_run(ttl=5, key=None):
         param = list(sigs.parameters.values())[0]
         if not isinstance(param.default, tuple):
             raise ValueError('func default must be tuple: %s' % param.default)
-        suffix_key_func = key if key else default_suffix_key
+        func.delay = functools.partial(delay, func)
+        func.apply = functools.partial(apply, func)
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            from orgs.utils import get_current_org
-            org = get_current_org()
-            func_name = f'{func.__module__}_{func.__name__}'
-            key_suffix = suffix_key_func(*args, **kwargs)
-            cache_key = f'MERGE_DELAY_RUN_{func_name}_{key_suffix}'
-            cache_kwargs = _loop_debouncer_func_args_cache.get(cache_key, {})
-
-            for k, v in kwargs.items():
-                if not isinstance(v, (tuple, list, set)):
-                    raise ValueError('func kwargs value must be list or tuple: %s %s' % (func.__name__, v))
-                if k not in cache_kwargs:
-                    cache_kwargs[k] = v
-                elif isinstance(v, set):
-                    cache_kwargs[k] = cache_kwargs[k].union(v)
-                else:
-                    cache_kwargs[k] = list(cache_kwargs[k]) + list(v)
-            _loop_debouncer_func_args_cache[cache_key] = cache_kwargs
-            run_debouncer_func(cache_key, org, ttl, func, *args, **cache_kwargs)
+            return func(*args, **kwargs)
 
         return wrapper
 
@@ -201,8 +250,8 @@ def merge_delay_run(ttl=5, key=None):
 
 
 @delay_run(ttl=5)
-def test_delay_run(username):
-    print("Hello, %s, now is %s" % (username, time.time()))
+def test_delay_run():
+    print("Hello,  now is %s" % time.time())
 
 
 @merge_delay_run(ttl=5, key=lambda users=(): users[0][0])
@@ -245,3 +294,102 @@ def cached_method(ttl=20):
         return wrapper
 
     return decorator
+
+
+def cached_method_to_redis(key, ttl, should_cache=None):
+    from django.core.cache import cache
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 尝试从缓存读取
+            cached_result = cache.get(key)
+            if cached_result is not None:
+                return cached_result
+            
+            # 执行函数
+            result = func(*args, **kwargs)
+            
+            # 判断是否缓存
+            if should_cache is None or should_cache(result):
+                cache.set(key, result, ttl)
+            
+            return result
+        
+        return wrapper
+    
+    return decorator
+
+
+def bulk_handle(handler, batch_size=50, timeout=0.5):
+    def decorator(func):
+        from orgs.utils import get_current_org_id
+
+        cache = []  # 缓存实例的列表
+        lock = threading.Lock()  # 用于线程安全
+        org_id = None
+
+        def handle_it():
+            from orgs.utils import tmp_to_org
+            with lock:
+                if not cache:
+                    return
+                with tmp_to_org(org_id):
+                    with safe_atomic_db_connection():
+                        handler(cache)
+                cache.clear()
+
+        def handle_on_org_changed():
+            nonlocal org_id
+            if org_id is None:
+                org_id = get_current_org_id()
+            else:
+                c_org_id = get_current_org_id()
+                if org_id != c_org_id:
+                    handle_it()
+                    org_id = c_org_id
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            nonlocal cache
+
+            handle_on_org_changed()
+
+            # 调用被装饰的函数，生成一个实例
+            instance = func(*args, **kwargs)
+            if instance is None:
+                return None
+
+            # 添加实例到缓存
+            cache.append(instance)
+
+            # 如果缓存大小达到批量保存阈值，执行保存
+            if len(cache) >= batch_size:
+                handle_it()
+
+            return instance
+
+        # 提交剩余实例的方法
+        def handle_remaining():
+            if not cache:
+                return
+            handle_it()
+
+        wrapper.finish = handle_remaining
+        return wrapper
+
+    return decorator
+
+
+def bulk_create_decorator(instance_model, batch_size=50, ignore_conflicts=True, timeout=0.3):
+    def handle(cache):
+        instance_model.objects.bulk_create(cache, ignore_conflicts=ignore_conflicts)
+
+    return bulk_handle(handle, batch_size, timeout)
+
+
+def bulk_update_decorator(instance_model, batch_size=50, update_fields=None, timeout=0.3):
+    def handle(cache):
+        instance_model.objects.bulk_update(cache, update_fields)
+
+    return bulk_handle(handle, batch_size, timeout)

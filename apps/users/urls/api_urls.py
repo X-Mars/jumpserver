@@ -18,12 +18,15 @@ router.register(r'users-groups-relations', api.UserUserGroupRelationViewSet, 'us
 router.register(r'service-account-registrations', api.ServiceAccountRegistrationViewSet, 'service-account-registration')
 router.register(r'connection-token', auth_api.ConnectionTokenViewSet, 'connection-token')
 
-
 urlpatterns = [
+    path('users-groups/tree/', api.UserGroupTreeApi.as_view(), name='users-groups-tree'),
     path('profile/', api.UserProfileApi.as_view(), name='user-profile'),
+    path('profile/lock-password/', api.UserLockPasswordApi.as_view(), name='user-lock-password'),
+    path('profile/file-encryption/', api.UserFileEncryptionApi.as_view(), name='user-file-encryption'),
+    path('profile/idle-lock/', api.UserIdleLockApi.as_view(), name='user-idle-lock'),
     path('profile/password/', api.UserPasswordApi.as_view(), name='user-password'),
-    path('profile/public-key/', api.UserPublicKeyApi.as_view(), name='user-public-key'),
     path('profile/mfa/reset/', api.UserResetMFAApi.as_view(), name='my-mfa-reset'),
+    path('profile/permissions/', api.UserPermissionsApi.as_view(), name='user-permissions'),
     path('preference/', api.PreferenceApi.as_view(), name='preference'),
     path('users/<uuid:pk>/mfa/reset/', api.UserResetMFAApi.as_view(), name='user-reset-mfa'),
     path('users/<uuid:pk>/password/', api.UserChangePasswordApi.as_view(), name='change-user-password'),
@@ -32,5 +35,3 @@ urlpatterns = [
     path('users/<uuid:pk>/unblock/', api.UserUnblockPKApi.as_view(), name='user-unblock'),
 ]
 urlpatterns += router.urls
-
-

@@ -1,25 +1,32 @@
 # -*- coding: utf-8 -*-
 #
 from collections import defaultdict
+from contextlib import nullcontext
 from itertools import chain
 from typing import Callable
 
+from django.conf import settings
+from django.core.exceptions import FieldDoesNotExist
 from django.db import models
 from django.db.models.signals import m2m_changed
+from rest_framework.generics import get_object_or_404
+from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
 
 from common.drf.filters import (
     IDSpmFilterBackend, CustomFilterBackend, IDInFilterBackend,
-    IDNotFilterBackend, NotOrRelFilterBackend
+    IDNotFilterBackend, LabelFilterBackend
 )
-from common.utils import get_logger
+from common.utils import get_logger, lazyproperty
+from common.utils import is_uuid
+from orgs.utils import tmp_to_org, tmp_to_root_org
 from .action import RenderToJsonMixin
 from .serializer import SerializerMixin
 
 __all__ = [
     'CommonApiMixin', 'PaginatedResponseMixin', 'RelationMixin',
-    'ExtraFilterFieldsMixin',
+    'ExtraFilterFieldsMixin'
 ]
 
 logger = get_logger(__name__)
@@ -89,20 +96,118 @@ class RelationMixin:
 
 class QuerySetMixin:
     action: str
+    request: Request
     get_serializer_class: Callable
     get_queryset: Callable
+    slug_field = 'name'
 
-    def get_queryset(self):
-        queryset = super().get_queryset()
+    def get_object(self):
+        pk = self.kwargs.get(self.lookup_url_kwarg or self.lookup_field)
+        if not pk or is_uuid(pk) or str(pk).isdigit():
+            return super().get_object()
+
+        queryset = self.get_queryset()
+        try:
+            queryset.model._meta.get_field(self.slug_field)
+        except FieldDoesNotExist:
+            return super().get_object()
+
+        queryset = self.filter_queryset(queryset)
+        obj = get_object_or_404(queryset, **{self.slug_field: pk})
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    def limit_queryset_if_no_page(self, queryset):
+        if self.request.query_params.get('format') in ['csv', 'xlsx']:
+            return queryset[:settings.MAX_LIMIT_PER_PAGE]
+        action = getattr(self, 'action', None)
+        if action != 'list':
+            return queryset
+
+        # 如果分页器有设置 limit，则不限制
+        if self.paginator and self.paginator.get_limit(self.request):
+            return queryset
+
+        # 如果分页器没有设置 limit，则不限制
+        if getattr(self, 'page_no_limit', False):
+            return queryset
+
+        if not settings.DEFAULT_PAGE_SIZE:
+            return queryset
+
+        return queryset[:settings.DEFAULT_PAGE_SIZE]
+
+    def filter_queryset(self, queryset):
+        queryset = super().filter_queryset(queryset)
         if not hasattr(self, 'action'):
             return queryset
         if self.action == 'metadata':
             queryset = queryset.none()
-        if self.action in ['list', 'metadata']:
-            serializer_class = self.get_serializer_class()
-            if serializer_class and hasattr(serializer_class, 'setup_eager_loading'):
-                queryset = serializer_class.setup_eager_loading(queryset)
+        queryset = self.limit_queryset_if_no_page(queryset)
+        queryset = self.setup_eager_loading(queryset)
         return queryset
+
+    def setup_eager_loading(self, queryset, is_paginated=False):
+        # OPTIONS metadata only needs the object itself for permission checks.
+        # `determine_actions` temporarily changes `action` to update/retrieve,
+        # so use the preserved raw action to avoid loading relation data.
+        if getattr(self, 'raw_action', None) in ('metadata', 'OPTIONS'):
+            return queryset
+
+        is_export_request = self.request.query_params.get('format') in ['csv', 'xlsx']
+        no_request_page = self.request.query_params.get('limit') is None
+        # 不分页不走一般这个，是因为会消耗多余的 sql 查询, 不如分页的时候查询一次
+        if not is_export_request and not is_paginated and not no_request_page:
+            return queryset
+
+        serializer_class = self.get_serializer_class()
+        if not serializer_class:
+            return queryset
+
+        if hasattr(serializer_class, 'setup_eager_loading'):
+            queryset = serializer_class.setup_eager_loading(queryset)
+
+        if hasattr(serializer_class, 'setup_eager_labels'):
+            queryset = serializer_class.setup_eager_labels(queryset)
+
+        should_attach_counts = is_paginated or getattr(self, 'action', None) == 'list'
+        if should_attach_counts and hasattr(serializer_class, 'attach_relation_counts'):
+            queryset = serializer_class.attach_relation_counts(queryset)
+        return queryset
+
+    def paginate_queryset(self, queryset):
+        page = super().paginate_queryset(queryset)
+        model = getattr(queryset, 'model', None)
+        if not model or hasattr(queryset, 'custom'):
+            return page
+
+        serializer_class = self.get_serializer_class()
+        if page and serializer_class and isinstance(page[0], models.Model):
+            # 必须要返回 ids，用于排序
+            queryset, ids = self._get_page_again(page, model)
+            page = self.setup_eager_loading(queryset, is_paginated=True)
+            page_mapper = {str(obj.id): obj for obj in page}
+            page = [page_mapper.get(_id) for _id in ids if _id in page_mapper]
+        return page
+
+    def _get_page_again(self, page, model):
+        """
+        因为 setup_eager_loading 需要是 queryset 结构, 所以必须要重新构造
+        """
+        id_org_mapper = {str(obj.id): getattr(obj, 'org_id', None) for obj in page}
+        ids = list(id_org_mapper.keys())
+        org_ids = list(set(id_org_mapper.values()) - {None})
+
+        if not org_ids:
+            context = nullcontext()
+        elif len(org_ids) == 1:
+            context = tmp_to_org(org_ids[0])
+        else:
+            context = tmp_to_root_org()
+
+        with context:
+            page = model.objects.filter(id__in=ids)
+        return page, ids
 
 
 class ExtraFilterFieldsMixin:
@@ -111,7 +216,7 @@ class ExtraFilterFieldsMixin:
     """
     default_added_filters = (
         CustomFilterBackend, IDSpmFilterBackend, IDInFilterBackend,
-        IDNotFilterBackend,
+        IDNotFilterBackend, LabelFilterBackend
     )
     filter_backends = api_settings.DEFAULT_FILTER_BACKENDS
     extra_filter_fields = []
@@ -133,8 +238,6 @@ class ExtraFilterFieldsMixin:
             self.default_added_filters,
             self.extra_filter_backends,
         ))
-        # 这个要放在最后
-        backends.append(NotOrRelFilterBackend)
         return backends
 
     def filter_queryset(self, queryset):
@@ -150,9 +253,9 @@ class OrderingFielderFieldsMixin:
     ordering_fields = None
     extra_ordering_fields = []
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ordering_fields = self._get_ordering_fields()
+    @lazyproperty
+    def ordering_fields(self):
+        return self._get_ordering_fields()
 
     def _get_ordering_fields(self):
         if isinstance(self.__class__.ordering_fields, (list, tuple)):
@@ -179,7 +282,7 @@ class OrderingFielderFieldsMixin:
             model = self.queryset.model
         else:
             queryset = self.get_queryset()
-            model = queryset.model
+            model = None if isinstance(queryset, list) else queryset.model
 
         if not model:
             return []
@@ -198,7 +301,9 @@ class OrderingFielderFieldsMixin:
 
 
 class CommonApiMixin(
-    SerializerMixin, ExtraFilterFieldsMixin, OrderingFielderFieldsMixin,
-    QuerySetMixin, RenderToJsonMixin, PaginatedResponseMixin
+    SerializerMixin, QuerySetMixin, ExtraFilterFieldsMixin,
+    OrderingFielderFieldsMixin, RenderToJsonMixin, PaginatedResponseMixin
 ):
-    pass
+    def is_swagger_request(self):
+        return getattr(self, 'swagger_fake_view', False) or \
+            getattr(self, 'raw_action', '') == 'metadata'

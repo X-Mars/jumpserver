@@ -1,18 +1,23 @@
+from django.conf import settings
 from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
+from assets.models import Asset
 from common.serializers import (
     WritableNestedModelSerializer, type_field_map, MethodSerializer,
-    DictSerializer, create_serializer_class
+    DictSerializer, create_serializer_class, ResourceLabelsMixin,
+    CommonSerializerMixin
 )
-from common.serializers.fields import LabeledChoiceField
-from common.utils import lazyproperty
-from ..const import Category, AllTypes, Protocol
+from common.serializers.fields import LabeledChoiceField, ObjectRelatedField
+from ..const import Category, AllTypes, Protocol, SuMethodChoices
 from ..models import Platform, PlatformProtocol, PlatformAutomation
 
-__all__ = ["PlatformSerializer", "PlatformOpsMethodSerializer", "PlatformProtocolSerializer"]
+__all__ = [
+    "PlatformSerializer", "PlatformOpsMethodSerializer", "PlatformProtocolSerializer",
+    "PlatformProtocolCreateSerializer", "PlatformListSerializer",
+]
 
 
 class PlatformAutomationSerializer(serializers.ModelSerializer):
@@ -27,27 +32,62 @@ class PlatformAutomationSerializer(serializers.ModelSerializer):
             "change_secret_enabled", "change_secret_method", "change_secret_params",
             "verify_account_enabled", "verify_account_method", "verify_account_params",
             "gather_accounts_enabled", "gather_accounts_method", "gather_accounts_params",
+            "remove_account_enabled", "remove_account_method", "remove_account_params",
         ]
         extra_kwargs = {
             # 启用资产探测
-            "ping_enabled": {"label": _("Ping enabled")},
+            "ping_enabled": {"label": _("Ping enabled"), "help_text": _("Enable asset detection")},
             "ping_method": {"label": _("Ping method")},
-            "gather_facts_enabled": {"label": _("Gather facts enabled")},
-            "gather_facts_method": {"label": _("Gather facts method")},
-            "verify_account_enabled": {"label": _("Verify account enabled")},
-            "verify_account_method": {"label": _("Verify account method")},
-            "change_secret_enabled": {"label": _("Change secret enabled")},
-            "change_secret_method": {"label": _("Change secret method")},
-            "push_account_enabled": {"label": _("Push account enabled")},
-            "push_account_method": {"label": _("Push account method")},
-            "gather_accounts_enabled": {"label": _("Gather accounts enabled")},
-            "gather_accounts_method": {"label": _("Gather accounts method")},
+            "gather_facts_enabled": {
+                "label": _("Gather facts enabled"),
+                "help_text": _("Enable asset information collection")
+            },
+            "gather_facts_method": {
+                "label": _("Gather facts method"),
+            },
+            "verify_account_enabled": {
+                "label": _("Verify account enabled"),
+                "help_text": _("Enable account verification")
+            },
+            "verify_account_method": {
+                "label": _("Verify account method"),
+            },
+            "change_secret_enabled": {
+                "label": _("Change secret enabled"),
+                "help_text": _("Enable account secret auto change")
+            },
+            "change_secret_method": {
+                "label": _("Change secret method"),
+            },
+            "push_account_enabled": {
+                "label": _("Push account enabled"),
+                "help_text": _("Enable account auto push")
+            },
+            "push_account_method": {
+                "label": _("Push account method"),
+            },
+            "gather_accounts_enabled": {
+                "label": _("Gather accounts enabled"),
+                "help_text": _("Enable account collection")
+            },
+            "gather_accounts_method": {
+                "label": _("Gather accounts method"),
+            },
+            "remove_account_method": {
+                "label": _("Remove account method"),
+            },
+            "remove_account_enabled": {
+                "label": _("Remove accounts enabled"),
+                "help_text": _("Enable account remove"),
+            },
+
         }
 
 
 class PlatformProtocolSerializer(serializers.ModelSerializer):
     setting = MethodSerializer(required=False, label=_("Setting"))
     port_from_addr = serializers.BooleanField(label=_("Port from addr"), read_only=True)
+    port = serializers.IntegerField(label=_("Port"), required=False, min_value=0, max_value=65535)
 
     class Meta:
         model = PlatformProtocol
@@ -94,7 +134,12 @@ class PlatformProtocolSerializer(serializers.ModelSerializer):
         setting_fields = protocol_settings.get(protocol, {}).get('setting')
         if not setting_fields:
             return default_field
+
         setting_fields = [{'name': k, **v} for k, v in setting_fields.items()]
+        if protocol in ('http', 'https') and not settings.XPACK_LICENSE_IS_VALID:
+            for field in setting_fields:
+                if field['name'] == 'autofill':
+                    field['choices'] = [(key, label) for key, label in field['choices'] if key != 'script']
         name = '{}ProtocolSettingSerializer'.format(protocol.capitalize())
         return create_serializer_class(name, setting_fields)()
 
@@ -104,6 +149,20 @@ class PlatformProtocolSerializer(serializers.ModelSerializer):
     def to_file_internal_value(self, data):
         name, port = data.split('/')
         return {'name': name, 'port': port}
+
+    @staticmethod
+    def get_render_help_text():
+        return _('Protocols, format is ["protocol/port"]')
+
+
+class PlatformProtocolCreateSerializer(PlatformProtocolSerializer):
+    platform = serializers.PrimaryKeyRelatedField(
+        queryset=Platform.objects.all(), pk_field=serializers.IntegerField()
+    )
+    port = serializers.IntegerField(label=_("Port"), min_value=0, max_value=65535)
+
+    class Meta(PlatformProtocolSerializer.Meta):
+        fields = PlatformProtocolSerializer.Meta.fields + ['platform']
 
 
 class PlatformCustomField(serializers.Serializer):
@@ -116,14 +175,7 @@ class PlatformCustomField(serializers.Serializer):
     choices = serializers.ListField(default=list, label=_("Choices"), required=False)
 
 
-class PlatformSerializer(WritableNestedModelSerializer):
-    SU_METHOD_CHOICES = [
-        ("sudo", "sudo su -"),
-        ("su", "su - "),
-        ("enable", "enable"),
-        ("super", "super 15"),
-        ("super_level", "super level 15")
-    ]
+class PlatformSerializer(ResourceLabelsMixin, CommonSerializerMixin, WritableNestedModelSerializer):
     id = serializers.IntegerField(
         label='ID', required=False,
         validators=[UniqueValidator(queryset=Platform.objects.all())]
@@ -132,12 +184,15 @@ class PlatformSerializer(WritableNestedModelSerializer):
     type = LabeledChoiceField(choices=AllTypes.choices(), label=_("Type"))
     category = LabeledChoiceField(choices=Category.choices, label=_("Category"))
     protocols = PlatformProtocolSerializer(label=_("Protocols"), many=True, required=False)
-    automation = PlatformAutomationSerializer(label=_("Automation"), required=False, default=dict)
+    automation = PlatformAutomationSerializer(label=_("Automation"), required=False)
     su_method = LabeledChoiceField(
-        choices=SU_METHOD_CHOICES, label=_("Su method"),
-        required=False, default="sudo", allow_null=True
+        choices=SuMethodChoices.choices, label=_("Su method"),
+        required=False, default=SuMethodChoices.sudo, allow_null=True
     )
     custom_fields = PlatformCustomField(label=_("Custom fields"), many=True, required=False)
+    assets = ObjectRelatedField(queryset=Asset.objects, many=True, required=False, label=_('Assets'))
+    assets_amount = serializers.IntegerField(label=_('Assets amount'), read_only=True)
+    has_package = serializers.SerializerMethodField(label=_('Has package'))
 
     class Meta:
         model = Platform
@@ -150,14 +205,25 @@ class PlatformSerializer(WritableNestedModelSerializer):
             'internal', 'date_created', 'date_updated',
             'created_by', 'updated_by'
         ]
-        fields = fields_small + [
-            "protocols", "domain_enabled", "su_enabled",
-            "su_method", "automation", "comment", "custom_fields",
+        fields_m2m = ['assets', 'assets_amount']
+        fields = fields_small + fields_m2m + [
+            "protocols", "gateway_enabled", "su_enabled", "su_method",
+            "ds_enabled", "automation", "comment", "custom_fields", "labels", "has_package"
         ] + read_only_fields
         extra_kwargs = {
-            "su_enabled": {"label": _('Su enabled')},
-            "domain_enabled": {"label": _('Domain enabled')},
-            "domain_default": {"label": _('Default Domain')},
+            "su_enabled": {
+                "label": _('Su enabled'),
+                "help_text": _(
+                    "Login with account when accessing assets, then automatically switch to another, "
+                    "similar to logging in with a regular account and then switching to root"
+                )
+            },
+            "gateway_enabled": {
+                "label": _('Gateway enabled'),
+                "help_text": _("Assets can be connected using a zone gateway")
+            },
+            "zone_default": {"label": _('Default zone')},
+            'assets': {'required': False, 'label': _('Assets')},
         }
 
     def __init__(self, *args, **kwargs):
@@ -165,39 +231,27 @@ class PlatformSerializer(WritableNestedModelSerializer):
         self.set_initial_value()
 
     def set_initial_value(self):
-        if not hasattr(self, 'initial_data'):
+        if not isinstance(getattr(self, 'initial_data', None), dict):
             return
-        if self.instance:
-            return
-        if not self.initial_data.get('automation'):
-            self.initial_data['automation'] = {}
 
-    @property
-    def platform_category_type(self):
+        self.initial_data = self.initial_data.copy()
+        name = self.initial_data.get('name')
+        if isinstance(name, str) and ' ' in name:
+            self.initial_data['name'] = name.replace(' ', '-')
+
         if self.instance:
-            return self.instance.category, self.instance.type
-        if self.initial_data:
-            return self.initial_data.get('category'), self.initial_data.get('type')
-        raise serializers.ValidationError({'type': _("type is required")})
+            return
+        if 'automation' not in self.initial_data:
+            self.initial_data['automation'] = {}
 
     def add_type_choices(self, name, label):
         tp = self.fields['type']
         tp.choices[name] = label
-        tp.choice_mapper[name] = label
         tp.choice_strings_to_values[name] = label
 
-    @lazyproperty
-    def constraints(self):
-        category, tp = self.platform_category_type
-        constraints = AllTypes.get_constraints(category, tp)
-        return constraints
-
-    @classmethod
-    def setup_eager_loading(cls, queryset):
-        queryset = queryset.prefetch_related(
-            'protocols', 'automation'
-        )
-        return queryset
+    @staticmethod
+    def get_has_package(obj):
+        return bool(obj.package_id and obj.package.exists)
 
     def validate_protocols(self, protocols):
         if not protocols:
@@ -209,18 +263,31 @@ class PlatformSerializer(WritableNestedModelSerializer):
         self.initial_data['protocols'] = protocols
         return protocols
 
-    def validate_su_enabled(self, su_enabled):
-        return su_enabled and self.constraints.get('su_enabled', False)
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # Cross-field constraints must run after required fields and choice
+        # objects have been validated and converted to their scalar values.
+        category = attrs.get('category', getattr(self.instance, 'category', None))
+        tp = attrs.get('type', getattr(self.instance, 'type', None))
+        constraints = AllTypes.get_constraints(category, tp)
+        for name in ('su_enabled', 'gateway_enabled'):
+            if name in attrs:
+                attrs[name] = attrs[name] and constraints.get(name, False)
+        automation = attrs.get('automation', {})
+        if 'ansible_enabled' in automation:
+            automation['ansible_enabled'] = (
+                automation['ansible_enabled']
+                and constraints.get('automation', {}).get('ansible_enabled', False)
+            )
+            # drf-writable-nested validates reverse relations again from the
+            # initial input, so carry the constrained value into that input.
+            self.initial_data['automation']['ansible_enabled'] = automation['ansible_enabled']
+        return attrs
 
-    def validate_domain_enabled(self, domain_enabled):
-        return domain_enabled and self.constraints.get('domain_enabled', False)
 
-    def validate_automation(self, automation):
-        automation = automation or {}
-        ansible_enabled = automation.get('ansible_enabled', False) \
-                          and self.constraints['automation'].get('ansible_enabled', False)
-        automation['ansible_enable'] = ansible_enabled
-        return automation
+class PlatformListSerializer(PlatformSerializer):
+    class Meta(PlatformSerializer.Meta):
+        fields = list(set(PlatformSerializer.Meta.fields + ['assets_amount']) - {'assets'})
 
 
 class PlatformOpsMethodSerializer(serializers.Serializer):

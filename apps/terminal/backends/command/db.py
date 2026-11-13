@@ -2,14 +2,18 @@
 import datetime
 
 from django.db import transaction
-from django.utils import timezone
 from django.db.utils import OperationalError
-from common.utils.common import pretty_string
+from django.utils import timezone
 
+from common.utils.common import pretty_string
+from common.utils import get_logger
 from .base import CommandBase
+
+logger = get_logger(__name__)
 
 
 class CommandStore(CommandBase):
+    supports_idempotent_receipts = True
 
     def __init__(self, params):
         from terminal.models import Command
@@ -19,9 +23,10 @@ class CommandStore(CommandBase):
         """
         保存命令到数据库
         """
+        cmd_input = pretty_string(command['input'])
         self.model.objects.create(
             user=command["user"], asset=command["asset"],
-            account=command["account"], input=command["input"],
+            account=command["account"], input=cmd_input,
             output=command["output"], session=command["session"],
             risk_level=command.get("risk_level", 0), org_id=command["org_id"],
             timestamp=command["timestamp"]
@@ -31,6 +36,8 @@ class CommandStore(CommandBase):
         """
         批量保存命令到数据库, command的顺序和save中一致
         """
+        if commands and all(c.get('id') for c in commands):
+            return self._save_receipts(commands)
         _commands = []
         for c in commands:
             cmd_input = pretty_string(c['input'])
@@ -60,6 +67,29 @@ class CommandStore(CommandBase):
                 command.output = str(command.output.encode())
                 command.save()
         return True
+
+    def _save_receipts(self, commands):
+        # get_or_create resolves concurrent retries against the existing UUID
+        # primary key. Do not ignore arbitrary integrity errors or overwrite a
+        # different event which happens to supply the same id.
+        try:
+            with transaction.atomic():
+                for command in commands:
+                    values = {key: command[key] for key in (
+                        'user', 'asset', 'account', 'session', 'org_id', 'timestamp'
+                    )}
+                    values.update(
+                        input=pretty_string(command['input']),
+                        output=pretty_string(command['output'], max_length=1024),
+                        risk_level=command.get('risk_level', 0),
+                    )
+                    obj, created = self.model.objects.get_or_create(id=command['id'], defaults=values)
+                    if not created and any(getattr(obj, key) != value for key, value in values.items()):
+                        raise ValueError('Audit event id reused with different content')
+            return True
+        except Exception as exc:
+            logger.error('Durable audit receipt save failed (%s)', type(exc).__name__)
+            return False
 
     @staticmethod
     def make_filter_kwargs(

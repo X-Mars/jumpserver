@@ -2,7 +2,7 @@
 #
 import re
 
-from django.db import models
+from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
 
 from common.utils import lazyproperty, get_logger
@@ -23,7 +23,7 @@ class CommandGroup(JMSOrgBaseModel):
         max_length=16, default=TypeChoices.command, choices=TypeChoices.choices,
         verbose_name=_("Type")
     )
-    content = models.TextField(verbose_name=_("Content"), help_text=_("One line one command"))
+    content = models.TextField(verbose_name=_("Content"), help_text=_("One command per line"))
     ignore_case = models.BooleanField(default=True, verbose_name=_('Ignore case'))
 
     TypeChoices = TypeChoices
@@ -34,16 +34,16 @@ class CommandGroup(JMSOrgBaseModel):
 
     @lazyproperty
     def pattern(self):
+        content = self.content.replace('\r\n', '\n')
         if self.type == 'command':
-            s = self.construct_command_regex(self.content)
+            s = self.construct_command_regex(content)
         else:
-            s = r'{0}'.format(self.content)
+            s = r'{0}'.format(r'{}'.format('|'.join(content.split('\n'))))
         return s
 
     @classmethod
     def construct_command_regex(cls, content):
         regex = []
-        content = content.replace('\r\n', '\n')
         for _cmd in content.split('\n'):
             cmd = re.sub(r'\s+', ' ', _cmd)
             cmd = re.escape(cmd)
@@ -93,7 +93,14 @@ class CommandGroup(JMSOrgBaseModel):
 
 
 class CommandFilterACL(UserAssetAccountBaseACL):
-    command_groups = models.ManyToManyField(CommandGroup, verbose_name=_('Command group'))
+    workflow = models.ForeignKey(
+        'tickets.Workflow', null=True, blank=True, on_delete=models.PROTECT,
+        related_name='+', verbose_name=_('Workflow'),
+    )
+    command_groups = models.ManyToManyField(
+        CommandGroup, verbose_name=_('Command group'),
+        related_name='command_filters'
+    )
 
     class Meta(UserAssetAccountBaseACL.Meta):
         abstract = False
@@ -102,22 +109,29 @@ class CommandFilterACL(UserAssetAccountBaseACL):
     def __str__(self):
         return self.name
 
+    @transaction.atomic
     def create_command_review_ticket(self, run_command, session, cmd_filter_acl, org_id):
         from tickets.const import TicketType
-        from tickets.models import ApplyCommandTicket
+        from tickets.models import Ticket
         data = {
             'title': _('Command confirm') + ' ({})'.format(session.user),
-            'type': TicketType.command_confirm,
             'applicant': session.user_obj,
-            'apply_run_user_id': session.user_id,
-            'apply_run_asset': str(session.asset),
-            'apply_run_account': str(session.account),
-            'apply_run_command': run_command[:4090],
-            'apply_from_session_id': str(session.id),
-            'apply_from_cmd_filter_acl_id': str(cmd_filter_acl.id),
+            'type': TicketType.command_confirm,
             'org_id': org_id,
+            'request_data': {
+                'apply_run_user': str(session.user_id),
+                'apply_run_asset': str(session.asset),
+                'apply_run_account': str(session.account),
+                'apply_run_command': run_command[:4090],
+                'apply_from_session': str(session.id),
+                'apply_from_cmd_filter_acl': str(cmd_filter_acl.id),
+            },
+            'rel_snapshot': {
+                'apply_run_user': str(session.user_obj),
+                'apply_from_cmd_filter_acl': str(cmd_filter_acl),
+            },
         }
-        ticket = ApplyCommandTicket.objects.create(**data)
+        ticket = Ticket.objects.create(**data)
         assignees = self.reviewers.all()
-        ticket.open_by_system(assignees)
+        ticket.open_by_system(assignees, workflow=self.workflow)
         return ticket

@@ -5,6 +5,16 @@ from functools import partial
 from common.utils.yml import yaml_load_with_i18n
 
 
+def is_ignored_pkg_path(path):
+    parts = os.path.normpath(path).split(os.sep)
+    for part in parts:
+        if not part:
+            continue
+        if part == '__MACOSX' or part.startswith('._'):
+            return True
+    return False
+
+
 def check_platform_method(manifest, manifest_path):
     required_keys = ['category', 'method', 'name', 'id', 'type']
     less_key = set(required_keys) - set(manifest.keys())
@@ -31,16 +41,21 @@ def generate_serializer(data):
     return create_serializer_class(serializer_name, params)
 
 
-def get_platform_automation_methods(path):
+def get_platform_automation_methods(path, lang=None):
     methods = []
+    if not os.path.isdir(path):
+        return methods
     for root, dirs, files in os.walk(path, topdown=False):
+        dirs[:] = [d for d in dirs if not is_ignored_pkg_path(d)]
         for name in files:
             path = os.path.join(root, name)
+            if is_ignored_pkg_path(path):
+                continue
             if not path.endswith('manifest.yml'):
                 continue
 
             with open(path, 'r', encoding='utf8') as f:
-                manifest = yaml_load_with_i18n(f)
+                manifest = yaml_load_with_i18n(f, lang=lang)
                 check_platform_method(manifest, path)
                 manifest['dir'] = os.path.dirname(path)
                 manifest['params_serializer'] = generate_serializer(manifest)
@@ -66,6 +81,10 @@ def filter_platform_methods(category, tp_name, method=None, methods=None):
     if method:
         methods = filter(lambda x: x['method'] == method, methods)
     return methods
+
+
+def sorted_methods(methods):
+    return sorted(methods, key=lambda x: x.get('priority', 10))
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
